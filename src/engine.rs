@@ -434,7 +434,13 @@ impl Engine {
 
         let polled: Vec<_> = due
             .iter()
-            .map(|account| (account, self.poll_one(account, active_ids.contains(&account.id))))
+            .map(|account| {
+                let outcome = self.poll_one(account, active_ids.contains(&account.id));
+                if outcome.is_ok() {
+                    self.learn_entitlement(account);
+                }
+                (account, outcome)
+            })
             .collect();
 
         let _lock = self.store.lock()?;
@@ -456,6 +462,33 @@ impl Engine {
         }
         self.store.put_usage_cache(&cache)?;
         Ok(results)
+    }
+
+    /// Fills in the plan and quota size of an account that does not have them.
+    ///
+    /// An account imported while offline, or stored before agent-meter asked
+    /// about quota sizes, has no way to learn either otherwise — and without
+    /// the quota size the switching rules fall back to comparing percentages.
+    /// Costs one request per account, once, because it stops as soon as the
+    /// plan is known.
+    fn learn_entitlement(&self, account: &Account) {
+        if account.identity.plan.is_some() {
+            return;
+        }
+        let Ok(identity) = provider::get(account.provider).fetch_identity(&account.credential) else {
+            return;
+        };
+        let Ok(_lock) = self.store.lock_account(&account.id) else {
+            return;
+        };
+        // Re-read under the lock: this account's credential may have been
+        // refreshed during the poll that just happened, and writing back the
+        // copy taken before that would restore a spent refresh token.
+        let Ok(Some(mut current)) = self.store.account(&account.id) else {
+            return;
+        };
+        current.identity.update_from(&identity);
+        let _ = self.store.put_account(&current);
     }
 
     /// Whether `account` is due for a poll.
@@ -592,6 +625,7 @@ impl Engine {
                     usage: s.usage.as_ref(),
                     active: s.active,
                     usable: s.account.needs_login.is_none(),
+                    capacity: s.account.identity.capacity,
                 })
                 .collect();
             let rules = Rules {
@@ -649,13 +683,16 @@ impl Engine {
     }
 }
 
-/// Asks the provider who an account belongs to, when the credential did not
-/// say. Without it the account is only ever "claude-2" in the interface.
+/// Asks the provider who an account belongs to and what it is entitled to.
+///
+/// The credential files name the account but do not reliably state its plan or
+/// the size of its quota — Claude Code's copies of both drift from what the
+/// provider reports — so the provider is asked whenever either is missing.
 ///
 /// Best effort, and deliberately outside the store lock: it is a network call,
-/// and a nameless account is better than a failed import.
+/// and an account with an unknown plan is better than a failed import.
 fn name_account(kind: ProviderKind, captured: &mut Captured) {
-    if captured.identity.email.is_some() {
+    if captured.identity.email.is_some() && captured.identity.plan.is_some() {
         return;
     }
     if let Ok(identity) = provider::get(kind).fetch_identity(&captured.credential) {

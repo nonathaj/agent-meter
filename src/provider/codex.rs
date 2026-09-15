@@ -254,8 +254,33 @@ fn identity_from_tokens(credential: &Credential, tokens: &Map<String, Value>) ->
             .map(ToString::to_string)
             .or_else(|| auth_claim("chatgpt_account_id")),
         workspace_name: None,
-        plan: auth_claim("chatgpt_plan_type"),
+        plan: plan_word(auth_claim("chatgpt_plan_type").as_deref()),
+        // ChatGPT states no quota multiplier, so there is nothing to say about
+        // the size of this account's tank.
+        capacity: None,
     }
+}
+
+/// The plan as one of our own words.
+///
+/// Known values are matched, not echoed. An unrecognised one is not printed
+/// verbatim either: this string reaches a terminal row, and one carrying escape
+/// sequences could repaint it. It is reduced to plain lowercase ASCII, which is
+/// what every plan name the provider actually uses already is, or dropped when
+/// nothing recognisable survives.
+fn plan_word(plan: Option<&str>) -> Option<String> {
+    let plan = plan?.trim();
+    let known = ["free", "plus", "pro", "team", "business", "enterprise", "edu"];
+    if let Some(word) = known.iter().find(|word| plan.eq_ignore_ascii_case(word)) {
+        return Some((*word).to_string());
+    }
+    let sanitised: String = plan
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (!sanitised.is_empty()).then_some(sanitised)
 }
 
 /// Reads the identity fields the usage endpoint reports.
@@ -272,7 +297,8 @@ fn parse_usage_identity(response: &Value) -> Identity {
         email: string("email"),
         workspace_id: string("account_id"),
         workspace_name: None,
-        plan: string("plan_type"),
+        plan: plan_word(string("plan_type").as_deref()),
+        capacity: None,
     }
 }
 
@@ -417,6 +443,28 @@ mod tests {
             captured.provider_data["last_refresh"],
             "2026-09-09T02:30:16.972224500Z"
         );
+    }
+
+    /// The plan reaches a terminal row, so a provider string never does.
+    #[test]
+    fn plan_names_are_matched_or_reduced_to_plain_text() {
+        assert_eq!(plan_word(Some("pro")).as_deref(), Some("pro"));
+        assert_eq!(plan_word(Some("Team")).as_deref(), Some("team"));
+        assert_eq!(plan_word(Some(" enterprise ")).as_deref(), Some("enterprise"));
+
+        // Unknown but plausible: kept, in plain lowercase ASCII.
+        assert_eq!(plan_word(Some("pro-max")).as_deref(), Some("pro-max"));
+
+        // An escape sequence or an override character cannot repaint the row.
+        assert_eq!(plan_word(Some("\u{1b}[31mpro")).as_deref(), Some("31mpro"));
+        assert_eq!(plan_word(Some("pro\u{202e}x")).as_deref(), Some("prox"));
+        assert_eq!(plan_word(Some("\u{1b}[2J")).as_deref(), Some("2j"));
+        assert!(plan_word(Some("\u{202e}\u{1b}")).is_none());
+        assert!(plan_word(Some("")).is_none());
+        assert!(plan_word(None).is_none());
+
+        // Bounded, so a long string cannot stretch the row either.
+        assert_eq!(plan_word(Some(&"a".repeat(100))).unwrap().len(), 16);
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub struct Candidate<'a> {
     pub active: bool,
     /// Accounts needing a fresh login cannot be switched to.
     pub usable: bool,
+    /// How large this account's quota is relative to the base tier, when the
+    /// provider says. See [`weights`] for what it changes.
+    pub capacity: Option<u32>,
 }
 
 /// The knobs that shape a decision.
@@ -118,11 +121,17 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
         .filter(|(_, usage)| !usage.is_exhausted_at(now))
         .collect();
 
-    // Least used first, so the roomiest account leads. Ties go to the id, which
-    // keeps the choice deterministic no matter what order accounts arrive in.
+    // Rank by how much work each account can still do, not by percentage: a
+    // percentage is a fraction of that account's own quota, and quotas differ.
+    let weighted = quotas_all_known(active, &usable);
+    let remaining =
+        |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
+
+    // Most remaining first. Ties go to the id, which keeps the choice
+    // deterministic no matter what order accounts arrive in.
     usable.sort_by(|(a_candidate, a), (b_candidate, b)| {
-        a.used_at(now)
-            .total_cmp(&b.used_at(now))
+        remaining(b_candidate, b)
+            .total_cmp(&remaining(a_candidate, a))
             .then_with(|| a_candidate.id.cmp(b_candidate.id))
     });
 
@@ -133,9 +142,13 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
                 Reason::ActiveExhausted { target_used }
             } else if target_used < rules.threshold {
                 Reason::ThresholdCrossed { used, target_used }
-            } else if target_used + rules.margin <= used {
+            } else if remaining(candidate, usage)
+                >= remaining(active, active_usage) + rules.margin * weight(active, weighted)
+            {
                 // Everything is past the threshold: only move for a worthwhile
-                // gain, otherwise two busy accounts ping-pong.
+                // gain, otherwise two busy accounts ping-pong. The margin is in
+                // points of the active account's own quota, so it means the
+                // same thing whichever way the ranking is being measured.
                 Reason::BestOfExhausted { used, target_used }
             } else {
                 return Decision::Stay(Stay::NoBetterAccount { used });
@@ -166,6 +179,29 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
                 relief_account: soonest.map(|(id, _)| id.to_string()),
             })
         }
+    }
+}
+
+/// Whether the size of every quota in the comparison is known.
+///
+/// Weighting is all-or-nothing on purpose: treating an unknown quota as the
+/// base tier would rank a perfectly good account last for a fact the provider
+/// simply did not state.
+fn quotas_all_known(active: &Candidate<'_>, usable: &[(&Candidate<'_>, &Usage)]) -> bool {
+    active.capacity.is_some() && usable.iter().all(|(c, _)| c.capacity.is_some())
+}
+
+/// What one point of an account's headroom is worth against the others.
+///
+/// A percentage says how full an account is, never how big it is, and two
+/// accounts on the same plan can differ several-fold: half of a 5x seat is an
+/// eighth of half of a 20x one. Where every quota in play is known, headroom is
+/// weighted by quota size, so ranking compares the work each account can still
+/// do rather than the fraction of itself it has left.
+fn weight(candidate: &Candidate<'_>, weighted: bool) -> f64 {
+    match candidate.capacity {
+        Some(times) if weighted => f64::from(times),
+        _ => 1.0,
     }
 }
 
@@ -210,6 +246,15 @@ mod tests {
             usage,
             active,
             usable: true,
+            capacity: None,
+        }
+    }
+
+    /// The same account, on a quota `times` the base tier.
+    fn sized<'a>(id: &'a str, usage: Option<&'a Usage>, active: bool, times: u32) -> Candidate<'a> {
+        Candidate {
+            capacity: Some(times),
+            ..candidate(id, usage, active)
         }
     }
 
@@ -371,10 +416,8 @@ mod tests {
             &[
                 candidate("claude-1", Some(&a), true),
                 Candidate {
-                    id: "claude-2",
-                    usage: Some(&b),
-                    active: false,
                     usable: false,
+                    ..candidate("claude-2", Some(&b), false)
                 },
             ],
             &Rules::default(),
@@ -393,6 +436,98 @@ mod tests {
                 now()
             ),
             Decision::Stay(Stay::NoActiveAccount)
+        );
+    }
+
+    /// A percentage is a fraction of an account's own quota, so the roomiest
+    /// account by percentage is not the one that can do the most work. Half of
+    /// a 5x seat is an eighth of half of a 20x one.
+    #[test]
+    fn the_account_with_the_most_work_left_wins_not_the_emptiest_one() {
+        let (active, small, large) = (usage(95.0), usage(10.0), usage(60.0));
+        let decision = decide(
+            &[
+                sized("claude-1", Some(&active), true, 5),
+                // 90% left of a 5x quota: 4.5 units.
+                sized("claude-2", Some(&small), false, 5),
+                // 40% left of a 20x quota: 8 units, despite looking fuller.
+                sized("claude-3", Some(&large), false, 20),
+            ],
+            &Rules::default(),
+            now(),
+        );
+        assert_eq!(
+            decision,
+            Decision::Switch {
+                to: "claude-3".into(),
+                reason: Reason::ThresholdCrossed {
+                    used: 95.0,
+                    target_used: 60.0
+                },
+            }
+        );
+    }
+
+    /// Weighting is all-or-nothing: an account whose quota the provider never
+    /// stated must not be ranked last for it.
+    #[test]
+    fn one_unknown_quota_falls_back_to_comparing_percentages() {
+        let (active, small, large) = (usage(95.0), usage(10.0), usage(60.0));
+        let decision = decide(
+            &[
+                sized("claude-1", Some(&active), true, 5),
+                sized("claude-2", Some(&small), false, 5),
+                // Same readings as the test above, but this one's size is
+                // unknown, so percentages decide and the emptiest wins.
+                candidate("claude-3", Some(&large), false),
+            ],
+            &Rules::default(),
+            now(),
+        );
+        assert!(
+            matches!(&decision, Decision::Switch { to, .. } if to == "claude-2"),
+            "{decision:?}"
+        );
+    }
+
+    /// With every account busy, the margin has to mean the same thing whichever
+    /// way the ranking is being measured: points of the active account's quota.
+    #[test]
+    fn the_margin_scales_with_the_quota_it_is_measured_against() {
+        let rules = Rules::default();
+
+        // 4 points of a 20x quota is 80 units, far beyond the 5-point margin,
+        // which is worth 100 units here. Not enough: stay.
+        let (active, other) = (usage(95.0), usage(91.0));
+        let decision = decide(
+            &[
+                sized("claude-1", Some(&active), true, 20),
+                sized("claude-2", Some(&other), false, 20),
+            ],
+            &rules,
+            now(),
+        );
+        assert_eq!(decision, Decision::Stay(Stay::NoBetterAccount { used: 95.0 }));
+
+        // The same two readings, but the candidate's quota is four times the
+        // active one's, so the work it can still do is far greater.
+        let decision = decide(
+            &[
+                sized("claude-1", Some(&active), true, 5),
+                sized("claude-2", Some(&other), false, 20),
+            ],
+            &rules,
+            now(),
+        );
+        assert!(
+            matches!(
+                &decision,
+                Decision::Switch {
+                    to,
+                    reason: Reason::BestOfExhausted { .. }
+                } if to == "claude-2"
+            ),
+            "{decision:?}"
         );
     }
 

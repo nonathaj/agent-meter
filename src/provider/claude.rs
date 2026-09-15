@@ -97,13 +97,13 @@ impl Provider for Claude {
             .as_ref()
             .and_then(|v| v.get(ACCOUNT_KEY))
             .and_then(Value::as_object);
-        let mut identity = parse_identity(account);
-        if identity.plan.is_none() {
-            identity.plan = oauth
-                .get("subscriptionType")
-                .and_then(Value::as_str)
-                .map(Into::into);
-        }
+        // Deliberately no plan here. This file carries `subscriptionType` and
+        // `rateLimitTier`, but both drift from what the account is actually on
+        // — measured on one machine, 2026-09-15: `max` and
+        // `default_claude_max_20x` here for an account the provider reported as
+        // a Team seat on `default_claude_max_5x`. The profile endpoint answers
+        // this, and `Engine` asks it.
+        let identity = parse_identity(account);
 
         // Keep the fields Claude Code expects to find again after a swap: the
         // identity block verbatim, plus the account-scoped extras that live
@@ -447,11 +447,20 @@ fn parse_identity(account: Option<&Map<String, Value>>) -> Identity {
         email: get("emailAddress"),
         workspace_id: get("organizationUuid"),
         workspace_name: get("organizationName"),
+        // The plan and the size of the quota come from the provider, not from
+        // this file; see `capture`.
         plan: None,
+        capacity: None,
     }
 }
 
 /// Reads `/api/oauth/profile`.
+///
+/// This endpoint is the authority on which plan an account is on and how large
+/// its quota is; the copies of both in the local credential file drift away
+/// from it. Measured on one machine, 2026-09-15: the file said `max` and
+/// `default_claude_max_20x` for the account this endpoint reported as
+/// `claude_team` on `default_claude_max_5x`.
 fn parse_profile(response: &Value) -> Identity {
     let account = response.get("account");
     let organization = response.get("organization");
@@ -462,25 +471,64 @@ fn parse_profile(response: &Value) -> Identity {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
     };
+    Identity {
+        user_id: string(account, "uuid"),
+        email: string(account, "email").or_else(|| string(account, "email_address")),
+        workspace_id: string(organization, "uuid"),
+        workspace_name: string(organization, "name"),
+        plan: parse_plan(account, organization),
+        capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
+    }
+}
+
+/// Which plan an account is on.
+///
+/// `organization_type` decides it, because the booleans cannot: a Team seat
+/// sets `has_claude_max` exactly as a personal Max one does, so reading the
+/// booleans alone reports a Team account as "max" — a plan the person is not
+/// on. Measured on one machine, 2026-09-15, where the two seats differed in
+/// nothing else the response carries.
+///
+/// Known types are matched to our own words rather than echoed, and one we have
+/// not seen falls through to the booleans instead of being printed. That keeps
+/// the property the booleans had: nothing a provider writes reaches the screen
+/// through this field.
+fn parse_plan(account: Option<&Value>, organization: Option<&Value>) -> Option<String> {
     let flag = |key: &str| {
         account
             .and_then(|a| a.get(key))
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    Identity {
-        user_id: string(account, "uuid"),
-        email: string(account, "email").or_else(|| string(account, "email_address")),
-        workspace_id: string(organization, "uuid"),
-        workspace_name: string(organization, "name"),
-        plan: if flag("has_claude_max") {
-            Some("max".into())
-        } else if flag("has_claude_pro") {
-            Some("pro".into())
-        } else {
-            None
-        },
+    match organization
+        .and_then(|o| o.get("organization_type"))
+        .and_then(Value::as_str)
+    {
+        Some("claude_team") => Some("team".into()),
+        Some("claude_enterprise") => Some("enterprise".into()),
+        Some("claude_max") => Some("max".into()),
+        Some("claude_pro") => Some("pro".into()),
+        // The wider plan wins: naming the narrower one would understate what
+        // the account can do.
+        _ if flag("has_claude_max") => Some("max".into()),
+        _ if flag("has_claude_pro") => Some("pro".into()),
+        _ => None,
     }
+}
+
+/// The quota multiplier in a `rate_limit_tier`: `default_claude_max_20x` is 20.
+///
+/// Rebuilt from digits that parsed as a number, never sliced out of the
+/// provider's string, so a hostile `rate_limit_tier` has no route onto the
+/// screen. Anything not ending in `<digits>x` yields `None` rather than a guess.
+fn multiplier(tier: Option<&Value>) -> Option<u32> {
+    let digits = tier?.as_str()?.rsplit('_').next()?.strip_suffix('x')?;
+    // A tier is a small multiple. The bound keeps a long digit run out of the
+    // parse, and zero out of a ranking that multiplies by it.
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    digits.parse().ok().filter(|times| *times > 0)
 }
 
 /// Reads `/api/oauth/usage`.
@@ -720,6 +768,73 @@ mod tests {
         assert_eq!(usage.windows[1].window_secs, ONE_WEEK);
     }
 
+    /// A Team seat sets `has_claude_max` exactly as a personal Max one does, so
+    /// the booleans alone report it as "max" — a plan the person is not on.
+    /// Both bodies are the shape measured on one machine, 2026-09-15.
+    #[test]
+    fn a_team_seat_is_not_reported_as_a_personal_max_one() {
+        let seat = |org_type: &str, tier: &str| {
+            json!({
+                "account": {"uuid": "u", "has_claude_max": true, "has_claude_pro": false},
+                "organization": {"uuid": "o", "name": "Example", "organization_type": org_type,
+                                 "rate_limit_tier": tier}
+            })
+        };
+
+        let team = parse_profile(&seat("claude_team", "default_claude_max_5x"));
+        assert_eq!(team.plan.as_deref(), Some("team"));
+        assert_eq!(team.capacity, Some(5));
+        assert_eq!(team.plan_label().unwrap(), "team 5x");
+
+        let personal = parse_profile(&seat("claude_max", "default_claude_max_20x"));
+        assert_eq!(personal.plan.as_deref(), Some("max"));
+        assert_eq!(personal.capacity, Some(20));
+        assert_eq!(personal.plan_label().unwrap(), "max 20x");
+    }
+
+    /// An organization type we have not seen falls back to the booleans rather
+    /// than being printed: the words on screen stay ours.
+    #[test]
+    fn an_unknown_organization_type_is_never_printed() {
+        let identity = parse_profile(&json!({
+            "account": {"has_claude_max": false, "has_claude_pro": true},
+            "organization": {"organization_type": "claude_something_new"}
+        }));
+        assert_eq!(identity.plan.as_deref(), Some("pro"));
+
+        // Nothing to fall back on either: no plan rather than a guess.
+        let identity = parse_profile(&json!({
+            "account": {},
+            "organization": {"organization_type": "\u{1b}[31mclaude_evil"}
+        }));
+        assert_eq!(identity.plan, None);
+    }
+
+    #[test]
+    fn the_quota_multiplier_is_rebuilt_from_digits_or_dropped() {
+        let tier = |value: Value| multiplier(Some(&value));
+        assert_eq!(tier(json!("default_claude_max_20x")), Some(20));
+        assert_eq!(tier(json!("default_claude_max_5x")), Some(5));
+
+        // Anything that is not a plain <digits>x yields nothing, so a provider
+        // string has no route onto the row through this field.
+        for junk in [
+            "default_claude_max",
+            "",
+            "x",
+            "enterprise_unlimited",
+            "9999x",
+            "0x",
+            "-5x",
+            "5X",
+            "1\u{202e}x",
+        ] {
+            assert_eq!(tier(json!(junk)), None, "junk tier: {junk:?}");
+        }
+        assert_eq!(multiplier(None), None);
+        assert_eq!(tier(json!(20)), None);
+    }
+
     #[test]
     fn parses_the_profile_response() {
         let identity = parse_profile(&json!({
@@ -780,8 +895,12 @@ mod tests {
 
         let captured = Claude.capture(&home).unwrap();
         assert_eq!(captured.identity.email.as_deref(), Some("dev@example.com"));
-        assert_eq!(captured.identity.plan.as_deref(), Some("max"));
         assert_eq!(captured.credential.refresh_token, "sk-ant-ort01-old");
+        // The file says `subscriptionType: max`, and it is not believed: that
+        // field drifts from the account's real plan, so the plan is left for
+        // the provider to state. See `parse_profile`.
+        assert_eq!(captured.identity.plan, None);
+        assert_eq!(captured.identity.capacity, None);
 
         // Install a different account over the top of the same home.
         let mut account = account_with(

@@ -9,11 +9,11 @@ account as a limit approaches.
 
 ```console
 $ agent-meter list
-     ID         PROVIDER      ACCOUNT               PLAN   USED   WINDOWS                          RESETS IN
- ────────────────────────────────────────────────────────────────────────────────────────────────────────────
- *   claude-1   Claude Code   dev@example.com       max    94%    5h 94%  weekly 61%  weekly Opus 4%   2h13m
-     claude-2   Claude Code   oncall@example.com    max    12%    5h 12%  weekly 30%                   3h02m
- *   codex-1    Codex         dev@example.com       pro    8%     5h 0%  weekly 8%                     6d2h
+     ID         PROVIDER      ACCOUNT              ORGANIZATION  PLAN     USED  WINDOWS                        RESETS IN
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ *   claude-1   Claude Code   dev@example.com      Example Inc   team 5x  94%   5h 94%  weekly 61%  weekly Opus 4%  2h13m
+     claude-2   Claude Code   dev@example.com      -             max 20x  12%   5h 12%  weekly 30%                  3h02m
+ *   codex-1    Codex         dev@example.com      -             pro      8%    5h 0%  weekly 8%                    6d2h
 
 $ agent-meter watch
 Watching every 5m at a 90% threshold. Press Ctrl-C to stop.
@@ -99,6 +99,24 @@ On each check, for each provider:
 An account is only ever compared on its *tightest* window: an account at 20% of
 its five-hour limit but 98% of its weekly one is treated as 98% full, because
 that is the limit you will hit.
+
+### Quota size, not just percentage
+
+A percentage says how full an account is, never how big it is — and two
+accounts on the same plan can differ several-fold. Claude reports the size as a
+multiplier, shown in the plan column: a `max 20x` seat holds four times what a
+`team 5x` one does, so **40% left on the 20x seat is twice the work that 90%
+left on the 5x seat is**.
+
+Where the provider states the size of every account in play, `agent-meter` ranks
+by how much work each can still do rather than by the fraction it has left. If
+the size of any one of them is unknown, it compares percentages instead — an
+account is never ranked last over a fact the provider simply did not state.
+
+The same is true of the plan name itself: a Team seat reports `has_claude_max`
+exactly as a personal Max seat does, so the plan is read from the account's
+organization type, and both the plan and the multiplier come from the provider
+rather than from the copies in the local credential file, which drift.
 
 Claude Code re-reads its credential between messages, so a switch takes effect
 in a session you already have open. Codex reads its credential once at startup,

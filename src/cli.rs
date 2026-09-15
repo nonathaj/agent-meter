@@ -230,6 +230,7 @@ fn status_json(status: &Status, now: Timestamp) -> serde_json::Value {
         "label": status.account.label,
         "email": status.account.identity.email,
         "plan": status.account.identity.plan,
+        "capacityMultiplier": status.account.identity.capacity,
         "organization": status.account.identity.workspace_name,
         "active": status.active,
         "needsLogin": status.account.needs_login,
@@ -258,6 +259,7 @@ fn render_table(statuses: &[Status], now: Timestamp) -> String {
             "ID",
             "PROVIDER",
             "ACCOUNT",
+            "ORGANIZATION",
             "PLAN",
             "USED",
             "WINDOWS",
@@ -314,7 +316,10 @@ fn render_table(statuses: &[Status], now: Timestamp) -> String {
             Cell::new(&account.id),
             Cell::new(account.provider.display_name()),
             Cell::new(account.display_name()),
-            Cell::new(account.identity.plan.as_deref().unwrap_or("-")),
+            // The organisation is part of which account this is: the same
+            // address in two of them is two accounts, with separate limits.
+            Cell::new(account.identity.workspace_name.as_deref().unwrap_or("-")),
+            Cell::new(account.identity.plan_label().unwrap_or_else(|| "-".into())),
             used_cell(
                 used,
                 status.usage.as_ref().is_some_and(|u| u.is_exhausted_at(now)),

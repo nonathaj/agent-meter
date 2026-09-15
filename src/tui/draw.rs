@@ -78,6 +78,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|status| {
             let used = status.used(now);
+            let identity = &status.account.identity;
             let note = match (&status.account.needs_login, &status.error) {
                 (Some(_), _) => Span::styled("login needed", Style::new().fg(Color::Red)),
                 (None, Some(_)) => Span::styled("usage unavailable", Style::new().fg(Color::Yellow)),
@@ -88,7 +89,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(status.account.id.clone()),
                 Cell::from(status.account.provider.display_name()),
                 Cell::from(status.account.display_name().to_string()),
-                Cell::from(status.account.identity.plan.clone().unwrap_or_else(|| "-".into())),
+                // The organisation is part of which account this is: the same
+                // address in two of them is two accounts, with separate limits.
+                Cell::from(identity.workspace_name.clone().unwrap_or_else(|| "-".into())),
+                Cell::from(identity.plan_label().unwrap_or_else(|| "-".into())),
                 Cell::from(bar(used, 14)).style(used_style(used, status)),
                 Cell::from(Line::from(note)),
             ])
@@ -102,14 +106,24 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Min(16),
-            Constraint::Length(6),
+            Constraint::Length(14),
+            Constraint::Length(9),
             Constraint::Length(22),
             Constraint::Length(18),
         ],
     )
     .header(
-        Row::new(["", "ID", "PROVIDER", "ACCOUNT", "PLAN", "USED", ""])
-            .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+        Row::new([
+            "",
+            "ID",
+            "PROVIDER",
+            "ACCOUNT",
+            "ORGANIZATION",
+            "PLAN",
+            "USED",
+            "",
+        ])
+        .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
     )
     .row_highlight_style(Style::new().bg(Color::DarkGray))
     .block(bordered("Accounts"));

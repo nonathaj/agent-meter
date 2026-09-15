@@ -66,9 +66,21 @@ pub struct Identity {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
-    /// Subscription plan, e.g. `max`, `pro`, `plus`.
+    /// Subscription plan, e.g. `max`, `team`, `pro`, `plus`.
+    ///
+    /// Always one of our own words. Nothing a provider writes is printed
+    /// through this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// How large this account's quota is relative to the provider's base tier:
+    /// `20` for a 20x seat, `5` for a 5x one.
+    ///
+    /// This is the only thing that says how big the tank is rather than how
+    /// full, and two accounts on the same plan can differ several-fold. A
+    /// percentage cannot show that: half of a 5x seat is an eighth of half of a
+    /// 20x one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
 }
 
 impl Identity {
@@ -85,6 +97,21 @@ impl Identity {
         take(&mut self.workspace_id, &other.workspace_id);
         take(&mut self.workspace_name, &other.workspace_name);
         take(&mut self.plan, &other.plan);
+        if other.capacity.is_some() {
+            self.capacity = other.capacity;
+        }
+    }
+
+    /// The plan as shown to the user, with the size of the quota when it is
+    /// known: `team 5x`.
+    pub fn plan_label(&self) -> Option<String> {
+        match (&self.plan, self.capacity) {
+            (Some(plan), Some(times)) => Some(format!("{plan} {times}x")),
+            (Some(plan), None) => Some(plan.clone()),
+            // A multiplier with no plan says little on its own, and inventing a
+            // plan name to hang it on would be worse than leaving it out.
+            (None, _) => None,
+        }
     }
 }
 

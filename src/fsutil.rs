@@ -100,34 +100,36 @@ fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(unique)
 }
 
+/// Creates the temp file that will replace `target`, with the permissions
+/// `mode` asks for.
+#[cfg(unix)]
 fn create_new(tmp: &Path, mode: Mode, target: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let bits = match mode {
-            Mode::Private => 0o600,
-            Mode::InheritExisting => {
-                use std::os::unix::fs::PermissionsExt;
-                fs::metadata(target)
-                    .map(|m| m.permissions().mode() & 0o777)
-                    .unwrap_or(0o600)
-            }
-        };
-        options.mode(bits);
-        let file = options.open(tmp)?;
-        // `mode` is filtered through the umask; set the exact bits explicitly.
-        fs::set_permissions(tmp, fs::Permissions::from_mode(bits))?;
-        return Ok(file);
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: files inherit the ACL of their directory, which is what both
-        // agent-meter's data dir (under the user profile) and agent CLI homes expect.
-        let _ = (mode, target);
-        options.open(tmp)
-    }
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let bits = match mode {
+        Mode::Private => 0o600,
+        Mode::InheritExisting => fs::metadata(target)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600),
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(bits)
+        .open(tmp)?;
+    // The mode above is filtered through the umask, so set the exact bits.
+    fs::set_permissions(tmp, fs::Permissions::from_mode(bits))?;
+    Ok(file)
+}
+
+/// Creates the temp file that will replace `target`.
+///
+/// Windows has no mode bits: a new file inherits the ACL of its directory,
+/// which is what both agent-meter's data directory (under the user's profile)
+/// and the agent CLIs' own homes rely on.
+#[cfg(not(unix))]
+fn create_new(tmp: &Path, _mode: Mode, _target: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(tmp)
 }
 
 /// Retries an operation that failed with a transient Windows sharing or access

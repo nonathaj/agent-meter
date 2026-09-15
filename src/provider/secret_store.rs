@@ -19,7 +19,7 @@ pub use stub::*;
 
 #[cfg(not(target_os = "macos"))]
 mod stub {
-    use anyhow::Result;
+    use anyhow::{Result, bail};
 
     /// Keychain storage is unavailable off macOS.
     pub fn is_available() -> bool {
@@ -30,8 +30,11 @@ mod stub {
         Ok(None)
     }
 
+    /// Callers only reach this after [`is_available`] said yes, so it cannot
+    /// happen here. It returns an error rather than panicking: losing a
+    /// credential write is worth reporting, never worth aborting over.
     pub fn write(_service: &str, _secret: &str) -> Result<()> {
-        unreachable!("the Keychain is only used on macOS")
+        bail!("this platform has no Keychain; credentials belong in a file here")
     }
 
     pub fn delete(_service: &str) -> Result<()> {

@@ -100,14 +100,6 @@ impl Error {
             Error::Status { status, .. } => *status >= 500 || *status == 408,
         }
     }
-
-    /// The provider's machine-readable error code, when the body carried one.
-    pub fn code(&self) -> Option<&str> {
-        match self {
-            Error::Unauthorized { code, .. } => code.as_deref(),
-            _ => None,
-        }
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

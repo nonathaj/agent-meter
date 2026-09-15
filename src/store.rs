@@ -232,10 +232,6 @@ impl UsageCache {
         self.entries.get(id)
     }
 
-    pub fn usage(&self, id: &str) -> Option<&Usage> {
-        self.entries.get(id)?.usage.as_ref()
-    }
-
     /// Records a successful reading, clearing any failure state.
     pub fn record_success(&mut self, id: &str, usage: Usage) {
         let entry = self.entries.entry(id.to_string()).or_default();

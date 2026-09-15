@@ -20,6 +20,10 @@ use crate::usage::Usage;
 /// the expiry.
 const REFRESH_LEEWAY: SignedDuration = SignedDuration::from_mins(10);
 
+/// How long a login directory may sit before it is assumed to be the remains of
+/// an interrupted login. Longer than any sign-in a person would still be doing.
+const LOGIN_HOME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 pub struct Engine {
     store: Store,
     config: Config,
@@ -40,12 +44,6 @@ impl Status {
     /// Percent of the tightest window used, if known.
     pub fn used(&self, now: Timestamp) -> Option<f64> {
         self.usage.as_ref().map(|u| u.used_at(now))
-    }
-
-    /// Whether this account can serve requests: it has a working login and is
-    /// not at its limit.
-    pub fn usable(&self, now: Timestamp) -> bool {
-        self.account.needs_login.is_none() && !self.usage.as_ref().is_some_and(|u| u.is_exhausted_at(now))
     }
 }
 
@@ -238,6 +236,7 @@ impl Engine {
     /// It sits in agent-meter's own data directory rather than the system temp
     /// directory: Codex refuses to create its helper binaries under temp.
     fn login_home(&self, kind: ProviderKind) -> Result<PathBuf> {
+        self.sweep_login_homes(LOGIN_HOME_MAX_AGE);
         let unique = format!(
             "{kind}-{}-{:x}",
             std::process::id(),
@@ -246,6 +245,31 @@ impl Engine {
         let home = self.store.dir().join("logins").join(unique);
         crate::fsutil::create_private_dir(&home).with_context(|| format!("creating {}", home.display()))?;
         Ok(home)
+    }
+
+    /// Deletes login directories left behind by an interrupted login.
+    ///
+    /// A login that finishes cleans up after itself, but one killed part-way
+    /// through leaves a directory that may hold a real credential. Anything
+    /// older than `older_than` cannot belong to a login still in progress.
+    fn sweep_login_homes(&self, older_than: std::time::Duration) {
+        let Ok(entries) = std::fs::read_dir(self.store.dir().join("logins")) else {
+            return;
+        };
+        let Some(cutoff) = std::time::SystemTime::now().checked_sub(older_than) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let is_stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified < cutoff);
+            if is_stale {
+                // Best effort: a directory another process is using right now
+                // simply stays until next time.
+                let _ = crate::fsutil::remove_dir_all_if_exists(&entry.path());
+            }
+        }
     }
 
     /// Writes a captured account into the store, merging it into an existing
@@ -700,6 +724,34 @@ mod tests {
         assert_eq!(engine.resolve("personal").unwrap().id, "claude-1");
         let err = engine.resolve("nope").unwrap_err().to_string();
         assert!(err.contains("agent-meter list"), "{err}");
+    }
+
+    #[test]
+    fn stale_login_directories_are_swept_but_fresh_ones_are_kept() {
+        let (_tmp, engine) = engine();
+        let logins = engine.store().dir().join("logins");
+        std::fs::create_dir_all(&logins).unwrap();
+
+        // A login killed part-way through can leave a real credential behind.
+        let abandoned = logins.join("claude-1-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::write(abandoned.join(".credentials.json"), b"{}").unwrap();
+
+        // A login starting now must not sweep away one that started a moment ago.
+        let fresh = engine.login_home(ProviderKind::Claude).unwrap();
+        assert!(fresh.exists());
+        assert!(
+            abandoned.exists(),
+            "an hour-old cutoff must spare a directory created just now"
+        );
+
+        // With no grace period, every leftover goes.
+        engine.sweep_login_homes(std::time::Duration::ZERO);
+        assert!(
+            !abandoned.exists(),
+            "an abandoned login directory must be removed"
+        );
+        assert!(!fresh.exists());
     }
 
     #[test]

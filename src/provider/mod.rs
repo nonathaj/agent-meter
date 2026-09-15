@@ -165,6 +165,49 @@ mod tests {
         assert_eq!(all().count(), ProviderKind::ALL.len());
     }
 
+    /// The point of a second configuration directory is that the agent CLI the
+    /// user has open keeps its own credentials, so a login must be pointed at
+    /// the throwaway home and stripped of anything that would short-circuit it.
+    #[test]
+    fn a_login_is_isolated_from_the_running_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login-home");
+
+        for (kind, var) in [
+            (ProviderKind::Claude, claude::CONFIG_HOME_ENV),
+            (ProviderKind::Codex, codex::CONFIG_HOME_ENV),
+        ] {
+            let provider = get(kind);
+            // The CLI may not be installed on the machine running the tests;
+            // that failure is about PATH, not about isolation.
+            let Ok(command) = provider.login_command(&home, false) else {
+                continue;
+            };
+
+            let envs: Vec<_> = command.get_envs().collect();
+            let set = |name: &str| {
+                envs.iter()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .map(|(_, value)| *value)
+            };
+            assert_eq!(
+                set(var).flatten().map(std::path::PathBuf::from),
+                Some(home.clone()),
+                "{kind} login must use the throwaway home"
+            );
+            for var in AUTH_OVERRIDE_VARS.iter().chain(SESSION_VARS) {
+                assert_eq!(set(var), Some(None), "{kind} login must clear {var}");
+            }
+
+            let args: Vec<_> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(args.iter().any(|a| a == "login"), "{kind}: {args:?}");
+            assert!(home.exists(), "{kind} must prepare the login directory");
+        }
+    }
+
     #[test]
     fn env_override_must_be_absolute() {
         // SAFETY: single-threaded test; no other thread reads the environment.

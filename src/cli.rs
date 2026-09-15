@@ -497,20 +497,58 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         engine.config().watch.threshold
     );
     while running.load(Ordering::SeqCst) {
-        if let Err(error) = run_tick(&engine, args.dry_run) {
-            // A failed check should not end the watch: the provider may be
-            // briefly unreachable, and the next tick will try again.
-            eprintln!("{} check failed: {error}", Timestamp::now());
-        }
+        let sleep_for = match run_tick(&engine, args.dry_run) {
+            Ok(outcomes) => wait_after(&outcomes, &engine, interval),
+            Err(error) => {
+                // A failed check should not end the watch: the provider may be
+                // briefly unreachable, and the next tick will try again.
+                eprintln!("{} check failed: {error}", Timestamp::now());
+                interval
+            }
+        };
         // Wake often enough to notice Ctrl-C promptly.
         let mut waited = Duration::ZERO;
-        while running.load(Ordering::SeqCst) && waited < interval {
+        while running.load(Ordering::SeqCst) && waited < sleep_for {
             std::thread::sleep(Duration::from_millis(200));
             waited += Duration::from_millis(200);
         }
     }
     println!("Stopped.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// How long to wait before the next check.
+///
+/// When every account is spent there is nothing to poll for until one of them
+/// resets, so the watcher waits for that instead of spending requests on a
+/// wall it cannot get past. It still wakes at the normal interval at the
+/// latest, in case a limit lifts earlier than the provider said.
+fn wait_after(outcomes: &[TickOutcome], engine: &Engine, interval: Duration) -> Duration {
+    if !engine.config().watch.wait_for_reset {
+        return interval;
+    }
+    let now = Timestamp::now();
+    let relief = outcomes
+        .iter()
+        .filter_map(|outcome| match &outcome.decision {
+            Decision::Blocked(Blocked::AllExhausted { relief_at, .. }) => *relief_at,
+            _ => None,
+        })
+        .min();
+
+    match relief {
+        // Every provider that is stuck knows when it recovers: sleep until the
+        // first one does, plus a moment so the reset has certainly landed.
+        Some(at)
+            if outcomes
+                .iter()
+                .all(|o| matches!(o.decision, Decision::Blocked(_))) =>
+        {
+            let seconds = (at.as_second() - now.as_second()).max(0) as u64 + 15;
+            Duration::from_secs(seconds).max(interval)
+        }
+        _ => interval,
+    }
 }
 
 fn run_tick(engine: &Engine, dry_run: bool) -> Result<Vec<TickOutcome>> {
@@ -632,5 +670,44 @@ mod tests {
             panic!("expected watch");
         };
         assert_eq!(args.threshold, Some(80.0));
+    }
+
+    #[test]
+    fn a_stuck_watcher_waits_for_the_next_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path().join("data")).unwrap();
+        let engine = Engine::with_store(store).unwrap();
+        let interval = Duration::from_secs(300);
+
+        let stuck = |relief_in: i64| {
+            vec![TickOutcome {
+                provider: ProviderKind::Claude,
+                decision: Decision::Blocked(Blocked::AllExhausted {
+                    relief_at: Some(Timestamp::now() + jiff::SignedDuration::from_secs(relief_in)),
+                    relief_account: Some("claude-2".into()),
+                }),
+                switched: None,
+                held: None,
+            }]
+        };
+
+        // A reset an hour away is worth sleeping through.
+        let waited = wait_after(&stuck(3600), &engine, interval);
+        assert!(
+            waited > Duration::from_secs(3500) && waited < Duration::from_secs(3700),
+            "{waited:?}"
+        );
+
+        // A reset sooner than the poll interval must not shorten it.
+        assert_eq!(wait_after(&stuck(10), &engine, interval), interval);
+
+        // Nothing stuck: the normal interval applies.
+        let fine = vec![TickOutcome {
+            provider: ProviderKind::Claude,
+            decision: Decision::Stay(Stay::BelowThreshold { used: 10.0 }),
+            switched: None,
+            held: None,
+        }];
+        assert_eq!(wait_after(&fine, &engine, interval), interval);
     }
 }

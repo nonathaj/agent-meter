@@ -187,7 +187,8 @@ impl Engine {
     pub fn import(&self, kind: ProviderKind, label: Option<String>) -> Result<AddOutcome> {
         let provider = provider::get(kind);
         let home = provider.config_home()?;
-        let captured = provider.capture(&home)?;
+        let mut captured = provider.capture(&home)?;
+        name_account(kind, &mut captured);
         let _lock = self.store.lock()?;
         self.store_captured(kind, captured, label)
     }
@@ -224,9 +225,10 @@ impl Engine {
         // The throwaway home holds a live credential; remove it whether or not
         // the login worked.
         let discarded = provider.discard_home(&home);
-        let captured = result?;
+        let mut captured = result?;
         discarded?;
 
+        name_account(kind, &mut captured);
         let _lock = self.store.lock()?;
         self.store_captured(kind, captured, label)
     }
@@ -277,17 +279,9 @@ impl Engine {
     fn store_captured(
         &self,
         kind: ProviderKind,
-        mut captured: Captured,
+        captured: Captured,
         label: Option<String>,
     ) -> Result<AddOutcome> {
-        // Without an email an account is only ever "claude-2" in the interface.
-        // Ask the provider who it belongs to; failing that, store it anyway.
-        if captured.identity.email.is_none()
-            && let Ok(identity) = provider::get(kind).fetch_identity(&captured.credential)
-        {
-            captured.identity.update_from(&identity);
-        }
-
         let existing = self.store.accounts()?.into_iter().find(|a| {
             a.provider == kind
                 && (a.credential.refresh_token == captured.credential.refresh_token
@@ -412,26 +406,42 @@ impl Engine {
     /// limit these endpoints to roughly 30 requests per hour per account, so
     /// unforced polls stay inside that budget.
     pub fn poll(&self, ids: &[String], force: bool) -> Result<Vec<(String, Result<Usage, String>)>> {
-        let _lock = self.store.lock()?;
-        let accounts = self.store.accounts()?;
-        for kind in ProviderKind::ALL {
-            if accounts.iter().any(|a| a.provider == kind) {
-                self.sync_active(kind, &accounts)?;
+        // Work out what to poll under the lock, then let go of it: a poll makes
+        // network calls that can take tens of seconds, and holding the store
+        // lock through them would block every other agent-meter on the machine.
+        let (due, active_ids) = {
+            let _lock = self.store.lock()?;
+            let accounts = self.store.accounts()?;
+            let mut active_ids = Vec::new();
+            for kind in ProviderKind::ALL {
+                if accounts.iter().any(|a| a.provider == kind)
+                    && let Some(id) = self.sync_active(kind, &accounts)?
+                {
+                    active_ids.push(id);
+                }
             }
-        }
-        let accounts = self.store.accounts()?;
-        let mut cache = self.store.usage_cache()?;
-        let now = Timestamp::now();
 
+            let accounts = self.store.accounts()?;
+            let cache = self.store.usage_cache()?;
+            let now = Timestamp::now();
+            let due: Vec<Account> = accounts
+                .into_iter()
+                .filter(|a| ids.is_empty() || ids.contains(&a.id))
+                .filter(|a| force || self.is_poll_due(&cache, a, now))
+                .collect();
+            (due, active_ids)
+        };
+
+        let polled: Vec<_> = due
+            .iter()
+            .map(|account| (account, self.poll_one(account, active_ids.contains(&account.id))))
+            .collect();
+
+        let _lock = self.store.lock()?;
+        let mut cache = self.store.usage_cache()?;
         let mut results = Vec::new();
-        for account in &accounts {
-            if !ids.is_empty() && !ids.contains(&account.id) {
-                continue;
-            }
-            if !force && !self.is_poll_due(&cache, account, now) {
-                continue;
-            }
-            match self.poll_one(account) {
+        for (account, outcome) in polled {
+            match outcome {
                 Ok(usage) => {
                     cache.record_success(&account.id, usage.clone());
                     results.push((account.id.clone(), Ok(usage)));
@@ -464,34 +474,66 @@ impl Engine {
 
     /// Reads one account's usage, refreshing its token first if needed and
     /// retrying once if the provider rejects it.
-    fn poll_one(&self, account: &Account) -> Result<Usage, http::Error> {
+    fn poll_one(&self, account: &Account, active: bool) -> Result<Usage, http::Error> {
         let provider = provider::get(account.provider);
         let mut credential = account.credential.clone();
 
         if expires_within(&credential, REFRESH_LEEWAY) {
-            credential = self.refresh_and_store(provider, account)?;
+            credential = self.refresh_and_store(provider, account, active)?;
         }
 
         match provider.fetch_usage(&credential) {
             Err(http::Error::Unauthorized { .. }) => {
                 // The token was rejected even though it looked current; one
                 // refresh is worth trying before declaring the account dead.
-                let credential = self.refresh_and_store(provider, account)?;
+                let credential = self.refresh_and_store(provider, account, active)?;
                 provider.fetch_usage(&credential)
             }
             other => other,
         }
     }
 
-    /// Exchanges the refresh token and stores the result.
+    /// Exchanges the refresh token for a fresh one and stores the result.
     ///
-    /// Refresh tokens are single-use, so the new one is written before it is
-    /// used; a crash in between would otherwise strand the account.
+    /// Refresh tokens are single-use: the moment this exchange succeeds, every
+    /// other copy of the old token is dead. Two things follow, and both are
+    /// handled here.
+    ///
+    /// First, only one refresh may be in flight for an account, so this takes a
+    /// per-account lock and re-reads under it — if another agent-meter got
+    /// there first, its result is adopted instead of spending a second token.
+    /// Second, if the agent CLI is signed in to this account, the new token has
+    /// to reach the CLI as well; leaving it holding the spent one would sign
+    /// the user out at its next refresh.
     fn refresh_and_store(
         &self,
         provider: &dyn Provider,
         account: &Account,
+        active: bool,
     ) -> Result<Credential, http::Error> {
+        let transport = |e: anyhow::Error| http::Error::Transport(e);
+        let _lock = self.store.lock_account(&account.id).map_err(transport)?;
+
+        // Someone may have refreshed while this process waited for the lock.
+        if let Ok(Some(stored)) = self.store.account(&account.id)
+            && stored.credential != account.credential
+        {
+            return Ok(stored.credential);
+        }
+        // The CLI refreshes its own credential as it works. If it already has,
+        // that token is the live one and ours is spent: take theirs.
+        if active
+            && let Ok(home) = provider.config_home()
+            && let Ok(live) = provider.capture(&home)
+            && live.credential != account.credential
+        {
+            let mut updated = account.clone();
+            updated.credential = live.credential.clone();
+            updated.needs_login = None;
+            self.store.put_account(&updated).map_err(transport)?;
+            return Ok(live.credential);
+        }
+
         match provider.refresh(&account.credential) {
             Ok(credential) => {
                 let mut updated = account.clone();
@@ -499,7 +541,12 @@ impl Engine {
                 updated.needs_login = None;
                 self.store
                     .put_account(&updated)
-                    .map_err(|e| http::Error::Transport(e.context("saving the refreshed credential")))?;
+                    .map_err(|e| transport(e.context("saving the refreshed credential")))?;
+                if active && let Ok(home) = provider.config_home() {
+                    provider.install(&home, &updated).map_err(|e| {
+                        transport(e.context("giving the refreshed credential to the agent CLI"))
+                    })?;
+                }
                 Ok(credential)
             }
             Err(error) => {
@@ -599,6 +646,20 @@ impl Engine {
         };
         let elapsed = now.as_second() - record.at.as_second();
         Ok((elapsed < cooldown).then(|| std::time::Duration::from_secs((cooldown - elapsed) as u64)))
+    }
+}
+
+/// Asks the provider who an account belongs to, when the credential did not
+/// say. Without it the account is only ever "claude-2" in the interface.
+///
+/// Best effort, and deliberately outside the store lock: it is a network call,
+/// and a nameless account is better than a failed import.
+fn name_account(kind: ProviderKind, captured: &mut Captured) {
+    if captured.identity.email.is_some() {
+        return;
+    }
+    if let Ok(identity) = provider::get(kind).fetch_identity(&captured.credential) {
+        captured.identity.update_from(&identity);
     }
 }
 

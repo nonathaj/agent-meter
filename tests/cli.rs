@@ -282,6 +282,24 @@ fn a_credential_the_cli_rotated_is_adopted_rather_than_overwritten() {
     assert_eq!(stored["credential"]["refresh_token"], "sk-ant-ort01-rotated");
 }
 
+/// Two agent-meter processes must not trip over each other. A long `watch`
+/// used to hold the store lock through its network calls, so a `list` in
+/// another terminal would sit there and then fail.
+#[test]
+fn a_second_process_can_read_while_another_is_working() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("dev@example.com", "uuid-1", "one");
+    fixture.run(&["import", "claude"]);
+
+    let mut children: Vec<_> = (0..4)
+        .map(|_| fixture.cmd(&["list", "--refresh"]).spawn().unwrap())
+        .collect();
+    for child in &mut children {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "concurrent read failed: {status}");
+    }
+}
+
 #[test]
 fn removing_an_account_forgets_it_without_touching_the_cli() {
     let fixture = Fixture::new();

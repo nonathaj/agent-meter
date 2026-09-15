@@ -62,8 +62,18 @@ impl Store {
 
     /// Takes the store-wide lock. Hold it around any read-modify-write cycle so
     /// two agent-meter processes cannot interleave.
+    ///
+    /// Never hold it across a network call: the other processes on the machine
+    /// wait behind it.
     pub fn lock(&self) -> Result<FileLock> {
         FileLock::acquire(&self.dir.join("store.lock"), LOCK_TIMEOUT)
+    }
+
+    /// Takes a lock covering one account, for work that must not be done twice
+    /// at once but should not stop unrelated accounts from being read.
+    pub fn lock_account(&self, id: &str) -> Result<FileLock> {
+        validate_id(id)?;
+        FileLock::acquire(&self.accounts_dir().join(format!("{id}.lock")), LOCK_TIMEOUT)
     }
 
     /// Loads every account, sorted by provider then id.
@@ -152,6 +162,9 @@ impl Store {
         let path = self.account_path(id);
         let existed = path.exists();
         fsutil::remove_file_if_exists(&path).with_context(|| format!("removing {}", path.display()))?;
+        // The per-account lock file outlives the account otherwise. A lock held
+        // right now keeps the file open, so treat failure as nothing to do.
+        let _ = fsutil::remove_file_if_exists(&self.accounts_dir().join(format!("{id}.lock")));
         if existed {
             let mut usage = self.usage_cache()?;
             if usage.entries.remove(id).is_some() {

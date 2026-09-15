@@ -367,20 +367,17 @@ fn add(engine: &Engine, args: &AddArgs) -> Result<ExitCode> {
             .status()
             .context("starting the login. Is the CLI installed and on PATH?")
     })?;
-    report_added(engine, &outcome)
+    report_added(engine, &[outcome])
 }
 
 fn import(engine: &Engine, args: &ImportArgs) -> Result<ExitCode> {
     let providers: Vec<_> = args
         .provider
         .map_or_else(|| ProviderKind::ALL.to_vec(), |p| vec![p]);
-    let mut imported = 0;
-    let mut last = None;
-
+    let mut outcomes = Vec::new();
     for provider in providers {
         match engine.import(provider, args.label.clone()) {
             Ok(outcome) => {
-                imported += 1;
                 println!(
                     "{} {} from {}",
                     match outcome {
@@ -390,40 +387,45 @@ fn import(engine: &Engine, args: &ImportArgs) -> Result<ExitCode> {
                     outcome.id(),
                     provider.display_name()
                 );
-                last = Some(outcome);
+                outcomes.push(outcome);
             }
-            // With no provider named, this is a survey: a CLI that is not
-            // signed in here is expected, not an error.
+            // With no provider named, this is a survey of the machine: a CLI
+            // that is not signed in here is expected, not an error.
             Err(error) if args.provider.is_none() => {
                 eprintln!("Skipped {}: {error}", provider.display_name());
             }
             Err(error) => return Err(error),
         }
     }
-
-    match last {
-        Some(outcome) if imported == 1 => report_added(engine, &outcome),
-        Some(_) => Ok(ExitCode::SUCCESS),
-        None => bail!("no agent CLI on this machine is signed in to an account agent-meter can read"),
+    if outcomes.is_empty() {
+        bail!("no agent CLI on this machine is signed in to an account agent-meter can read");
     }
+    report_added(engine, &outcomes)
 }
 
-fn report_added(engine: &Engine, outcome: &AddOutcome) -> Result<ExitCode> {
-    let account = engine.resolve(outcome.id())?;
-    match outcome {
-        AddOutcome::Added { .. } => println!("\nAdded {} ({})", account.id, account.display_name()),
-        AddOutcome::Updated { .. } => {
-            println!(
+/// Names what was added and shows where it leaves the user.
+fn report_added(engine: &Engine, outcomes: &[AddOutcome]) -> Result<ExitCode> {
+    if let [outcome] = outcomes {
+        let account = engine.resolve(outcome.id())?;
+        match outcome {
+            AddOutcome::Added { .. } => println!("\nAdded {} ({})", account.id, account.display_name()),
+            AddOutcome::Updated { .. } => println!(
                 "\nUpdated {} ({}) — it was already stored",
                 account.id,
                 account.display_name()
-            );
+            ),
         }
     }
-    // A first reading makes the account eligible for automatic switching.
-    if let Some((_, Err(error))) = engine.poll(std::slice::from_ref(&account.id), true)?.first() {
-        eprintln!("Could not read its usage yet: {error}");
+
+    // A first reading is what makes an account eligible for switching, so take
+    // one now rather than leaving the table full of question marks.
+    let ids: Vec<String> = outcomes.iter().map(|o| o.id().to_string()).collect();
+    for (id, result) in engine.poll(&ids, true)? {
+        if let Err(error) = result {
+            eprintln!("Could not read usage for {id} yet: {error}");
+        }
     }
+    println!();
     print!("{}", render_table(&engine.status()?, Timestamp::now()));
     Ok(ExitCode::SUCCESS)
 }

@@ -63,6 +63,12 @@ agent-meter watch
 Accounts are named `claude-1`, `codex-2` and so on. Commands that take an
 account also accept its email address or a label you gave it with `--label`.
 
+One address can hold more than one account: a personal seat and a seat in a
+team share an address, and on Claude a user id too — only the organisation
+tells them apart, which is why it has a column of its own. They have separate
+limits, so `agent-meter` keeps them as separate accounts, and naming the shared
+address asks you which one you meant.
+
 ## Commands
 
 | Command | What it does |

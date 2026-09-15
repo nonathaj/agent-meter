@@ -475,10 +475,47 @@ fn parse_profile(response: &Value) -> Identity {
         user_id: string(account, "uuid"),
         email: string(account, "email").or_else(|| string(account, "email_address")),
         workspace_id: string(organization, "uuid"),
-        workspace_name: string(organization, "name"),
+        workspace_name: workspace_name(organization),
         plan: parse_plan(account, organization),
         capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
     }
+}
+
+/// What to call the organisation a seat belongs to.
+///
+/// A personal organisation's provider-given name is the account's own address
+/// with several words stapled to it — "someone@example.com's Organization" —
+/// which repeats the column beside it and pushes the row onto a second line.
+/// It is one word: `personal`. A team's own name stands as it is, because that
+/// is the thing that tells two seats under one address apart.
+///
+/// A team name is written by whoever named the organisation, so it is trimmed
+/// of anything that could repaint the row it lands on.
+fn workspace_name(organization: Option<&Value>) -> Option<String> {
+    let personal = matches!(
+        organization
+            .and_then(|o| o.get("organization_type"))
+            .and_then(Value::as_str),
+        Some("claude_max" | "claude_pro")
+    );
+    if personal {
+        return Some("personal".into());
+    }
+    let name: String = organization?
+        .get("name")?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_override(*c))
+        .take(40)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Characters that reorder the text around them, so a name cannot be made to
+/// read as another organisation's.
+fn is_bidi_override(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}')
 }
 
 /// Which plan an account is on.
@@ -808,6 +845,37 @@ mod tests {
             "organization": {"organization_type": "\u{1b}[31mclaude_evil"}
         }));
         assert_eq!(identity.plan, None);
+    }
+
+    /// A personal organisation is named after the address it sits beside, so
+    /// printing it verbatim repeats the column next to it and wraps the row.
+    #[test]
+    fn a_personal_organization_is_called_personal_and_a_team_keeps_its_name() {
+        let named = |org_type: &str, name: &str| {
+            workspace_name(Some(&json!({"organization_type": org_type, "name": name})))
+        };
+        assert_eq!(
+            named("claude_max", "dev@example.com's Organization").as_deref(),
+            Some("personal")
+        );
+        assert_eq!(
+            named("claude_pro", "dev@example.com's Org").as_deref(),
+            Some("personal")
+        );
+        assert_eq!(
+            named("claude_team", "Example Inc").as_deref(),
+            Some("Example Inc")
+        );
+
+        // A team names itself, so the name is trimmed of anything that could
+        // repaint the row or make it read as another organisation.
+        assert_eq!(
+            named("claude_team", "\u{1b}[31mEvil\u{202e}").as_deref(),
+            Some("[31mEvil")
+        );
+        assert_eq!(named("claude_team", &"n".repeat(100)).unwrap().len(), 40);
+        assert_eq!(named("claude_team", "   ").as_deref(), None);
+        assert_eq!(workspace_name(None), None);
     }
 
     #[test]

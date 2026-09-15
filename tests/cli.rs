@@ -35,6 +35,22 @@ impl Fixture {
         fixture
     }
 
+    /// Signs the fixture's Claude Code in to a seat in a named organisation.
+    ///
+    /// `org` is `None` for a credential whose organisation was never recorded.
+    fn sign_in_claude_seat(&self, email: &str, uuid: &str, refresh: &str, org: Option<&str>) {
+        self.sign_in_claude(email, uuid, refresh);
+        let mut account = json!({"accountUuid": uuid, "emailAddress": email});
+        if let Some(org) = org {
+            account["organizationUuid"] = json!(org);
+            account["organizationName"] = json!(org);
+        }
+        write_json(
+            &self.claude_home.join(".claude.json"),
+            &json!({"numStartups": 42, "oauthAccount": account}),
+        );
+    }
+
     /// Signs the fixture's Claude Code in to an account.
     fn sign_in_claude(&self, email: &str, uuid: &str, refresh: &str) {
         write_json(
@@ -298,6 +314,87 @@ fn a_second_process_can_read_while_another_is_working() {
         let status = child.wait().unwrap();
         assert!(status.success(), "concurrent read failed: {status}");
     }
+}
+
+/// One address can hold a personal seat and a seat in a team. On Claude they
+/// share a user id as well, so only the organisation tells them apart — and
+/// treating them as one account overwrites one credential with the other's.
+/// The overwritten one is gone, not hidden.
+#[test]
+fn a_second_seat_under_the_same_address_is_a_separate_account() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "team", Some("team-org"));
+    fixture.run(&["import", "claude"]);
+
+    // The person signs in to their personal organisation: same address, same
+    // user, different organisation, and a credential of its own.
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "personal", Some("personal-org"));
+    fixture.run(&["import", "claude"]);
+
+    let accounts = fixture.accounts();
+    assert_eq!(accounts.len(), 2, "two seats, two accounts: {accounts:#?}");
+    assert_eq!(accounts[0]["organization"], "team-org");
+    assert_eq!(accounts[1]["organization"], "personal-org");
+    // Only the seat that is actually signed in is marked live.
+    assert_eq!(accounts[0]["active"], false);
+    assert_eq!(accounts[1]["active"], true);
+
+    // The team credential still exists. This is the part the bug destroyed.
+    let stored: Value = read_json(&fixture.data.join("accounts").join("claude-1.json"));
+    assert_eq!(stored["credential"]["refresh_token"], "sk-ant-ort01-team");
+
+    // Both rows show the same address, so the column that tells them apart has
+    // to be there, and naming the address alone cannot choose between them.
+    let table = fixture.run(&["list"]);
+    assert!(
+        table.contains("team-org") && table.contains("personal-org"),
+        "{table}"
+    );
+    fixture
+        .cmd(&["use", "dev@example.com"])
+        .assert()
+        .failure()
+        .stderr(contains("matches several accounts").and(contains("claude-1")));
+}
+
+/// The same trap with the organisation missing rather than different: nothing
+/// contradicts, the user id matches, and adopting on that alone would replace a
+/// credential that belongs to the other seat.
+#[test]
+fn an_unstated_organization_never_adopts_another_seats_credential() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "team", None);
+    fixture.run(&["import", "claude"]);
+
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "personal", Some("personal-org"));
+    // `list` is enough: it reconciles what the CLI is signed in to.
+    fixture.run(&["list"]);
+
+    let stored: Value = read_json(&fixture.data.join("accounts").join("claude-1.json"));
+    assert_eq!(
+        stored["credential"]["refresh_token"], "sk-ant-ort01-team",
+        "an unstated organisation must not confirm a match"
+    );
+    assert_eq!(fixture.accounts()[0]["active"], false);
+}
+
+/// The floor under the rule above: when the credential itself is the same, the
+/// accounts are the same whatever the organisation says, so a `.claude.json`
+/// that drifts cannot split one account into two rows.
+#[test]
+fn an_unchanged_credential_is_the_same_account_however_the_organization_reads() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "one", Some("team-org"));
+    fixture.run(&["import", "claude"]);
+
+    // Same credential, but the recorded organisation changed underneath it.
+    fixture.sign_in_claude_seat("dev@example.com", "same-person", "one", None);
+    fixture
+        .cmd(&["import", "claude"])
+        .assert()
+        .success()
+        .stdout(contains("Updated claude-1"));
+    assert_eq!(fixture.accounts().len(), 1);
 }
 
 #[test]

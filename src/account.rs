@@ -124,14 +124,32 @@ pub enum Match {
     Unknown,
 }
 
-/// Compares two identities. A conflicting user or workspace id always means a
-/// different account; otherwise a matching user id or email means the same one.
+/// Compares two identities.
+///
+/// One address can hold more than one account: a personal seat and a seat in a
+/// team share an address, and on Claude they share a user id too — they differ
+/// only in the organisation. So the organisation is part of *which* account
+/// this is, and the rules follow from that:
+///
+/// 1. anything stated on both sides that disagrees means different accounts;
+/// 2. a match cannot be **confirmed** while only one side states an
+///    organisation, because the other side may be the same person's other seat;
+/// 3. otherwise a matching user id, or address, means the same account.
+///
+/// Callers compare refresh tokens before asking: identical tokens are the same
+/// account whatever this says, which is what keeps a merely unstated
+/// organisation from splitting one account in two.
 pub fn same_identity(a: &Identity, b: &Identity) -> Match {
     fn conflict(x: &Option<String>, y: &Option<String>) -> bool {
         matches!((x, y), (Some(x), Some(y)) if x != y)
     }
     if conflict(&a.user_id, &b.user_id) || conflict(&a.workspace_id, &b.workspace_id) {
         return Match::Different;
+    }
+    // Rule 2. Saying "same" here would let one seat's credential overwrite the
+    // other's, and the overwritten one is gone rather than hidden.
+    if a.workspace_id.is_some() != b.workspace_id.is_some() {
+        return Match::Unknown;
     }
     if matches!((&a.user_id, &b.user_id), (Some(x), Some(y)) if x == y) {
         return Match::Same;
@@ -225,6 +243,39 @@ mod tests {
             workspace_id: ws.map(Into::into),
             ..Default::default()
         }
+    }
+
+    /// One address can hold two accounts: a personal seat and a team one. They
+    /// differ only in the organisation, so a match that ignores it merges two
+    /// accounts into one record — and whichever credential is written second
+    /// destroys the first.
+    #[test]
+    fn two_seats_under_one_address_are_two_accounts() {
+        let person = |org: Option<&str>| Identity {
+            user_id: Some("same-person".into()),
+            email: Some("dev@example.com".into()),
+            workspace_id: org.map(Into::into),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            same_identity(&person(Some("team-org")), &person(Some("personal-org"))),
+            Match::Different,
+            "the same person in two organisations is two accounts"
+        );
+        assert_eq!(
+            same_identity(&person(Some("team-org")), &person(Some("team-org"))),
+            Match::Same
+        );
+
+        // The dangerous case: one side never stated an organisation, so there
+        // is nothing to conflict with and the person matches. Saying "same"
+        // here would overwrite a credential belonging to the other seat.
+        assert_eq!(
+            same_identity(&person(None), &person(Some("team-org"))),
+            Match::Unknown,
+            "an unstated organisation cannot confirm a match, only fail to deny one"
+        );
     }
 
     #[test]

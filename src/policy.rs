@@ -103,7 +103,13 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     let Some(active) = candidates.iter().find(|c| c.active) else {
         return Decision::Stay(Stay::NoActiveAccount);
     };
-    let Some(active_usage) = fresh(active, rules, now) else {
+    // Deliberately not gated on age. The account being used up is the one that
+    // gets hammered, so it is the first the provider rate-limits — and if a
+    // failed poll made it unreadable rather than spent, switching would stop
+    // working at exactly the moment it is needed. A provider declining to
+    // answer is not a provider retracting what it said, and a reading that has
+    // passed its reset already counts as empty rather than full.
+    let Some(active_usage) = active.usage else {
         return Decision::Stay(Stay::UsageUnknown);
     };
 
@@ -376,21 +382,52 @@ mod tests {
         );
     }
 
+    /// The account that gets hammered is the spent one, so it is the first to
+    /// be rate-limited — and if a failed poll made it *unreadable* rather than
+    /// *spent*, switching would stop working exactly when it is needed. What
+    /// the endpoint said before still stands: a provider declining to answer is
+    /// not a provider retracting what it said.
+    #[test]
+    fn a_stale_reading_still_counts_against_the_account_in_use() {
+        let rules = Rules::default();
+        let long_ago = rules.max_reading_age_secs * 10;
+        let spent = usage_aged(100.0, long_ago);
+        let fresh_other = usage(5.0);
+
+        let decision = decide(
+            &[
+                candidate("claude-1", Some(&spent), true),
+                candidate("claude-2", Some(&fresh_other), false),
+            ],
+            &rules,
+            now(),
+        );
+        assert!(
+            matches!(&decision, Decision::Switch { to, .. } if to == "claude-2"),
+            "a spent account that stopped answering must still be left: {decision:?}"
+        );
+    }
+
+    /// The same reading does not get to claim headroom once it is old: an
+    /// account is only switched *to* on figures that are still current.
     #[test]
     fn stale_readings_are_not_acted_on() {
         let rules = Rules::default();
         let stale_active = usage_aged(95.0, rules.max_reading_age_secs + 1);
         let fresh_other = usage(5.0);
-        assert_eq!(
-            decide(
-                &[
-                    candidate("claude-1", Some(&stale_active), true),
-                    candidate("claude-2", Some(&fresh_other), false)
-                ],
-                &rules,
-                now()
+        assert!(
+            matches!(
+                decide(
+                    &[
+                        candidate("claude-1", Some(&stale_active), true),
+                        candidate("claude-2", Some(&fresh_other), false)
+                    ],
+                    &rules,
+                    now()
+                ),
+                Decision::Switch { .. }
             ),
-            Decision::Stay(Stay::UsageUnknown)
+            "the account in use is judged on what is known about it"
         );
 
         // A stale candidate is not a switch target either.

@@ -1,0 +1,3 @@
+# Slightly wider than the default: the code leans on descriptive names, and
+# 100 columns splits too many of them across lines.
+max_width = 110

@@ -1,0 +1,39 @@
+[package]
+name = "agent-meter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Manage multiple AI coding-agent accounts (Claude Code, Codex): import, log in, meter usage, and auto-switch before you hit a limit."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["claude", "codex", "cli", "tui", "accounts"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/"]
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+comfy-table = "8.0.0"
+ctrlc = { version = "3.5.2", features = ["termination"] }
+dirs = "7.0.0"
+jiff = { version = "0.2.37", features = ["serde"] }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+toml = "1.1.6"
+unicode-normalization = "0.1.25"
+ureq = { version = "3.4.2", features = ["json", "platform-verifier"] }
+which = "8.0.6"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+mockito = "1.7.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+strip = true

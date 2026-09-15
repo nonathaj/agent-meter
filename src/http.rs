@@ -20,7 +20,13 @@ pub fn user_agent() -> String {
 
 /// Whether network access is switched off for this run.
 pub fn is_offline() -> bool {
-    std::env::var_os(OFFLINE_ENV).is_some_and(|value| !value.is_empty() && value != "0")
+    offline_from(std::env::var_os(OFFLINE_ENV).as_deref())
+}
+
+/// The rule [`is_offline`] applies, separated from the environment so it can be
+/// tested without mutating process-wide state that other tests are reading.
+fn offline_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// A shared agent: connection pooling matters because the watcher polls the
@@ -43,7 +49,23 @@ fn agent() -> &'static ureq::Agent {
 
 /// GETs JSON from `url` with the given headers.
 pub fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)]) -> Result<T> {
-    check_online()?;
+    get_json_unless(is_offline(), url, headers)
+}
+
+/// POSTs a JSON body to `url` and reads a JSON response.
+pub fn post_json<T: DeserializeOwned>(url: &str, body: Value) -> Result<T> {
+    if is_offline() {
+        return Err(Error::Offline);
+    }
+    read_json(url, agent().post(url).send_json(body))
+}
+
+/// The body of [`get_json`], with the offline decision passed in so a test can
+/// prove that being offline sends nothing at all.
+fn get_json_unless<T: DeserializeOwned>(offline: bool, url: &str, headers: &[(&str, &str)]) -> Result<T> {
+    if offline {
+        return Err(Error::Offline);
+    }
     let mut request = agent().get(url);
     for (name, value) in headers {
         request = request.header(*name, *value);
@@ -51,22 +73,9 @@ pub fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)]) -> Res
     read_json(url, request.call())
 }
 
-/// POSTs a JSON body to `url` and reads a JSON response.
-pub fn post_json<T: DeserializeOwned>(url: &str, body: Value) -> Result<T> {
-    check_online()?;
-    read_json(url, agent().post(url).send_json(body))
-}
-
 /// Convenience for the bearer header every provider endpoint expects.
 pub fn bearer(token: &str) -> String {
     format!("Bearer {token}")
-}
-
-fn check_online() -> Result<()> {
-    if is_offline() {
-        return Err(Error::Offline);
-    }
-    Ok(())
 }
 
 /// What went wrong with a provider request.
@@ -295,16 +304,22 @@ mod tests {
         let never = server.mock("GET", "/usage").expect(0).create();
         let url = format!("{}/usage", server.url());
 
-        // SAFETY: the variable is read only by this module, and this test does
-        // not run in parallel with another that reads it.
-        unsafe { std::env::set_var(OFFLINE_ENV, "1") };
-        let err = get_json::<Value>(&url, &[]).unwrap_err();
-        unsafe { std::env::remove_var(OFFLINE_ENV) };
-
+        let err = get_json_unless::<Value>(true, &url, &[]).unwrap_err();
         assert!(matches!(err, Error::Offline));
         // Offline must never be mistaken for a bad credential.
         assert!(err.is_transient());
+        // The message has to name the switch, or nobody will know why.
         assert!(err.to_string().contains(OFFLINE_ENV));
         never.assert();
+    }
+
+    #[test]
+    fn the_offline_switch_reads_the_usual_ways_of_saying_no() {
+        let os = std::ffi::OsStr::new;
+        assert!(!offline_from(None));
+        assert!(!offline_from(Some(os(""))));
+        assert!(!offline_from(Some(os("0"))));
+        assert!(offline_from(Some(os("1"))));
+        assert!(offline_from(Some(os("true"))));
     }
 }

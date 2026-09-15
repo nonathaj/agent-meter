@@ -8,8 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Nothing in the test suite may reach a provider.
-  AGENT_METER_OFFLINE: "1"
+  # AGENT_METER_OFFLINE is deliberately NOT set here. The end-to-end tests set
+  # it per command themselves, which is what keeps them off the network; setting
+  # it for the whole job would also switch off the HTTP layer's own unit tests,
+  # which talk to a local mock server.
 
 jobs:
   test:

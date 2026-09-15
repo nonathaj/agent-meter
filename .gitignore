@@ -1,1 +1,4 @@
 /target
+
+# Crash dumps from shells run in the working directory.
+*.stackdump

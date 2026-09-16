@@ -93,18 +93,55 @@ import, `d` to remove, `w` to watch, `?` for the rest.
 
 On each check, for each provider:
 
-1. If the live account is below the threshold (90% by default), nothing happens.
-2. Otherwise the roomiest other account below the threshold wins.
-3. If **every** account is past the threshold, it still moves — but only to an
-   account with at least 5 points more headroom, so two busy accounts do not
-   ping-pong. This is the case that gets the most out of the subscriptions you
-   are paying for.
+1. If the live account is below the threshold (90% by default), nothing happens
+   — except on Claude, where an expiring week can still move it; see below.
+2. Otherwise the best other account below the threshold wins.
+3. If **every** account is past the threshold, what happens depends on what a
+   switch costs. This is the case that gets the most out of the subscriptions
+   you are paying for.
 4. If every account is completely spent, it says so and names the one that frees
    up first, rather than churning.
 
-An account is only ever compared on its *tightest* window: an account at 20% of
-its five-hour limit but 98% of its weekly one is treated as 98% full, because
-that is the limit you will hit.
+An account is compared on its *tightest* window, so one at 20% of its five-hour
+limit but 98% of its weekly one counts as 98% full. But only the account's own
+limits count: `weekly Opus` at 100% costs one model, while `weekly` at 100%
+stops the account, so a spent per-model window never makes an account look
+unusable.
+
+### The five-hour window gates; the week ranks
+
+The two limits are not the same kind of thing, and ranking on whichever happens
+to be worse gets it wrong:
+
+- A five-hour window is a **rate**. At 90% it costs a few hours of waiting, and
+  it refills on its own.
+- A weekly window is a **budget**. At 90% it costs days — and whatever is left
+  in it when it resets is **thrown away**.
+
+So the threshold keeps throttled accounts out, and what ranks the rest is when
+they recover: **soonest weekly reset first**, then soonest five-hour reset, then
+how much work each can still do, then the name. Spending the soonest-expiring
+allowance first is earliest-deadline-first on a perishable resource — better or
+neutral, never worse.
+
+### What a switch costs decides how eager it is
+
+Claude Code re-reads its credential between messages, so a switch interrupts
+nothing. Codex reads its once at startup, so a switch means restarting whatever
+you have open. `agent-meter` takes that from the provider itself rather than
+naming them in the rules:
+
+- **Claude** moves whenever another usable account's week expires sooner, without
+  waiting for the threshold — that allowance is being wasted while it waits, and
+  taking it costs nothing. The trigger is a strictly sooner weekly reset and
+  nothing else, which is what stops it oscillating: a weekly reset is fixed for
+  the life of its window, so whichever account wins stays the winner until its
+  week actually turns over.
+- **Codex** stays put once everything is past the threshold. Picking the least
+  busy of several busy accounts is an optimisation, and paying for one by
+  restarting your sessions is the wrong trade — unless staying means staying on
+  an account that can do nothing at all, which is a restart you would have to
+  take anyway.
 
 ### Quota size, not just percentage
 
@@ -114,19 +151,15 @@ multiplier, shown in the plan column: a `max 20x` seat holds four times what a
 `team 5x` one does, so **40% left on the 20x seat is twice the work that 90%
 left on the 5x seat is**.
 
-Where the provider states the size of every account in play, `agent-meter` ranks
-by how much work each can still do rather than by the fraction it has left. If
-the size of any one of them is unknown, it compares percentages instead — an
+Where the provider states the size of every account in play, `agent-meter`
+compares how much work each can still do rather than the fraction it has left.
+If the size of any one of them is unknown, it compares percentages instead — an
 account is never ranked last over a fact the provider simply did not state.
 
 The same is true of the plan name itself: a Team seat reports `has_claude_max`
 exactly as a personal Max seat does, so the plan is read from the account's
 organization type, and both the plan and the multiplier come from the provider
 rather than from the copies in the local credential file, which drift.
-
-Claude Code re-reads its credential between messages, so a switch takes effect
-in a session you already have open. Codex reads its credential once at startup,
-so `agent-meter` tells you when a restart is needed.
 
 ## Settings
 

@@ -5,6 +5,23 @@ use serde::{Deserialize, Serialize};
 
 pub const FIVE_HOURS: u64 = 5 * 3600;
 pub const ONE_WEEK: u64 = 7 * 24 * 3600;
+/// Providers report window lengths a little loosely, so they are matched with
+/// a few minutes of slack rather than exactly.
+const WINDOW_TOLERANCE: u64 = 300;
+
+/// What a rate-limit window measures.
+///
+/// The two are not interchangeable, and ranking accounts against each other
+/// depends on the difference. A five-hour window is a **rate**: at 90% it costs
+/// a few hours of waiting. A weekly window is a **budget**: at 90% it costs
+/// days, and whatever is left in it when it resets is thrown away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    FiveHour,
+    Weekly,
+    /// Some other length the provider reported.
+    Other,
+}
 
 /// One rate-limit window, e.g. "5-hour session" or "weekly, Opus only".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,6 +39,25 @@ pub struct Window {
 }
 
 impl Window {
+    /// What this window measures.
+    pub fn kind(&self) -> WindowKind {
+        let near = |length: u64| self.window_secs.abs_diff(length) <= WINDOW_TOLERANCE;
+        match () {
+            _ if near(FIVE_HOURS) => WindowKind::FiveHour,
+            _ if near(ONE_WEEK) => WindowKind::Weekly,
+            _ => WindowKind::Other,
+        }
+    }
+
+    /// Whether this window limits the whole account rather than one model.
+    ///
+    /// The difference is what a limit costs: `weekly` at 100% stops the account,
+    /// while `weekly Opus` at 100% only stops one model and leaves the account
+    /// able to do most of its work.
+    pub fn is_account_wide(&self) -> bool {
+        self.scope.is_none()
+    }
+
     /// Short label such as `5h`, `weekly`, or `weekly Opus`.
     pub fn label(&self) -> String {
         let base = match self.window_secs {
@@ -75,13 +111,34 @@ impl Usage {
         (100.0 - self.used_at(now)).max(0.0)
     }
 
-    /// Whether the account cannot serve requests right now.
+    /// Whether the account can do no work at all right now.
+    ///
+    /// Only account-wide windows count. A per-model window at 100% costs that
+    /// model; the account can still do most of its work, and calling it spent
+    /// would refuse an account that is largely free.
     pub fn is_exhausted_at(&self, now: Timestamp) -> bool {
-        if self.used_at(now) >= 100.0 {
+        let spent = self
+            .windows
+            .iter()
+            .filter(|w| w.is_account_wide())
+            .any(|w| w.used_at(now) >= 100.0);
+        if spent {
             return true;
         }
         // A "limit reached" flag is only trusted until the next window resets.
         self.limit_reached && self.windows.iter().all(|w| w.resets_at.is_none_or(|r| r > now))
+    }
+
+    /// When the account's own window of `kind` resets.
+    ///
+    /// Per-model windows are ignored: this answers when the *account* recovers.
+    /// `None` when the provider stated no such window, or no reset for it.
+    pub fn resets_at(&self, kind: WindowKind) -> Option<Timestamp> {
+        self.windows
+            .iter()
+            .filter(|w| w.is_account_wide() && w.kind() == kind)
+            .filter_map(|w| w.resets_at)
+            .min()
     }
 
     /// When the account becomes usable again: the instant every exhausted

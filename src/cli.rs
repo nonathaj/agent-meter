@@ -589,6 +589,10 @@ fn describe(decision: &Decision, dry_run: bool) -> String {
         Decision::Stay(Stay::NoBetterAccount { used }) => {
             format!("{used:.0}% used, but no other account has meaningfully more left")
         }
+        Decision::Stay(Stay::NotWorthARestart { used }) => format!(
+            "{used:.0}% used, and so is every other account — staying put rather than \
+             restarting your sessions to pick the least busy one"
+        ),
         Decision::Switch { to, reason } => {
             let why = match reason {
                 Reason::ThresholdCrossed { used, target_used } => {
@@ -600,6 +604,10 @@ fn describe(decision: &Decision, dry_run: bool) -> String {
                 Reason::ActiveExhausted { target_used } => {
                     format!("out of quota; {to} is at {target_used:.0}%")
                 }
+                Reason::WeekExpiresSooner { target_used } => format!(
+                    "{to}'s weekly allowance resets sooner, so spending it first wastes \
+                     nothing; it is at {target_used:.0}% and switching interrupts nothing"
+                ),
             };
             if dry_run {
                 format!("would switch to {to} ({why})")

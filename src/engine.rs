@@ -11,7 +11,7 @@ use jiff::{SignedDuration, Timestamp};
 use crate::account::{Account, Captured, Credential, Match, ProviderKind, SCHEMA_VERSION, same_identity};
 use crate::config::Config;
 use crate::http;
-use crate::policy::{self, Candidate, Decision, Rules};
+use crate::policy::{self, Candidate, Decision, Disruption, Rules};
 use crate::provider::{self, Provider};
 use crate::store::{Store, SwitchRecord, UsageCache};
 use crate::usage::Usage;
@@ -631,6 +631,14 @@ impl Engine {
             let rules = Rules {
                 threshold: self.config.threshold_for(kind),
                 margin: self.config.watch.margin,
+                // Taken from the provider's own answer about restarts, so a new
+                // provider inherits the behaviour instead of being named in the
+                // policy.
+                disruption: if provider::get(kind).restarts_sessions() {
+                    Disruption::RestartsSessions
+                } else {
+                    Disruption::Seamless
+                },
                 ..Rules::default()
             };
             let decision = policy::decide(&candidates, &rules, now);

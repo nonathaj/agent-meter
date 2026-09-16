@@ -209,6 +209,14 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub provider_data: Map<String, Value>,
     pub added_at: Timestamp,
+    /// When the provider last stated this account's plan and quota size.
+    ///
+    /// Those change when somebody changes plan or moves organisation, so they
+    /// are re-asked on a far slower clock than usage — but they do change, and
+    /// the quota size feeds the switching rules, so a stale one misranks the
+    /// account rather than merely displaying something wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_checked_at: Option<Timestamp>,
     /// Set when the stored tokens were rejected and the account must log in again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_login: Option<String>,

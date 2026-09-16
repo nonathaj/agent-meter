@@ -24,6 +24,13 @@ const REFRESH_LEEWAY: SignedDuration = SignedDuration::from_mins(10);
 /// an interrupted login. Longer than any sign-in a person would still be doing.
 const LOGIN_HOME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// How long an account's stated plan and quota size are taken on trust.
+///
+/// Six hours is far slower than usage is polled, and far faster than anyone
+/// changes plan — about four requests a day for the one account in use, against
+/// a budget measured in tens per hour.
+const ENTITLEMENT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 pub struct Engine {
     store: Store,
     config: Config,
@@ -288,11 +295,19 @@ impl Engine {
                     || same_identity(&a.identity, &captured.identity) == Match::Same)
         });
 
+        // A plan here came from the provider a moment ago, in `name_account`
+        // for Claude or from the signed token claims for Codex, so it starts
+        // the clock rather than leaving the next poll to ask again.
+        let checked_at = captured.identity.plan.is_some().then(Timestamp::now);
+
         if let Some(mut account) = existing {
             account.credential = captured.credential;
             account.identity.update_from(&captured.identity);
             account.provider_data = captured.provider_data;
             account.needs_login = None;
+            if checked_at.is_some() {
+                account.entitlement_checked_at = checked_at;
+            }
             if label.is_some() {
                 account.label = label;
             }
@@ -309,6 +324,7 @@ impl Engine {
             credential: captured.credential,
             provider_data: captured.provider_data,
             added_at: Timestamp::now(),
+            entitlement_checked_at: checked_at,
             needs_login: None,
         };
         self.store.put_account(&account)?;
@@ -435,9 +451,10 @@ impl Engine {
         let polled: Vec<_> = due
             .iter()
             .map(|account| {
-                let outcome = self.poll_one(account, active_ids.contains(&account.id));
+                let active = active_ids.contains(&account.id);
+                let outcome = self.poll_one(account, active);
                 if outcome.is_ok() {
-                    self.learn_entitlement(account);
+                    self.learn_entitlement(account, active);
                 }
                 (account, outcome)
             })
@@ -464,15 +481,19 @@ impl Engine {
         Ok(results)
     }
 
-    /// Fills in the plan and quota size of an account that does not have them.
+    /// Keeps an account's plan and quota size current.
     ///
-    /// An account imported while offline, or stored before agent-meter asked
-    /// about quota sizes, has no way to learn either otherwise — and without
-    /// the quota size the switching rules fall back to comparing percentages.
-    /// Costs one request per account, once, because it stops as soon as the
-    /// plan is known.
-    fn learn_entitlement(&self, account: &Account) {
-        if account.identity.plan.is_some() {
+    /// Asked once for any account that has neither — one imported while
+    /// offline, say — because without the quota size the switching rules fall
+    /// back to comparing percentages.
+    ///
+    /// After that only the account in use is re-asked, and on a clock measured
+    /// in hours rather than minutes. These facts change when somebody changes
+    /// plan or moves organisation, not as work is done, and every request spent
+    /// here comes out of the same per-account budget as the usage polls that
+    /// the switching actually runs on.
+    fn learn_entitlement(&self, account: &Account, active: bool) {
+        if !entitlement_due(account, active, Timestamp::now()) {
             return;
         }
         let Ok(identity) = provider::get(account.provider).fetch_identity(&account.credential) else {
@@ -488,6 +509,7 @@ impl Engine {
             return;
         };
         current.identity.update_from(&identity);
+        current.entitlement_checked_at = Some(Timestamp::now());
         let _ = self.store.put_account(&current);
     }
 
@@ -708,6 +730,23 @@ fn name_account(kind: ProviderKind, captured: &mut Captured) {
     }
 }
 
+/// Whether to ask the provider what an account is entitled to.
+///
+/// An account that has never been told its plan asks once, because without the
+/// quota size the switching rules are comparing percentages blind. After that
+/// only the account in use asks again, and only when the answer is old: these
+/// facts change when somebody changes plan, not as work is done, and every
+/// request spent here is one the usage polls no longer have.
+fn entitlement_due(account: &Account, active: bool, now: Timestamp) -> bool {
+    if account.identity.plan.is_none() {
+        return true;
+    }
+    let stale = account
+        .entitlement_checked_at
+        .is_none_or(|at| now.as_second() - at.as_second() >= ENTITLEMENT_MAX_AGE.as_secs() as i64);
+    active && stale
+}
+
 /// Whether a credential expires within `leeway`.
 fn expires_within(credential: &Credential, leeway: SignedDuration) -> bool {
     credential
@@ -830,6 +869,42 @@ mod tests {
         assert_eq!(engine.resolve("personal").unwrap().id, "claude-1");
         let err = engine.resolve("nope").unwrap_err().to_string();
         assert!(err.contains("agent-meter list"), "{err}");
+    }
+
+    /// The plan and quota size are re-asked on a clock measured in hours, and
+    /// only for the account in use. Every request here competes with the usage
+    /// polls that switching actually runs on.
+    #[test]
+    fn only_the_account_in_use_re_asks_its_entitlement_and_only_when_it_is_old() {
+        let (_tmp, engine) = engine();
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r1"), None)
+            .unwrap();
+        let mut account = engine.store().account("claude-1").unwrap().unwrap();
+        account.identity.plan = Some("team".into());
+
+        let now = Timestamp::now();
+        let checked = |hours: i64| Some(now - jiff::SignedDuration::from_hours(hours));
+
+        account.entitlement_checked_at = checked(1);
+        assert!(!entitlement_due(&account, true, now), "asked an hour ago");
+        assert!(!entitlement_due(&account, false, now), "not the account in use");
+
+        account.entitlement_checked_at = checked(7);
+        assert!(
+            entitlement_due(&account, true, now),
+            "in use, and the answer is old"
+        );
+        assert!(
+            !entitlement_due(&account, false, now),
+            "an idle account's plan is not worth a request"
+        );
+
+        // An account that was never told its plan asks once either way: without
+        // the quota size the ranking compares percentages blind.
+        account.identity.plan = None;
+        account.entitlement_checked_at = None;
+        assert!(entitlement_due(&account, false, now));
     }
 
     #[test]

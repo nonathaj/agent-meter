@@ -178,8 +178,16 @@ agent-meter config set provider.codex.enabled false
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
 
-Polling more often than every few minutes is counterproductive: the vendors rate
-limit their usage endpoints to roughly 30 requests an hour per account.
+**Polling faster does not give you fresher numbers.** The vendors allow roughly
+30 requests an hour per account, across every request made on its behalf, so a
+poll a minute would spend the whole budget on being refused — and the first
+account refused is the busiest one, which is exactly the one a switch depends on
+being able to read. The floor is 120 seconds for that reason; the 5-minute
+default leaves room for the rest.
+
+Plan and quota size are on a much slower clock: they change when you change plan
+or move organisation, not as you work, so they are re-read every six hours and
+only for the account actually in use.
 
 ## Where things are kept
 

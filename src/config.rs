@@ -18,6 +18,17 @@ pub const DEFAULT_MARGIN: f64 = 5.0;
 /// Minimum seconds between automatic switches of the same provider.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 
+/// Requests an hour per account the providers tolerate before returning 429,
+/// as measured against their usage endpoints. It covers every request made on
+/// an account's behalf, not the usage endpoint alone.
+pub const MEASURED_HOURLY_CEILING: u64 = 30;
+/// The fastest poll that stays inside that ceiling, one request per poll.
+///
+/// Polling faster does not produce fresher numbers — it produces refusals, and
+/// the account refused first is the one being used up, which is the one a
+/// switch depends on reading.
+pub const MIN_POLL_SECS: u64 = 3600 / MEASURED_HOURLY_CEILING;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
@@ -128,10 +139,12 @@ impl Config {
         if !(0.0..=50.0).contains(&self.watch.margin) {
             bail!("watch.margin must be between 0 and 50, got {}", self.watch.margin);
         }
-        if self.watch.poll_secs < 30 {
+        if self.watch.poll_secs < MIN_POLL_SECS {
             bail!(
-                "watch.poll-secs must be at least 30; the providers rate-limit their usage endpoints \
-                 at roughly 30 requests per hour per account"
+                "watch.poll-secs must be at least {MIN_POLL_SECS}. The providers allow roughly \
+                 {MEASURED_HOURLY_CEILING} requests an hour per account, so anything faster spends \
+                 the budget on being refused — and the first account refused is the busiest one, \
+                 which is exactly the one a switch depends on being able to read."
             );
         }
         Ok(())
@@ -260,6 +273,9 @@ mod tests {
         for (key, value) in [
             ("watch.threshold", "500"),
             ("watch.threshold", "high"),
+            // A poll a minute would spend the account's whole hourly budget on
+            // being refused, and the first account refused is the busiest one.
+            ("watch.poll-secs", "60"),
             ("watch.poll-secs", "5"),
             ("provider.gemini.threshold", "90"),
             ("watch.nonsense", "1"),

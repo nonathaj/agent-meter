@@ -513,6 +513,7 @@ mod tests {
             },
             provider_data: Map::new(),
             added_at: Timestamp::from_second(0).unwrap(),
+            entitlement_checked_at: None,
             needs_login: None,
         };
         Codex.install(&home, &account).unwrap();

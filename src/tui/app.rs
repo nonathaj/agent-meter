@@ -357,6 +357,7 @@ pub(super) fn sample_statuses(count: usize) -> Vec<Status> {
                 },
                 provider_data: Default::default(),
                 added_at: jiff::Timestamp::from_second(0).unwrap(),
+                entitlement_checked_at: None,
                 needs_login: None,
             },
             active: n == 1,

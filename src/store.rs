@@ -362,6 +362,7 @@ mod tests {
             },
             provider_data: Default::default(),
             added_at: Timestamp::from_second(1_700_000_000).unwrap(),
+            entitlement_checked_at: None,
             needs_login: None,
         }
     }

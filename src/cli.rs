@@ -12,8 +12,11 @@ use comfy_table::{Cell, Color, ContentArrangement, LineStyle, Table, TableStyle}
 use jiff::Timestamp;
 use serde_json::json;
 
+use std::path::PathBuf;
+
 use crate::account::ProviderKind;
 use crate::engine::{AddOutcome, Engine, Status, SwitchOutcome, TickOutcome};
+use crate::foreign::Source;
 use crate::policy::{Blocked, Decision, Reason, Stay};
 
 /// Exit code used when a switch was wanted but every account is used up.
@@ -103,12 +106,21 @@ struct AddArgs {
 
 #[derive(Args, Debug)]
 struct ImportArgs {
-    /// Which agent CLI to read; omit to import from every one that is signed in
+    /// Which agent CLI to read; omit to import every one that applies
     #[arg(value_enum)]
     provider: Option<ProviderKind>,
     /// A name for this account, shown instead of its email
+    ///
+    /// Only applies when importing a single signed-in account; accounts taken
+    /// from another tool keep the names that tool gave them.
     #[arg(short, long)]
     label: Option<String>,
+    /// Where to import from: the signed-in CLIs, or another tool's store
+    #[arg(long, value_enum, default_value = "live")]
+    from: Source,
+    /// Where that tool keeps its files, if not in its usual place
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -376,6 +388,25 @@ fn add(engine: &Engine, args: &AddArgs) -> Result<ExitCode> {
 }
 
 fn import(engine: &Engine, args: &ImportArgs) -> Result<ExitCode> {
+    if args.from != Source::Live {
+        let imported = engine.import_from(args.from, args.dir.as_deref(), args.provider)?;
+        let outcomes: Vec<_> = imported
+            .into_iter()
+            .map(|(origin, outcome)| {
+                println!(
+                    "{} {} from {origin}",
+                    match outcome {
+                        AddOutcome::Added { .. } => "Imported",
+                        AddOutcome::Updated { .. } => "Updated",
+                    },
+                    outcome.id()
+                );
+                outcome
+            })
+            .collect();
+        return report_added(engine, &outcomes);
+    }
+
     let providers: Vec<_> = args
         .provider
         .map_or_else(|| ProviderKind::ALL.to_vec(), |p| vec![p]);

@@ -13,6 +13,7 @@ pub mod account;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod foreign;
 pub mod fsutil;
 pub mod http;
 pub mod jwt;

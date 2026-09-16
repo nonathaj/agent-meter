@@ -11,7 +11,7 @@ use crate::fsutil;
 /// Usage percentage at which the watcher looks for a better account.
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
 /// Seconds between watcher polls.
-pub const DEFAULT_POLL_SECS: u64 = 300;
+pub const DEFAULT_POLL_SECS: u64 = 60;
 /// How much roomier a candidate must be before a switch is worthwhile, in
 /// percentage points. Prevents flapping between two similarly loaded accounts.
 pub const DEFAULT_MARGIN: f64 = 5.0;
@@ -22,12 +22,19 @@ pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 /// as measured against their usage endpoints. It covers every request made on
 /// an account's behalf, not the usage endpoint alone.
 pub const MEASURED_HOURLY_CEILING: u64 = 30;
-/// The fastest poll that stays inside that ceiling, one request per poll.
+/// The fastest poll allowed.
 ///
-/// Polling faster does not produce fresher numbers — it produces refusals, and
-/// the account refused first is the one being used up, which is the one a
-/// switch depends on reading.
-pub const MIN_POLL_SECS: u64 = 3600 / MEASURED_HOURLY_CEILING;
+/// One a minute is above [`MEASURED_HOURLY_CEILING`] — 60 requests an hour
+/// against a measured 30 — so an account polled this hard will meet 429s. That
+/// is a deliberate trade for a faster reaction, and it is survivable because a
+/// refusal costs nothing but the request: the backoff in `engine` spaces the
+/// next attempts out on the provider's own `Retry-After`, and a failed poll
+/// keeps the previous reading rather than erasing it, so a spent account still
+/// reads as spent and a switch still happens.
+///
+/// Nothing faster than this is allowed, because past it the refusals arrive
+/// faster than the readings.
+pub const MIN_POLL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -142,9 +149,8 @@ impl Config {
         if self.watch.poll_secs < MIN_POLL_SECS {
             bail!(
                 "watch.poll-secs must be at least {MIN_POLL_SECS}. The providers allow roughly \
-                 {MEASURED_HOURLY_CEILING} requests an hour per account, so anything faster spends \
-                 the budget on being refused — and the first account refused is the busiest one, \
-                 which is exactly the one a switch depends on being able to read."
+                 {MEASURED_HOURLY_CEILING} requests an hour per account, and polling faster than \
+                 once a minute spends the budget on refusals faster than it collects readings."
             );
         }
         Ok(())
@@ -273,9 +279,8 @@ mod tests {
         for (key, value) in [
             ("watch.threshold", "500"),
             ("watch.threshold", "high"),
-            // A poll a minute would spend the account's whole hourly budget on
-            // being refused, and the first account refused is the busiest one.
-            ("watch.poll-secs", "60"),
+            // Faster than once a minute collects refusals, not readings.
+            ("watch.poll-secs", "30"),
             ("watch.poll-secs", "5"),
             ("provider.gemini.threshold", "90"),
             ("watch.nonsense", "1"),

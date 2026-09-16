@@ -200,6 +200,41 @@ impl Engine {
         self.store_captured(kind, captured, label)
     }
 
+    /// Stores every account another tool is holding.
+    ///
+    /// The other tool's files are only read, so its own setup is left working;
+    /// an account it shares with one already stored here updates that one
+    /// rather than arriving twice.
+    pub fn import_from(
+        &self,
+        source: crate::foreign::Source,
+        dir: Option<&std::path::Path>,
+        only: Option<ProviderKind>,
+    ) -> Result<Vec<(String, AddOutcome)>> {
+        let mut found = crate::foreign::read(source, dir)?;
+        found.retain(|f| only.is_none_or(|kind| f.provider == kind));
+        if found.is_empty() {
+            bail!(
+                "{} is not holding any account agent-meter can manage",
+                source.display_name()
+            );
+        }
+
+        // Named before the lock is taken: naming asks the provider who an
+        // account belongs to, and that is a network call.
+        for account in &mut found {
+            name_account(account.provider, &mut account.captured);
+        }
+
+        let _lock = self.store.lock()?;
+        let mut outcomes = Vec::new();
+        for account in found {
+            let outcome = self.store_captured(account.provider, account.captured, account.label)?;
+            outcomes.push((account.origin, outcome));
+        }
+        Ok(outcomes)
+    }
+
     /// Logs in to a new account inside a throwaway configuration directory, so
     /// the agent CLI the user is running right now keeps its own credentials.
     ///
@@ -496,9 +531,12 @@ impl Engine {
         if !entitlement_due(account, active, Timestamp::now()) {
             return;
         }
-        let Ok(identity) = provider::get(account.provider).fetch_identity(&account.credential) else {
-            return;
-        };
+        let asked = provider::get(account.provider).fetch_identity(&account.credential);
+        // An account whose plan the provider will not state — because it is
+        // offline, rate-limited, or the organisation forbids these calls — must
+        // not be asked again on the very next poll. Recording the attempt puts
+        // it on the same slow clock as a successful answer, so one account
+        // cannot spend the budget re-asking a question that keeps failing.
         let Ok(_lock) = self.store.lock_account(&account.id) else {
             return;
         };
@@ -508,7 +546,9 @@ impl Engine {
         let Ok(Some(mut current)) = self.store.account(&account.id) else {
             return;
         };
-        current.identity.update_from(&identity);
+        if let Ok(identity) = asked {
+            current.identity.update_from(&identity);
+        }
         current.entitlement_checked_at = Some(Timestamp::now());
         let _ = self.store.put_account(&current);
     }
@@ -738,13 +778,21 @@ fn name_account(kind: ProviderKind, captured: &mut Captured) {
 /// facts change when somebody changes plan, not as work is done, and every
 /// request spent here is one the usage polls no longer have.
 fn entitlement_due(account: &Account, active: bool, now: Timestamp) -> bool {
-    if account.identity.plan.is_none() {
-        return true;
-    }
-    let stale = account
+    // One clock, whatever the last attempt produced. A provider that will not
+    // answer — offline, rate-limited, or an organisation that forbids the call
+    // — must not be asked again on the very next poll, or a handful of such
+    // accounts would spend the whole budget re-asking a question that keeps
+    // failing.
+    let asked_recently = account
         .entitlement_checked_at
-        .is_none_or(|at| now.as_second() - at.as_second() >= ENTITLEMENT_MAX_AGE.as_secs() as i64);
-    active && stale
+        .is_some_and(|at| now.as_second() - at.as_second() < ENTITLEMENT_MAX_AGE.as_secs() as i64);
+    if asked_recently {
+        return false;
+    }
+    // Never asked: worth one request whoever it is, because without the quota
+    // size the ranking compares percentages blind. After that, only the account
+    // in use is worth re-asking.
+    account.identity.plan.is_none() || active
 }
 
 /// Whether a credential expires within `leeway`.
@@ -905,6 +953,16 @@ mod tests {
         account.identity.plan = None;
         account.entitlement_checked_at = None;
         assert!(entitlement_due(&account, false, now));
+
+        // But only once. A provider that will not answer — rate-limiting, or an
+        // organisation that forbids the call — would otherwise be asked again
+        // every poll, and a handful of such accounts would spend the whole
+        // budget on it.
+        account.entitlement_checked_at = checked(1);
+        assert!(
+            !entitlement_due(&account, false, now),
+            "a failed attempt still puts the question on the slow clock"
+        );
     }
 
     #[test]

@@ -83,59 +83,13 @@ impl Provider for Claude {
                 home.display()
             )
         })?;
-        let oauth = blob.get(OAUTH_KEY).and_then(Value::as_object).ok_or_else(|| {
-            anyhow!(
-                "the Claude Code credential in {} has no {OAUTH_KEY} block; \
-                 it may be an API-key login, which agent-meter cannot meter",
-                home.display()
-            )
-        })?;
-
-        let credential = parse_credential(oauth)?;
         let identity_file = read_identity_file(home)?;
         let account = identity_file
             .as_ref()
             .and_then(|v| v.get(ACCOUNT_KEY))
             .and_then(Value::as_object);
-        // Deliberately no plan here. This file carries `subscriptionType` and
-        // `rateLimitTier`, but both drift from what the account is actually on
-        // — measured on one machine, 2026-09-15: `max` and
-        // `default_claude_max_20x` here for an account the provider reported as
-        // a Team seat on `default_claude_max_5x`. The profile endpoint answers
-        // this, and `Engine` asks it.
-        let identity = parse_identity(account);
-
-        // Keep the fields Claude Code expects to find again after a swap: the
-        // identity block verbatim, plus the account-scoped extras that live
-        // alongside the tokens.
-        let mut provider_data = Map::new();
-        if let Some(account) = account {
-            provider_data.insert(ACCOUNT_KEY.into(), Value::Object(account.clone()));
-        }
-        let extras: Map<String, Value> = oauth
-            .iter()
-            .filter(|(k, _)| {
-                !matches!(
-                    k.as_str(),
-                    "accessToken" | "refreshToken" | "expiresAt" | "refreshTokenExpiresAt"
-                )
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if !extras.is_empty() {
-            provider_data.insert("oauthExtras".into(), Value::Object(extras));
-        }
-        for (key, value) in &blob {
-            if key != OAUTH_KEY && !MACHINE_KEYS.contains(&key.as_str()) {
-                provider_data.insert(key.clone(), value.clone());
-            }
-        }
-
-        Ok(Captured {
-            identity,
-            credential,
-            provider_data,
-        })
+        captured_from_parts(&blob, account)
+            .with_context(|| format!("reading the Claude Code credential in {}", home.display()))
     }
 
     fn install(&self, home: &Path, account: &Account) -> Result<()> {
@@ -200,6 +154,64 @@ impl Provider for Claude {
         // session picks up the new account on its own.
         false
     }
+}
+
+/// Builds an account from the two things Claude Code keeps about it: the
+/// credential blob, and the `oauthAccount` block naming whose it is.
+///
+/// Shared with the importers, which read those two pieces out of other tools'
+/// backups rather than out of a live Claude Code home — so there is one
+/// definition of the shape rather than one per source.
+pub(crate) fn captured_from_parts(
+    blob: &Map<String, Value>,
+    account: Option<&Map<String, Value>>,
+) -> Result<Captured> {
+    let oauth = blob.get(OAUTH_KEY).and_then(Value::as_object).ok_or_else(|| {
+        anyhow!(
+            "it has no {OAUTH_KEY} block; it may be an API-key login, \
+             which agent-meter cannot meter"
+        )
+    })?;
+    let credential = parse_credential(oauth)?;
+    // Deliberately no plan. The blob carries `subscriptionType` and
+    // `rateLimitTier`, but both drift from what the account is actually on —
+    // measured on one machine, 2026-09-15: `max` and `default_claude_max_20x`
+    // for an account the provider reported as a Team seat on
+    // `default_claude_max_5x`. The profile endpoint answers this, and `Engine`
+    // asks it.
+    let identity = parse_identity(account);
+
+    // Keep the fields Claude Code expects to find again after a swap: the
+    // identity block verbatim, plus the account-scoped extras that live
+    // alongside the tokens.
+    let mut provider_data = Map::new();
+    if let Some(account) = account {
+        provider_data.insert(ACCOUNT_KEY.into(), Value::Object(account.clone()));
+    }
+    let extras: Map<String, Value> = oauth
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "accessToken" | "refreshToken" | "expiresAt" | "refreshTokenExpiresAt"
+            )
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !extras.is_empty() {
+        provider_data.insert("oauthExtras".into(), Value::Object(extras));
+    }
+    for (key, value) in blob {
+        if key != OAUTH_KEY && !MACHINE_KEYS.contains(&key.as_str()) {
+            provider_data.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(Captured {
+        identity,
+        credential,
+        provider_data,
+    })
 }
 
 /// Path of the file holding the OAuth credential.
@@ -471,13 +483,14 @@ fn parse_profile(response: &Value) -> Identity {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
     };
+    let email = string(account, "email").or_else(|| string(account, "email_address"));
     Identity {
         user_id: string(account, "uuid"),
-        email: string(account, "email").or_else(|| string(account, "email_address")),
         workspace_id: string(organization, "uuid"),
-        workspace_name: workspace_name(organization),
+        workspace_name: workspace_name(organization, email.as_deref()),
         plan: parse_plan(account, organization),
         capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
+        email,
     }
 }
 
@@ -491,19 +504,24 @@ fn parse_profile(response: &Value) -> Identity {
 ///
 /// A team name is written by whoever named the organisation, so it is trimmed
 /// of anything that could repaint the row it lands on.
-fn workspace_name(organization: Option<&Value>) -> Option<String> {
+fn workspace_name(organization: Option<&Value>, email: Option<&str>) -> Option<String> {
     let personal = matches!(
         organization
             .and_then(|o| o.get("organization_type"))
             .and_then(Value::as_str),
         Some("claude_max" | "claude_pro")
     );
-    if personal {
+    let raw = organization?.get("name")?.as_str()?;
+    // Some profiles state no organization type at all, and then the name is
+    // the only thing that says which kind of seat this is: a personal one is
+    // named after the address it will sit beside.
+    let named_after_the_person = email.is_some_and(|email| {
+        !email.is_empty() && raw.len() > email.len() && raw[..email.len()].eq_ignore_ascii_case(email)
+    });
+    if personal || named_after_the_person {
         return Some("personal".into());
     }
-    let name: String = organization?
-        .get("name")?
-        .as_str()?
+    let name: String = raw
         .chars()
         .filter(|c| !c.is_control() && !is_bidi_override(*c))
         .take(40)
@@ -853,7 +871,10 @@ mod tests {
     #[test]
     fn a_personal_organization_is_called_personal_and_a_team_keeps_its_name() {
         let named = |org_type: &str, name: &str| {
-            workspace_name(Some(&json!({"organization_type": org_type, "name": name})))
+            workspace_name(
+                Some(&json!({"organization_type": org_type, "name": name})),
+                Some("dev@example.com"),
+            )
         };
         assert_eq!(
             named("claude_max", "dev@example.com's Organization").as_deref(),
@@ -876,7 +897,21 @@ mod tests {
         );
         assert_eq!(named("claude_team", &"n".repeat(100)).unwrap().len(), 40);
         assert_eq!(named("claude_team", "   ").as_deref(), None);
-        assert_eq!(workspace_name(None), None);
+        assert_eq!(workspace_name(None, None), None);
+
+        // Some profiles state no organization type at all, and then the name
+        // is the only thing saying this is a seat of one's own.
+        let untyped = json!({"name": "dev@example.com's Organization"});
+        assert_eq!(
+            workspace_name(Some(&untyped), Some("dev@example.com")).as_deref(),
+            Some("personal")
+        );
+        // A team whose name merely begins the same way is still a team.
+        let team = json!({"name": "dev@example.com Collective"});
+        assert_eq!(
+            workspace_name(Some(&team), Some("other@example.com")).as_deref(),
+            Some("dev@example.com Collective")
+        );
     }
 
     #[test]

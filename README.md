@@ -46,6 +46,10 @@ Or build from source with `cargo build --release`; the binary lands in
 # Store the account your agent CLI is already signed in to.
 agent-meter import
 
+# Or take everything another tool is already holding.
+agent-meter import --from cswap     # claude-swap
+agent-meter import --from gemctl    # the Gem project launcher / gemctl
+
 # Add another one. The login runs in a throwaway configuration directory,
 # so an agent you have open right now keeps the credentials it is using.
 agent-meter add claude
@@ -63,6 +67,18 @@ agent-meter watch
 Accounts are named `claude-1`, `codex-2` and so on. Commands that take an
 account also accept its email address or a label you gave it with `--label`.
 
+### Coming from another tool
+
+`agent-meter import --from cswap` and `--from gemctl` read those tools' own
+stores — claude-swap's backup directory, and the account store the Gem project
+launcher shares with `gemctl` — and take every account they hold. Add `--dir` if
+either keeps its files somewhere unusual.
+
+Nothing is written back, so the other tool keeps working and you can run both
+while you decide. Importing twice is safe: an account already stored is updated
+rather than added again, and that holds across tools too, so the same account
+found in both ends up as one.
+
 One address can hold more than one account: a personal seat and a seat in a
 team share an address, and on Claude a user id too — only the organisation
 tells them apart, which is why it has a column of its own. They have separate
@@ -75,7 +91,7 @@ address asks you which one you meant.
 | --- | --- |
 | `agent-meter list` | Every account with its usage. `--refresh` polls now, `--json` prints machine-readable output. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
-| `agent-meter import [provider]` | Stores the account a CLI is already signed in to. |
+| `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
 | `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |

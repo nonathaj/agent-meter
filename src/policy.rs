@@ -199,23 +199,7 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     let remaining =
         |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
 
-    // Accounts under the threshold come first, and among them the one whose
-    // weekly allowance expires soonest — see `recovery_order`. Past the
-    // threshold there is no room left to allocate and the only question is
-    // which is least bad, so those rank by what they can still do.
-    usable.sort_by(|a, b| {
-        let over = |(_, usage): &(&Candidate<'_>, &Usage)| usage.used_at(now) >= rules.threshold;
-        over(a).cmp(&over(b)).then_with(|| {
-            if over(a) {
-                remaining(b.0, b.1)
-                    .total_cmp(&remaining(a.0, a.1))
-                    .then_with(|| a.1.next_relief(now).cmp(&b.1.next_relief(now)))
-                    .then_with(|| a.0.id.cmp(b.0.id))
-            } else {
-                recovery_order(*a, *b, &remaining)
-            }
-        })
-    });
+    rank(&mut usable, rules, now, &remaining);
 
     match usable.first().copied() {
         Some((candidate, usage)) => {
@@ -270,6 +254,66 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
             })
         }
     }
+}
+
+/// Puts the accounts worth switching to in the order they would be taken.
+///
+/// Accounts under the threshold come first, and among them the one whose weekly
+/// allowance expires soonest — see [`recovery_order`]. Past the threshold there
+/// is no room left to allocate and the only question is which is least bad, so
+/// those rank by what they can still do.
+fn rank(
+    usable: &mut [(&Candidate<'_>, &Usage)],
+    rules: &Rules,
+    now: Timestamp,
+    remaining: &impl Fn(&Candidate<'_>, &Usage) -> f64,
+) {
+    usable.sort_by(|a, b| {
+        let over = |(_, usage): &(&Candidate<'_>, &Usage)| usage.used_at(now) >= rules.threshold;
+        over(a).cmp(&over(b)).then_with(|| {
+            if over(a) {
+                remaining(b.0, b.1)
+                    .total_cmp(&remaining(a.0, a.1))
+                    .then_with(|| a.1.next_relief(now).cmp(&b.1.next_relief(now)))
+                    .then_with(|| a.0.id.cmp(b.0.id))
+            } else {
+                recovery_order(*a, *b, remaining)
+            }
+        })
+    });
+}
+
+/// The order these accounts would be taken in, best next first.
+///
+/// The same ranking [`decide`] chooses from, exposed so an interface can show
+/// the queue itself rather than an arrangement of its own invention — and so
+/// the order somebody reads is the order that will actually happen.
+///
+/// The account in use leads, because it is the one in use. After it come the
+/// accounts that could be switched to, then those that could not: spent, or
+/// with no reading, or needing a login.
+pub fn queue<'a>(candidates: &'a [Candidate<'a>], rules: &Rules, now: Timestamp) -> Vec<&'a str> {
+    let active = candidates.iter().find(|c| c.active);
+    let mut usable: Vec<(&Candidate<'_>, &Usage)> = candidates
+        .iter()
+        .filter(|c| !c.active && c.usable)
+        .filter_map(|c| Some((c, fresh(c, rules, now)?)))
+        .filter(|(_, usage)| !usage.is_exhausted_at(now))
+        .collect();
+
+    let weighted = active.is_some_and(|active| quotas_all_known(active, &usable));
+    let remaining =
+        |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
+    rank(&mut usable, rules, now, &remaining);
+
+    let ranked: Vec<&str> = active
+        .map(|c| c.id)
+        .into_iter()
+        .chain(usable.iter().map(|(c, _)| c.id))
+        .collect();
+    // Whatever the ranking had no place for still belongs on screen, after it.
+    let rest = candidates.iter().map(|c| c.id).filter(|id| !ranked.contains(id));
+    ranked.iter().copied().chain(rest).collect()
 }
 
 /// Ranks two accounts that both have room, by when they recover.
@@ -846,6 +890,50 @@ mod tests {
             ),
             "{decision:?}"
         );
+    }
+
+    /// With switching on, the list somebody reads should be the order that
+    /// will actually happen — the account in use first, then the one that
+    /// would be taken next.
+    #[test]
+    fn the_queue_leads_with_the_account_in_use_then_the_one_that_is_next() {
+        let current = metered(50.0, 3600, 50.0, 5);
+        let soonest_week = metered(10.0, 3600, 10.0, 1);
+        let later_week = metered(0.0, 3600, 0.0, 9);
+        let spent = usage(100.0);
+
+        let candidates = [
+            candidate("claude-2", Some(&later_week), false),
+            candidate("claude-4", Some(&spent), false),
+            candidate("claude-1", Some(&current), true),
+            candidate("claude-3", Some(&soonest_week), false),
+        ];
+        let order = queue(&candidates, &Rules::default(), now());
+        assert_eq!(
+            order,
+            ["claude-1", "claude-3", "claude-2", "claude-4"],
+            "in use, then soonest-expiring week, then the rest, then the spent one"
+        );
+    }
+
+    /// Everything stays on the list even when the ranking has no place for it:
+    /// an account that cannot be switched to is still an account somebody has.
+    #[test]
+    fn the_queue_keeps_accounts_it_cannot_rank() {
+        let current = usage(10.0);
+        let fine = usage(20.0);
+        let candidates = [
+            candidate("claude-1", Some(&current), true),
+            Candidate {
+                usable: false,
+                ..candidate("claude-2", Some(&fine), false)
+            },
+            candidate("claude-3", None, false),
+        ];
+        let order = queue(&candidates, &Rules::default(), now());
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0], "claude-1");
+        assert!(order.contains(&"claude-2") && order.contains(&"claude-3"));
     }
 
     #[test]

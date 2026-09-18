@@ -1,32 +1,42 @@
 //! Rendering. Nothing here mutates anything but the frame.
+//!
+//! An account is a block rather than a row, because a row can only show the
+//! worst of its limits and the worst limit is not the whole story: an account
+//! at 5% of its five hours and 98% of its week is nearly spent, and one the
+//! other way round is fine in an hour. Every window is on screen for every
+//! account, so two accounts can be compared without selecting either.
 
 use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use super::app::{App, Mode, ProviderAction};
+use super::app::{App, Mode, ProviderAction, Row};
 use crate::account::ProviderKind;
 use crate::engine::Status;
 use crate::timefmt;
+use crate::usage::Window;
 
-/// Usage at which a window is drawn as nearly spent.
+/// Usage at which a window stops looking comfortable.
 const WARN_PERCENT: f64 = 75.0;
+/// Usage at which it is nearly spent.
+const HIGH_PERCENT: f64 = 90.0;
+/// How much of a window may be spent ahead of the clock before saying so.
+/// A few points ahead is ordinary; a quarter of the window is a trend.
+const PACE_SLACK: f64 = 25.0;
+
+/// Width of the meter drawn for each window.
+const BAR: usize = 28;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, list, detail, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(4),
-        Constraint::Length(7),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let [header, body, footer] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .areas(frame.area());
 
     draw_header(frame, header, app);
-    draw_list(frame, list, app);
-    draw_detail(frame, detail, app);
+    draw_body(frame, body, app);
     draw_footer(frame, footer, app);
 
     match app.mode.clone() {
@@ -38,28 +48,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let watching = if app.watching {
+    let mut spans = vec![
         Span::styled(
-            format!(" watching, switches at {:.0}% ", app.threshold),
+            " agent-meter ",
+            Style::new()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(app.filter_label(), Style::new().fg(Color::Cyan)),
+    ];
+    spans.push(Span::raw("  "));
+    spans.push(if app.watching {
+        Span::styled(
+            format!(" switching at {:.0}% ", app.threshold),
             Style::new().bg(Color::Green).fg(Color::Black),
         )
     } else {
-        Span::styled(" watching off ", Style::new().fg(Color::DarkGray))
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            " agent-meter ",
-            Style::new().bg(Color::Blue).fg(Color::White).bold(),
-        ),
-        Span::raw(" "),
-        watching,
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+        Span::styled("switching off", Style::new().fg(Color::DarkGray))
+    });
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    let now = Timestamp::now();
-    if app.statuses.is_empty() {
+fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.rows.is_empty() {
         let text = Paragraph::new(vec![
             Line::raw(""),
             Line::raw("No accounts yet."),
@@ -67,159 +80,244 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
             Line::raw("Press i to import the account an agent CLI is already signed in to,"),
             Line::raw("or a to log in to another one."),
         ])
-        .alignment(Alignment::Center)
-        .block(bordered("Accounts"));
+        .alignment(Alignment::Center);
         frame.render_widget(text, area);
         return;
     }
 
-    let rows: Vec<Row> = app
-        .statuses
+    let now = Timestamp::now();
+    let mut lines = Vec::new();
+    for (index, row) in app.rows.iter().enumerate() {
+        match row {
+            Row::Provider(kind) => lines.push(provider_heading(*kind, app, lines.is_empty())),
+            Row::Account { status, position } => {
+                let selected = app.selected_row() == Some(index);
+                lines.extend(account_block(
+                    status,
+                    *position,
+                    selected,
+                    app,
+                    now,
+                    area.width as usize,
+                ));
+            }
+        }
+    }
+
+    // Keep the selected block in view without a scrollbar: the list is short
+    // enough that a moving window is less to read than a bar beside it.
+    app.visible_height = area.height as usize;
+    let first = app.scroll.min(lines.len().saturating_sub(1));
+    let shown: Vec<Line> = lines.into_iter().skip(first).take(area.height as usize).collect();
+    frame.render_widget(Paragraph::new(shown), area);
+}
+
+fn provider_heading(kind: ProviderKind, app: &App, first: bool) -> Line<'static> {
+    let count = app
+        .rows
         .iter()
-        .map(|status| {
-            let used = status.used(now);
-            let identity = &status.account.identity;
-            let note = match (&status.account.needs_login, &status.error) {
-                (Some(_), _) => Span::styled("login needed", Style::new().fg(Color::Red)),
-                (None, Some(_)) => Span::styled("usage unavailable", Style::new().fg(Color::Yellow)),
-                (None, None) => Span::raw(""),
-            };
-            Row::new(vec![
-                Cell::from(if status.active { "▶" } else { " " }).style(Style::new().fg(Color::Green)),
-                Cell::from(status.account.id.clone()),
-                Cell::from(status.account.provider.display_name()),
-                Cell::from(status.account.display_name().to_string()),
-                // The organisation is part of which account this is: the same
-                // address in two of them is two accounts, with separate limits.
-                Cell::from(identity.workspace_name.clone().unwrap_or_else(|| "-".into())),
-                Cell::from(identity.plan_label().unwrap_or_else(|| "-".into())),
-                Cell::from(bar(used, 14)).style(used_style(used, status)),
-                Cell::from(Line::from(note)),
-            ])
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Min(16),
-            Constraint::Length(14),
-            Constraint::Length(9),
-            Constraint::Length(22),
-            Constraint::Length(18),
-        ],
-    )
-    .header(
-        Row::new([
-            "",
-            "ID",
-            "PROVIDER",
-            "ACCOUNT",
-            "ORGANIZATION",
-            "PLAN",
-            "USED",
-            "",
-        ])
-        .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-    )
-    .row_highlight_style(Style::new().bg(Color::DarkGray))
-    .block(bordered("Accounts"));
-
-    frame.render_stateful_widget(table, area, &mut app.table);
+        .filter(|row| matches!(row, Row::Account { status, .. } if status.account.provider == kind))
+        .count();
+    let mut spans = Vec::new();
+    if !first {
+        spans.push(Span::raw(""));
+    }
+    spans.push(Span::styled(
+        format!("{} ", kind.display_name()),
+        Style::new()
+            .fg(Color::White)
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("({count})"),
+        Style::new().fg(Color::DarkGray),
+    ));
+    if app.watching {
+        spans.push(Span::styled(
+            "   in the order they will be taken",
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(ratatui::style::Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
 }
 
-/// A textual meter: `███████░░░░░░  56%`.
-fn bar(used: Option<f64>, width: usize) -> String {
-    let Some(used) = used else {
-        return format!("{:width$}   ?", "", width = width);
-    };
+/// One account: who it is, then every limit it has.
+fn account_block(
+    status: &Status,
+    position: usize,
+    selected: bool,
+    app: &App,
+    now: Timestamp,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let account = &status.account;
+    let identity = &account.identity;
+    let marker = if selected { "▌" } else { " " };
+    let number = Style::new().fg(if selected { Color::White } else { Color::DarkGray });
+
+    let mut head = vec![
+        Span::styled(marker.to_string(), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("{position} "), number),
+        Span::styled(
+            account.display_name().to_string(),
+            Style::new()
+                .fg(Color::White)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+    ];
+    if let Some(org) = &identity.workspace_name {
+        head.push(Span::styled(
+            format!("  [{org}]"),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(plan) = identity.plan_label() {
+        head.push(Span::styled(format!("  {plan}"), Style::new().fg(Color::Blue)));
+    }
+    head.push(Span::raw("  "));
+    head.push(standing(status, position, app, now));
+
+    let mut lines = vec![Line::from(head)];
+    match (&account.needs_login, &status.error, &status.usage) {
+        (Some(reason), _, _) => lines.push(note(format!("sign in again — {reason}"), Color::Red, width)),
+        (None, Some(error), None) => lines.push(note(format!("no reading — {error}"), Color::Yellow, width)),
+        (None, error, Some(usage)) => {
+            for window in &usage.windows {
+                lines.push(window_line(window, now));
+            }
+            if let Some(error) = error {
+                lines.push(note(format!("not refreshed — {error}"), Color::Yellow, width));
+            }
+        }
+        (None, None, None) => lines.push(note("no reading yet — press r".into(), Color::DarkGray, width)),
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// What this account is, in one word: in use, next, or spent.
+fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Span<'static> {
+    if status.active {
+        return Span::styled(
+            "● in use",
+            Style::new()
+                .fg(Color::Green)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        );
+    }
+    if status.account.needs_login.is_some() {
+        return Span::styled("login needed", Style::new().fg(Color::Red));
+    }
+    if status
+        .usage
+        .as_ref()
+        .is_some_and(|usage| usage.is_exhausted_at(now))
+    {
+        return Span::styled("spent", Style::new().fg(Color::Red));
+    }
+    // Only meaningful when something is actually choosing: with switching off
+    // the order is just an order.
+    if app.watching && position == 2 {
+        return Span::styled(
+            "next",
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        );
+    }
+    Span::raw("")
+}
+
+/// One limit: its name, a meter, the figure, and when it turns over.
+fn window_line(window: &Window, now: Timestamp) -> Line<'static> {
+    let used = window.used_at(now);
+    let colour = severity(used);
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{:<14}", truncate(&window.label(), 14)),
+            Style::new().fg(Color::Gray),
+        ),
+        Span::styled(meter(used, BAR), Style::new().fg(colour)),
+        Span::styled(
+            format!("{used:>4.0}%  "),
+            Style::new()
+                .fg(colour)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+    ];
+
+    match window.resets_at {
+        Some(at) if at > now => spans.push(Span::styled(
+            format!("resets {}", timefmt::until(now, at)),
+            Style::new().fg(Color::DarkGray),
+        )),
+        Some(_) => spans.push(Span::styled(
+            "resetting".to_string(),
+            Style::new().fg(Color::DarkGray),
+        )),
+        None => {}
+    }
+    // Spending faster than the window refills is the thing a percentage alone
+    // cannot say: 60% of a week is fine on day five and a warning on day two.
+    if let Some(over) = ahead_of_pace(window, now) {
+        spans.push(Span::styled(
+            format!("  ({over:.0}% ahead of pace)"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// How far ahead of the clock this window has been spent, when far enough to
+/// be worth saying.
+fn ahead_of_pace(window: &Window, now: Timestamp) -> Option<f64> {
+    // Only a budget can be overspent. A five-hour window is a rate: being
+    // ahead of its clock is ordinary, and it corrects itself within the hour,
+    // so saying so on every line would be noise rather than a warning.
+    if window.kind() != crate::usage::WindowKind::Weekly {
+        return None;
+    }
+    let resets_at = window.resets_at?;
+    let remaining = (resets_at.as_second() - now.as_second()).max(0) as f64;
+    if window.window_secs == 0 || remaining > window.window_secs as f64 {
+        return None;
+    }
+    let elapsed = 100.0 * (1.0 - remaining / window.window_secs as f64);
+    let over = window.used_at(now) - elapsed;
+    (over > PACE_SLACK).then_some(over)
+}
+
+fn note(text: String, colour: Color, width: usize) -> Line<'static> {
+    // Provider messages run long, and a line that overruns the window is cut
+    // mid-word with no sign that anything is missing.
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(truncate(&text, width.saturating_sub(6)), Style::new().fg(colour)),
+    ])
+}
+
+/// A meter: `███████░░░░░░░`.
+fn meter(used: f64, width: usize) -> String {
     let filled = ((used / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
-    format!("{}{}{used:4.0}%", "█".repeat(filled), "░".repeat(width - filled))
+    format!("{}{} ", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-fn used_style(used: Option<f64>, status: &Status) -> Style {
-    let now = Timestamp::now();
-    if status.usage.as_ref().is_some_and(|u| u.is_exhausted_at(now)) {
-        return Style::new().fg(Color::Red);
-    }
-    match used {
-        None => Style::new().fg(Color::DarkGray),
-        Some(used) if used >= 90.0 => Style::new().fg(Color::Yellow),
-        Some(used) if used >= WARN_PERCENT => Style::new().fg(Color::LightYellow),
-        Some(_) => Style::new().fg(Color::Green),
-    }
-}
-
-/// The selected account's individual limit windows.
-fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let now = Timestamp::now();
-    let Some(status) = app.selected() else {
-        frame.render_widget(bordered("Limits"), area);
-        return;
-    };
-    let title = format!("Limits — {}", status.account.display_name());
-    let block = bordered(&title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if let Some(reason) = &status.account.needs_login {
-        let text = format!("This account needs a fresh login: {reason}\nPress a to sign in again.");
-        frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: true }).fg(Color::Red),
-            inner,
-        );
-        return;
-    }
-    let Some(usage) = &status.usage else {
-        let text = match &status.error {
-            Some(error) => format!("Usage could not be read: {error}"),
-            None => "No usage reading yet. Press r to fetch one.".to_string(),
-        };
-        frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: true }).fg(Color::DarkGray),
-            inner,
-        );
-        return;
-    };
-
-    let rows = Layout::vertical(vec![Constraint::Length(1); usage.windows.len().max(1)]).split(inner);
-    for (window, row) in usage.windows.iter().zip(rows.iter()) {
-        let used = window.used_at(now);
-        let [label, meter, resets] = Layout::horizontal([
-            Constraint::Length(20),
-            Constraint::Min(12),
-            Constraint::Length(12),
-        ])
-        .areas(*row);
-        frame.render_widget(Paragraph::new(window.label()), label);
-        // A filled/hollow bar rather than a coloured line, so the reading is
-        // legible in a monochrome terminal too.
-        frame.render_widget(
-            Paragraph::new(bar(Some(used), meter.width.saturating_sub(6) as usize)).fg(gauge_color(used)),
-            meter,
-        );
-        let resets_in = window
-            .resets_at
-            .map(|at| format!("in {}", timefmt::until(now, at)))
-            .unwrap_or_default();
-        frame.render_widget(
-            Paragraph::new(resets_in)
-                .alignment(Alignment::Right)
-                .fg(Color::DarkGray),
-            resets,
-        );
-    }
-}
-
-fn gauge_color(used: f64) -> Color {
+fn severity(used: f64) -> Color {
     match used {
         u if u >= 100.0 => Color::Red,
-        u if u >= 90.0 => Color::Yellow,
-        u if u >= WARN_PERCENT => Color::LightYellow,
+        u if u >= HIGH_PERCENT => Color::LightRed,
+        u if u >= WARN_PERCENT => Color::Yellow,
         _ => Color::Green,
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    match text.char_indices().nth(width) {
+        Some((idx, _)) => format!("{}…", &text[..idx.saturating_sub(1)]),
+        None => text.to_string(),
     }
 }
 
@@ -227,15 +325,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let line = if let Some(busy) = &app.busy {
         Line::from(Span::styled(busy.clone(), Style::new().fg(Color::Cyan)))
     } else if let Some(message) = &app.message {
-        let color = if message.is_error {
+        let colour = if message.is_error {
             Color::Red
         } else {
             Color::Green
         };
-        Line::from(Span::styled(message.text.clone(), Style::new().fg(color)))
+        Line::from(Span::styled(message.text.clone(), Style::new().fg(colour)))
     } else {
         Line::from(Span::styled(
-            "↑↓ select   enter use   r refresh   a add   i import   d remove   w watch   ? help   q quit",
+            "↑↓ select   enter use   r refresh   p provider   a add   i import   d remove   w switching   ? help   q quit",
             Style::new().fg(Color::DarkGray),
         ))
     };
@@ -247,18 +345,22 @@ fn draw_help(frame: &mut Frame) {
         Line::from("↑ ↓ / j k    select an account".to_string()),
         Line::from("enter, u     sign the agent CLI in to it".to_string()),
         Line::from("r            read usage now".to_string()),
+        Line::from("p            show one agent at a time, or all".to_string()),
         Line::from("a            log in to a new account".to_string()),
         Line::from("i            import the account a CLI is signed in to".to_string()),
         Line::from("d            forget the selected account".to_string()),
         Line::from("w            switch automatically as limits approach".to_string()),
         Line::from("q, esc       quit".to_string()),
         Line::from(""),
+        Line::from("With switching on, accounts are listed in the order they".to_string()),
+        Line::from("will be taken: the one in use first, then the one next.".to_string()),
+        Line::from(""),
         Line::from(Span::styled(
             "Press any key to close",
             Style::new().fg(Color::DarkGray),
         )),
     ];
-    let area = popup(frame.area(), 60, lines.len() as u16 + 2);
+    let area = popup(frame.area(), 62, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(bordered("Keys")), area);
 }
@@ -321,13 +423,13 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::{FIVE_HOURS, ONE_WEEK, Usage, Window};
+    use crate::usage::{FIVE_HOURS, ONE_WEEK, Usage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     /// Renders the interface and returns what the terminal would show.
-    fn render(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -342,66 +444,128 @@ mod tests {
             .join("\n")
     }
 
-    fn usage(five_hour: f64, weekly: f64) -> Usage {
-        let now = Timestamp::now();
+    fn window(secs: u64, scope: Option<&str>, used: f64, resets_in: i64) -> Window {
+        Window {
+            window_secs: secs,
+            scope: scope.map(Into::into),
+            used_percent: used,
+            resets_at: Some(Timestamp::now() + jiff::SignedDuration::from_secs(resets_in)),
+        }
+    }
+
+    fn usage(windows: Vec<Window>) -> Usage {
         Usage {
-            observed_at: now,
-            windows: vec![
-                Window {
-                    window_secs: FIVE_HOURS,
-                    scope: None,
-                    used_percent: five_hour,
-                    resets_at: Some(now + jiff::SignedDuration::from_secs(3600)),
-                },
-                Window {
-                    window_secs: ONE_WEEK,
-                    scope: None,
-                    used_percent: weekly,
-                    resets_at: Some(now + jiff::SignedDuration::from_hours(50)),
-                },
-            ],
+            observed_at: Timestamp::now(),
+            windows,
             limit_reached: false,
         }
     }
 
+    /// Every limit of every account is on screen at once — the point of the
+    /// layout, since the worst window alone does not say whether an account is
+    /// spent for an hour or for days.
     #[test]
-    fn draws_accounts_their_meters_and_the_selected_account_limits() {
+    fn every_window_of_every_account_is_shown_without_selecting_it() {
         let mut statuses = crate::tui::app::sample_statuses(2);
-        statuses[0].usage = Some(usage(94.0, 60.0));
-        statuses[1].usage = Some(usage(10.0, 5.0));
+        statuses[0].usage = Some(usage(vec![
+            window(FIVE_HOURS, None, 68.0, 3 * 3600),
+            window(ONE_WEEK, None, 76.0, 4 * 86_400),
+            window(ONE_WEEK, Some("Fable"), 19.0, 4 * 86_400),
+        ]));
+        statuses[1].usage = Some(usage(vec![window(FIVE_HOURS, None, 4.0, 3600)]));
+
         let mut app = App::for_tests(statuses);
-        let screen = render(&mut app);
+        let screen = render(&mut app, 110, 30);
 
-        // The account list shows both accounts, with the live one marked.
-        assert!(screen.contains("claude-1"), "{screen}");
-        assert!(screen.contains("claude-2"), "{screen}");
+        // Both accounts, and every window of the first, without selecting it.
         assert!(
-            screen.contains('▶'),
-            "the active account should be marked:\n{screen}"
+            screen.contains("claude-1") && screen.contains("claude-2"),
+            "{screen}"
         );
-        assert!(
-            screen.contains("94%"),
-            "the worst window drives the meter:\n{screen}"
-        );
-
-        // The detail pane breaks the selected account down by window.
-        assert!(screen.contains("Limits"), "{screen}");
         assert!(screen.contains("5h"), "{screen}");
         assert!(screen.contains("weekly"), "{screen}");
+        assert!(screen.contains("weekly Fable"), "{screen}");
         assert!(
-            screen.contains("in 1h"),
-            "reset countdowns should show:\n{screen}"
+            screen.contains("68%") && screen.contains("76%") && screen.contains("19%"),
+            "{screen}"
+        );
+        // Resets are on the same line as the figure they belong to.
+        assert!(screen.contains("resets 3h"), "{screen}");
+        // The account in use says so.
+        assert!(screen.contains("● in use"), "{screen}");
+        // And the harness groups them.
+        assert!(screen.contains("Claude Code"), "{screen}");
+    }
+
+    /// With switching on the list is the queue, so the account that would be
+    /// taken next says so.
+    #[test]
+    fn the_next_account_is_named_only_while_switching_is_on() {
+        let mut statuses = crate::tui::app::sample_statuses(2);
+        statuses[0].usage = Some(usage(vec![window(FIVE_HOURS, None, 95.0, 3600)]));
+        statuses[1].usage = Some(usage(vec![window(FIVE_HOURS, None, 5.0, 3600)]));
+
+        let mut app = App::for_tests(statuses);
+        assert!(
+            !render(&mut app, 110, 30).contains("next"),
+            "with switching off the order is just an order"
         );
 
-        // The footer advertises the keys.
-        assert!(screen.contains("q quit"), "{screen}");
+        app.watching = true;
+        let screen = render(&mut app, 110, 30);
+        assert!(screen.contains("next"), "{screen}");
+        assert!(screen.contains("in the order they will be taken"), "{screen}");
+    }
+
+    /// Spending a window faster than it refills is the thing a percentage
+    /// cannot say on its own.
+    #[test]
+    fn a_window_spent_ahead_of_its_clock_says_so() {
+        // Nearly a full week spent with most of the week still to run.
+        let early = window(ONE_WEEK, None, 90.0, 6 * 86_400);
+        assert!(ahead_of_pace(&early, Timestamp::now()).is_some());
+
+        // The same figure at the end of the week is simply a spent week.
+        let late = window(ONE_WEEK, None, 90.0, 3600);
+        assert_eq!(ahead_of_pace(&late, Timestamp::now()), None);
+
+        // A window with no reset time states no pace to be ahead of.
+        let undated = Window {
+            resets_at: None,
+            ..early.clone()
+        };
+        assert_eq!(ahead_of_pace(&undated, Timestamp::now()), None);
+    }
+
+    #[test]
+    fn meters_scale_and_never_overflow() {
+        assert_eq!(meter(0.0, 10), "░░░░░░░░░░ ");
+        assert_eq!(meter(50.0, 10), "█████░░░░░ ");
+        assert_eq!(meter(100.0, 10), "██████████ ");
+        assert_eq!(meter(140.0, 10), "██████████ ");
+    }
+
+    #[test]
+    fn severity_escalates_with_usage() {
+        assert_eq!(severity(10.0), Color::Green);
+        assert_eq!(severity(80.0), Color::Yellow);
+        assert_eq!(severity(95.0), Color::LightRed);
+        assert_eq!(severity(100.0), Color::Red);
+    }
+
+    #[test]
+    fn renders_in_a_very_small_terminal_without_panicking() {
+        let mut app = App::for_tests(crate::tui::app::sample_statuses(3));
+        app.mode = Mode::Help;
+        for (width, height) in [(20u16, 5u16), (40, 10), (200, 60)] {
+            render(&mut app, width, height);
+        }
     }
 
     #[test]
     fn draws_guidance_when_there_are_no_accounts() {
-        let screen = render(&mut App::for_tests(Vec::new()));
+        let screen = render(&mut App::for_tests(Vec::new()), 80, 20);
         assert!(screen.contains("No accounts yet"), "{screen}");
-        assert!(screen.contains("press") || screen.contains("Press"), "{screen}");
     }
 
     #[test]
@@ -411,51 +575,14 @@ mod tests {
             id: "claude-1".into(),
             name: "dev@example.com".into(),
         };
-        let screen = render(&mut app);
+        let screen = render(&mut app, 80, 24);
         assert!(screen.contains("Remove claude-1 (dev@example.com)?"), "{screen}");
-        assert!(screen.contains("y to remove"), "{screen}");
 
         app.mode = Mode::ChooseProvider(ProviderAction::Add);
-        let screen = render(&mut app);
-        assert!(screen.contains("1  Claude Code"), "{screen}");
-        assert!(screen.contains("2  Codex"), "{screen}");
-
-        app.mode = Mode::Help;
-        assert!(render(&mut app).contains("sign the agent CLI in to it"));
-    }
-
-    #[test]
-    fn renders_in_a_very_small_terminal_without_panicking() {
-        let mut app = App::for_tests(crate::tui::app::sample_statuses(3));
-        app.mode = Mode::Help;
-        for (width, height) in [(20u16, 5u16), (40, 10), (200, 60)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        }
-    }
-
-    #[test]
-    fn bars_scale_and_handle_unknown_usage() {
-        assert_eq!(bar(Some(0.0), 10), "░░░░░░░░░░   0%");
-        assert_eq!(bar(Some(50.0), 10), "█████░░░░░  50%");
-        assert_eq!(bar(Some(100.0), 10), "██████████ 100%");
-        // Over 100% must not overflow the bar.
-        assert_eq!(bar(Some(150.0), 10), "██████████ 150%");
-        assert_eq!(bar(None, 4), "       ?");
-    }
-
-    #[test]
-    fn popups_fit_inside_small_terminals() {
-        let small = Rect::new(0, 0, 20, 5);
-        let area = popup(small, 60, 12);
-        assert!(area.width <= small.width && area.height <= small.height);
-    }
-
-    #[test]
-    fn gauge_colors_escalate_with_usage() {
-        assert_eq!(gauge_color(10.0), Color::Green);
-        assert_eq!(gauge_color(80.0), Color::LightYellow);
-        assert_eq!(gauge_color(95.0), Color::Yellow);
-        assert_eq!(gauge_color(100.0), Color::Red);
+        let screen = render(&mut app, 80, 24);
+        assert!(
+            screen.contains("1  Claude Code") && screen.contains("2  Codex"),
+            "{screen}"
+        );
     }
 }

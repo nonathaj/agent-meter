@@ -21,8 +21,8 @@ use crate::engine::Engine;
 /// This drives the same code the interactive loop draws with, so layout can be
 /// checked in tests and from `cargo run --example screenshot` without a
 /// terminal to attach to.
-pub fn screenshot(engine: &Engine, width: u16, height: u16) -> Result<String> {
-    let mut app = app::App::preview(engine)?;
+pub fn screenshot(engine: &Engine, width: u16, height: u16, watching: bool) -> Result<String> {
+    let mut app = app::App::preview(engine, watching)?;
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| draw::draw(frame, &mut app))?;
 

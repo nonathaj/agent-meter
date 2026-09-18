@@ -99,6 +99,20 @@ pub enum Error {
 }
 
 impl Error {
+    /// The failure in as few words as carry the meaning.
+    ///
+    /// `Display` names the endpoint, which is what a log wants and what a row
+    /// on a screen does not: the address is the same every time and crowds out
+    /// the part that differs.
+    pub fn brief(&self) -> String {
+        match self {
+            Error::Unauthorized { message, .. } => message.clone(),
+            Error::Status { status, body, .. } if body.is_empty() => format!("HTTP {status}"),
+            Error::Status { body, .. } => body.clone(),
+            other => other.to_string(),
+        }
+    }
+
     /// Whether retrying the same request later could plausibly succeed.
     pub fn is_transient(&self) -> bool {
         match self {

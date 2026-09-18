@@ -159,6 +159,47 @@ impl Engine {
             .collect())
     }
 
+    /// The order this provider's accounts would be taken in, best next first.
+    ///
+    /// The same ranking the watcher switches on, so a list showing this order
+    /// is showing what will happen rather than an arrangement of its own.
+    pub fn switch_order(&self, statuses: &[Status], kind: ProviderKind) -> Vec<String> {
+        let mine: Vec<&Status> = statuses.iter().filter(|s| s.account.provider == kind).collect();
+        let candidates: Vec<Candidate<'_>> = mine.iter().map(|s| self.candidate(s)).collect();
+        policy::queue(&candidates, &self.rules_for(kind), Timestamp::now())
+            .into_iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// How one account looks to the policy.
+    fn candidate<'a>(&self, status: &'a Status) -> Candidate<'a> {
+        Candidate {
+            id: &status.account.id,
+            usage: status.usage.as_ref(),
+            active: status.active,
+            usable: status.account.needs_login.is_none(),
+            capacity: status.account.identity.capacity,
+        }
+    }
+
+    /// The rules this provider is judged by.
+    pub fn rules_for(&self, kind: ProviderKind) -> Rules {
+        Rules {
+            threshold: self.config.threshold_for(kind),
+            margin: self.config.watch.margin,
+            // Taken from the provider's own answer about restarts, so a new
+            // provider inherits the behaviour instead of being named in the
+            // policy.
+            disruption: if provider::get(kind).restarts_sessions() {
+                Disruption::RestartsSessions
+            } else {
+                Disruption::Seamless
+            },
+            ..Rules::default()
+        }
+    }
+
     /// Resolves a user-supplied account reference: an id, an email, or a label.
     pub fn resolve(&self, reference: &str) -> Result<Account> {
         let accounts = self.store.accounts()?;
@@ -663,7 +704,8 @@ impl Engine {
             Err(error) => {
                 if !error.is_transient() {
                     let mut updated = account.clone();
-                    updated.needs_login = Some(format!("the provider rejected its credential ({error})"));
+                    updated.needs_login =
+                        Some(format!("the provider rejected its credential: {}", error.brief()));
                     let _ = self.store.put_account(&updated);
                 }
                 Err(error)
@@ -696,30 +738,9 @@ impl Engine {
                 continue;
             }
 
-            let candidates: Vec<Candidate<'_>> = provider_statuses
-                .iter()
-                .map(|s| Candidate {
-                    id: &s.account.id,
-                    usage: s.usage.as_ref(),
-                    active: s.active,
-                    usable: s.account.needs_login.is_none(),
-                    capacity: s.account.identity.capacity,
-                })
-                .collect();
-            let rules = Rules {
-                threshold: self.config.threshold_for(kind),
-                margin: self.config.watch.margin,
-                // Taken from the provider's own answer about restarts, so a new
-                // provider inherits the behaviour instead of being named in the
-                // policy.
-                disruption: if provider::get(kind).restarts_sessions() {
-                    Disruption::RestartsSessions
-                } else {
-                    Disruption::Seamless
-                },
-                ..Rules::default()
-            };
-            let decision = policy::decide(&candidates, &rules, now);
+            let candidates: Vec<Candidate<'_>> =
+                provider_statuses.iter().map(|s| self.candidate(s)).collect();
+            let decision = policy::decide(&candidates, &self.rules_for(kind), now);
 
             let (switched, held) = match &decision {
                 Decision::Switch { .. } if !act => (None, None),

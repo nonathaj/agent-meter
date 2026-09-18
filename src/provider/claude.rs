@@ -652,7 +652,7 @@ fn parse_rfc3339(value: &Value) -> Option<Timestamp> {
 
 /// Applies a token response to the credential it refreshed. Anthropic rotates
 /// refresh tokens, but only returns one when it did.
-fn parse_token_response(response: &Value, previous: &Credential) -> Result<Credential> {
+pub(crate) fn parse_token_response(response: &Value, previous: &Credential) -> Result<Credential> {
     let access_token = response
         .get("access_token")
         .and_then(Value::as_str)
@@ -667,12 +667,25 @@ fn parse_token_response(response: &Value, previous: &Credential) -> Result<Crede
         .get("expires_in")
         .and_then(Value::as_i64)
         .map(|secs| Timestamp::now() + jiff::SignedDuration::from_secs(secs));
+    // The refresh token is single-use, so the one just replaced has no expiry
+    // to carry forward; only an unrotated one keeps its own.
+    let rotated = refresh_token != previous.refresh_token;
     Ok(Credential {
         access_token,
         refresh_token,
         id_token: None,
-        expires_at: expires_at.or(previous.expires_at),
-        refresh_expires_at: previous.refresh_expires_at,
+        // Never the previous expiry. That timestamp describes the token this
+        // one just replaced, and it is the field that decides when to renew:
+        // a renewed credential wearing a spent clock is due again immediately,
+        // renews again on the next poll, and burns another single-use refresh
+        // token every time — until two rotations collide and the provider
+        // answers `invalid_grant`, which cannot be undone without signing in.
+        //
+        // `None` where the provider stated no lifetime is the honest answer,
+        // and it is also what closes the loop: an unknown expiry reads as not
+        // due, so the next renewal waits for a real reason.
+        expires_at,
+        refresh_expires_at: (!rotated).then_some(previous.refresh_expires_at).flatten(),
     })
 }
 

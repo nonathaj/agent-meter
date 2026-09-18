@@ -796,7 +796,7 @@ fn entitlement_due(account: &Account, active: bool, now: Timestamp) -> bool {
 }
 
 /// Whether a credential expires within `leeway`.
-fn expires_within(credential: &Credential, leeway: SignedDuration) -> bool {
+pub(crate) fn expires_within(credential: &Credential, leeway: SignedDuration) -> bool {
     credential
         .expires_at
         .is_some_and(|at| at - leeway <= Timestamp::now())
@@ -922,6 +922,47 @@ mod tests {
     /// The plan and quota size are re-asked on a clock measured in hours, and
     /// only for the account in use. Every request here competes with the usage
     /// polls that switching actually runs on.
+    /// The property, not the symptom: **after a renewal, the account must not
+    /// be due for another one.**
+    ///
+    /// Anything that renews on a timer and cannot say that burns a single-use
+    /// refresh token on every poll, and two rotations colliding ends in
+    /// `invalid_grant`, which no retry undoes. Asserted here for every provider
+    /// and for a response that states no lifetime at all, because carrying the
+    /// spent token's expiry forward is what turns one renewal into a loop.
+    #[test]
+    fn a_renewed_credential_is_never_immediately_due_again() {
+        let spent = Credential {
+            access_token: "old".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: None,
+            // Long expired, which is why a renewal happened at all.
+            expires_at: Some(Timestamp::now() - SignedDuration::from_hours(9)),
+            refresh_expires_at: Some(Timestamp::now() + SignedDuration::from_hours(48)),
+        };
+        assert!(expires_within(&spent, REFRESH_LEEWAY), "the credential was due");
+
+        let responses = [
+            // What the provider normally sends.
+            serde_json::json!({"access_token": "new", "refresh_token": "fresh", "expires_in": 28800}),
+            // And what it must survive sending: no lifetime at all.
+            serde_json::json!({"access_token": "new", "refresh_token": "fresh"}),
+            // A rotation-free renewal, which keeps its own refresh clock.
+            serde_json::json!({"access_token": "new", "expires_in": 28800}),
+        ];
+        for response in responses {
+            let renewed = crate::provider::claude::parse_token_response(&response, &spent).unwrap();
+            assert!(
+                !expires_within(&renewed, REFRESH_LEEWAY),
+                "renewing again immediately burns a single-use token every poll: {response}"
+            );
+            assert_ne!(
+                renewed.expires_at, spent.expires_at,
+                "the spent token's clock must not be carried forward: {response}"
+            );
+        }
+    }
+
     #[test]
     fn only_the_account_in_use_re_asks_its_entitlement_and_only_when_it_is_old() {
         let (_tmp, engine) = engine();

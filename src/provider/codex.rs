@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
@@ -159,6 +160,14 @@ impl Provider for Codex {
     fn restarts_sessions(&self) -> bool {
         // Codex reads auth.json once at startup.
         true
+    }
+
+    fn poll_interval(&self) -> Duration {
+        // Codex's own CLI reads this endpoint about once a minute per running
+        // session, so a minute here is traffic the machine already makes. It
+        // was only ever held to Anthropic's slower rate through sharing one
+        // number with it.
+        Duration::from_secs(60)
     }
 }
 

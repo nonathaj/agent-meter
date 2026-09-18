@@ -154,6 +154,15 @@ impl Provider for Claude {
         // session picks up the new account on its own.
         false
     }
+
+    fn poll_interval(&self) -> Duration {
+        // Anthropic tolerates roughly 28-30 requests an hour per account, and
+        // the penalty for passing it is not one skipped reading: the endpoint
+        // stays saturated for about an hour, which is an hour with nothing to
+        // switch on. Five minutes is twelve an hour, leaving room for the token
+        // refreshes and profile reads that come out of the same budget.
+        super::CAUTIOUS_POLL_INTERVAL
+    }
 }
 
 /// Builds an account from the two things Claude Code keeps about it: the

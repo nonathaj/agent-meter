@@ -561,10 +561,26 @@ impl Engine {
         if entry.retry_after.is_some_and(|at| at > now) {
             return false;
         }
+        let interval = self.poll_interval(account.provider).as_secs() as i64;
         entry
             .usage
             .as_ref()
-            .is_none_or(|usage| usage.age_secs(now) >= self.config.watch.poll_secs as i64)
+            .is_none_or(|usage| usage.age_secs(now) >= interval)
+    }
+
+    /// How often one provider's accounts are actually polled.
+    ///
+    /// Two numbers meet here. The provider states the closest together its own
+    /// endpoint may be asked, which differs by provider and is not ours to
+    /// choose. The configured interval is how often the watcher wakes, and a
+    /// provider cannot be polled more often than that however fast it would
+    /// tolerate — so the slower of the two wins, and setting a long interval
+    /// slows everything down without letting a short one speed anything past
+    /// what its provider allows.
+    pub fn poll_interval(&self, kind: ProviderKind) -> std::time::Duration {
+        provider::get(kind)
+            .poll_interval()
+            .max(std::time::Duration::from_secs(self.config.watch.poll_secs))
     }
 
     /// Reads one account's usage, refreshing its token first if needed and
@@ -960,6 +976,31 @@ mod tests {
                 renewed.expires_at, spent.expires_at,
                 "the spent token's clock must not be carried forward: {response}"
             );
+        }
+    }
+
+    /// One rate for every provider was Anthropic's rate applied to a provider
+    /// that never asked for it. Each states its own now, and the configured
+    /// cycle can only slow them down, never speed one past what it allows.
+    #[test]
+    fn each_provider_is_polled_at_its_own_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let mut engine = Engine::with_store(store).unwrap();
+
+        // The default cycle is a minute: Codex takes it, Claude does not.
+        engine.override_watch(None, Some(60)).unwrap();
+        assert_eq!(engine.poll_interval(ProviderKind::Codex).as_secs(), 60);
+        assert_eq!(
+            engine.poll_interval(ProviderKind::Claude).as_secs(),
+            300,
+            "Anthropic's ceiling is not something a faster cycle can opt out of"
+        );
+
+        // A slower cycle slows everyone, because nothing is read between wakes.
+        engine.override_watch(None, Some(900)).unwrap();
+        for kind in ProviderKind::ALL {
+            assert_eq!(engine.poll_interval(kind).as_secs(), 900, "{kind}");
         }
     }
 

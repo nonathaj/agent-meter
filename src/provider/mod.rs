@@ -10,12 +10,20 @@ mod secret_store;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::http;
 use crate::usage::Usage;
+
+/// The rate used for a provider that has not stated its own.
+///
+/// Deliberately the slow one. A provider polled too slowly shows a figure a few
+/// minutes old; one polled too fast can be refused for an hour, which is an
+/// hour with nothing to switch on.
+pub const CAUTIOUS_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The adapter for one agent CLI.
 pub trait Provider: Send + Sync {
@@ -57,6 +65,16 @@ pub trait Provider: Send + Sync {
     /// Whether a running session of this CLI keeps using the old account after
     /// a swap, so the user must restart it.
     fn restarts_sessions(&self) -> bool;
+
+    /// The closest together this provider's accounts may be polled for usage.
+    ///
+    /// Providers differ in what they tolerate, so this is theirs to answer
+    /// rather than one number applied to all of them. The default is the
+    /// cautious rate: guessing slow costs a stale figure, while guessing fast
+    /// can cost an hour of being refused outright.
+    fn poll_interval(&self) -> Duration {
+        CAUTIOUS_POLL_INTERVAL
+    }
 }
 
 /// Returns the adapter for `kind`.
@@ -117,6 +135,17 @@ pub const SESSION_VARS: &[&str] = &[
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
     "AI_AGENT",
 ];
+
+/// Names the agent session this process is running inside, if it is.
+///
+/// The same markers a CLI sets for its children are what identify a session
+/// from within one, so this reads exactly the list that is scrubbed for logins.
+pub fn inside_agent_session() -> Option<&'static str> {
+    SESSION_VARS
+        .iter()
+        .find(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
+        .copied()
+}
 
 /// Builds a command for `program`, resolved through `PATH` (which on Windows
 /// means finding `claude.cmd` or `codex.cmd`), with inherited agent state

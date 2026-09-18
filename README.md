@@ -92,7 +92,7 @@ address asks you which one you meant.
 | `agent-meter list` | Every account with its usage. `--refresh` polls now, `--json` prints machine-readable output. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
-| `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
+| `agent-meter use <account>` | Signs the agent CLI in to a stored account. Refused from inside an agent session, since it replaces the credential that session is running on. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
 | `agent-meter tui` | The same operations in a full-screen interface. |
@@ -188,22 +188,33 @@ agent-meter config set provider.codex.enabled false
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `watch.threshold` | `90` | Usage percent at which to look for a better account. |
-| `watch.poll-secs` | `300` | Seconds between usage polls. |
+| `watch.poll-secs` | `60` | Seconds between checks. Each provider is still polled no faster than it allows. |
 | `watch.margin` | `5` | Extra headroom needed to switch when every account is busy. |
 | `watch.cooldown-secs` | `300` | Minimum gap between automatic switches. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
 
-**Polling faster does not give you fresher numbers.** The vendors allow roughly
-30 requests an hour per account, across every request made on its behalf, so a
-poll a minute would spend the whole budget on being refused — and the first
-account refused is the busiest one, which is exactly the one a switch depends on
-being able to read. The floor is 120 seconds for that reason; the 5-minute
-default leaves room for the rest.
+### How often anything is actually read
 
-Plan and quota size are on a much slower clock: they change when you change plan
+`watch.poll-secs` is how often the watcher **wakes**, not how often an account is
+asked. Each provider states the closest together its own endpoint may be polled,
+and the slower of the two wins — so raising this slows everything down, while
+lowering it cannot speed any provider past its own rate.
+
+| | Polled | Why |
+| --- | --- | --- |
+| **Codex** | every minute | Its own CLI reads that endpoint about once a minute per running session, so this is traffic your machine already makes. |
+| **Claude** | every 5 minutes | Anthropic tolerates roughly 30 requests an hour per account, and going past it does not cost one skipped reading — the endpoint stays saturated for about an hour, which is an hour with nothing to switch on. |
+| a new provider | the slow rate | Guessing slow costs a stale figure; guessing fast can cost that hour. |
+
+Plan and quota size are on a slower clock again: they change when you change plan
 or move organisation, not as you work, so they are re-read every six hours and
 only for the account actually in use.
+
+A reading's age is only ever shown when it is a surprise — older than the
+interval that should already have replaced it, which usually means no watcher is
+running. Saying "just now" on every row would spend a column on the ordinary
+case.
 
 ## Where things are kept
 

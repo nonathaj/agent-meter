@@ -231,7 +231,7 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
         println!("  agent-meter add claude    # log in to another one");
         return Ok(ExitCode::SUCCESS);
     }
-    print!("{}", render_table(&statuses, Timestamp::now()));
+    print!("{}", render_table(engine, &statuses, Timestamp::now()));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -261,7 +261,7 @@ fn status_json(status: &Status, now: Timestamp) -> serde_json::Value {
     })
 }
 
-fn render_table(statuses: &[Status], now: Timestamp) -> String {
+fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String {
     let mut table = Table::new();
     table
         .load_style(TABLE_STYLE)
@@ -305,21 +305,32 @@ fn render_table(statuses: &[Status], now: Timestamp) -> String {
 
         // Keep the numbers in their columns: a flag here, the explanation
         // under the table, where a long provider message cannot stretch it.
-        let ago = status
-            .error_at
-            .map(|at| format!(" {} ago", crate::timefmt::since(now, at)))
-            .unwrap_or_default();
-        let (flag, detail) = match (&account.needs_login, &status.error) {
-            (Some(reason), _) => ("login needed", Some(format!("{}: {reason}", account.id))),
-            (None, Some(error)) if status.usage.is_some() => (
-                "reading is stale",
-                Some(format!("{}: poll failed{ago}: {error}", account.id)),
+        // An age is worth saying only when it is a surprise: a reading older
+        // than the interval that should already have replaced it. Saying "just
+        // now" on every row spends a column on the ordinary case, and where a
+        // poll failed the error already explains why the figures are not
+        // fresher — the age is the redundant half of that pair.
+        let overdue = status.usage.as_ref().filter(|usage| {
+            let interval = engine.poll_interval(account.provider).as_secs() as i64;
+            usage.age_secs(now) > interval + (interval / 2).max(60)
+        });
+        let (flag, detail) = match (&account.needs_login, &status.error, overdue) {
+            (Some(reason), _, _) => ("login needed", Some(format!("{}: {reason}", account.id))),
+            (None, Some(error), _) if status.usage.is_some() => {
+                ("reading is stale", Some(format!("{}: {error}", account.id)))
+            }
+            (None, Some(error), _) => ("no usage yet", Some(format!("{}: {error}", account.id))),
+            // Nothing failed, and yet nothing has read this account lately —
+            // which usually means no watcher is running.
+            (None, None, Some(usage)) => (
+                "",
+                Some(format!(
+                    "{}: read {} ago; `agent-meter list --refresh` or `agent-meter watch` updates it",
+                    account.id,
+                    crate::timefmt::since(now, usage.observed_at)
+                )),
             ),
-            (None, Some(error)) => (
-                "no usage yet",
-                Some(format!("{}: poll failed{ago}: {error}", account.id)),
-            ),
-            (None, None) => ("", None),
+            (None, None, None) => ("", None),
         };
         notes.extend(detail);
 
@@ -462,11 +473,23 @@ fn report_added(engine: &Engine, outcomes: &[AddOutcome]) -> Result<ExitCode> {
         }
     }
     println!();
-    print!("{}", render_table(&engine.status()?, Timestamp::now()));
+    print!("{}", render_table(engine, &engine.status()?, Timestamp::now()));
     Ok(ExitCode::SUCCESS)
 }
 
 fn switch(engine: &Engine, args: &UseArgs) -> Result<ExitCode> {
+    // Refused inside an agent session, and deliberately not by a flag anybody
+    // can pass: this command replaces the credential the session is running
+    // on, and a confirmation is how a person agrees to that — inside a session
+    // it is one more string the agent can emit on its own.
+    if let Some(marker) = crate::provider::inside_agent_session() {
+        bail!(
+            "refusing to switch accounts from inside an agent session ({marker} is set). \
+             This replaces the credential that session is using, so run it in an ordinary \
+             terminal instead — or let `agent-meter watch` do it, which is a decision you \
+             made in advance rather than one made mid-conversation."
+        );
+    }
     let account = engine.resolve(&args.account)?;
     let outcome = engine.switch_to(&account.id)?;
     print_switch(&outcome, account.provider.display_name());

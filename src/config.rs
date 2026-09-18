@@ -18,22 +18,12 @@ pub const DEFAULT_MARGIN: f64 = 5.0;
 /// Minimum seconds between automatic switches of the same provider.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 
-/// Requests an hour per account the providers tolerate before returning 429,
-/// as measured against their usage endpoints. It covers every request made on
-/// an account's behalf, not the usage endpoint alone.
-pub const MEASURED_HOURLY_CEILING: u64 = 30;
-/// The fastest poll allowed.
+/// The shortest cycle allowed.
 ///
-/// One a minute is above [`MEASURED_HOURLY_CEILING`] — 60 requests an hour
-/// against a measured 30 — so an account polled this hard will meet 429s. That
-/// is a deliberate trade for a faster reaction, and it is survivable because a
-/// refusal costs nothing but the request: the backoff in `engine` spaces the
-/// next attempts out on the provider's own `Retry-After`, and a failed poll
-/// keeps the previous reading rather than erasing it, so a spent account still
-/// reads as spent and a switch still happens.
-///
-/// Nothing faster than this is allowed, because past it the refusals arrive
-/// faster than the readings.
+/// This is how often the watcher *wakes*, not how often any one account is
+/// asked: each provider states the closest together its own endpoint may be
+/// polled, and the slower of the two wins. Waking more often than once a minute
+/// would buy nothing, because no provider is polled faster than that.
 pub const MIN_POLL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,7 +41,11 @@ pub struct Config {
 pub struct WatchConfig {
     /// Switch away from an account once any of its windows reaches this percent.
     pub threshold: f64,
-    /// Seconds between usage polls.
+    /// Seconds between checks.
+    ///
+    /// How often the watcher wakes. Each provider is polled no faster than its
+    /// own endpoint tolerates, so raising this slows everything down but
+    /// lowering it cannot speed any provider past its own rate.
     pub poll_secs: u64,
     /// Extra headroom a candidate needs before switching when every account is
     /// already past the threshold.
@@ -148,9 +142,9 @@ impl Config {
         }
         if self.watch.poll_secs < MIN_POLL_SECS {
             bail!(
-                "watch.poll-secs must be at least {MIN_POLL_SECS}. The providers allow roughly \
-                 {MEASURED_HOURLY_CEILING} requests an hour per account, and polling faster than \
-                 once a minute spends the budget on refusals faster than it collects readings."
+                "watch.poll-secs must be at least {MIN_POLL_SECS}. It is how often the watcher \
+                 wakes, and no provider is polled faster than its own endpoint tolerates, so a \
+                 shorter cycle would wake more often without reading anything new."
             );
         }
         Ok(())

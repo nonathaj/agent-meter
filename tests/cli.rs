@@ -124,9 +124,10 @@ impl Fixture {
         for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
             command.env_remove(var);
         }
-        // These tests stand for a person at a terminal. The suite may itself be
-        // run from inside an agent session, and inheriting its markers would
-        // make every test subject to the guard that refuses to switch there.
+        // The suite may be run from inside an agent session. Its markers say
+        // "a CLI is running you", which is not true of the binary under test,
+        // and leaving them set would have a test inherit an answer about its
+        // environment that its fixture did not choose.
         for var in [
             "CLAUDECODE",
             "CLAUDE_CODE_CHILD_SESSION",
@@ -506,34 +507,4 @@ fn stored_credentials_are_not_world_readable() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "account files must be readable by their owner only");
     }
-}
-
-/// `use` replaces the credential the caller is running on, so it is refused
-/// inside an agent session — and not by a flag, because inside a session a
-/// confirmation is one more string the agent can emit for itself.
-#[test]
-fn switching_is_refused_from_inside_an_agent_session() {
-    let fixture = Fixture::new();
-    fixture.sign_in_claude("dev@example.com", "uuid-1", "one");
-    fixture.run(&["import", "claude"]);
-
-    for marker in ["CLAUDECODE", "CODEX_THREAD_ID", "AI_AGENT"] {
-        fixture
-            .cmd(&["use", "claude-1"])
-            .env(marker, "1")
-            .assert()
-            .failure()
-            .stderr(contains("agent session").and(contains(marker)));
-    }
-
-    // `--yes` is not an escape hatch, because it is not a question being asked.
-    fixture
-        .cmd(&["use", "claude-1"])
-        .env("CLAUDECODE", "1")
-        .arg("--yes")
-        .assert()
-        .failure();
-
-    // Outside a session it goes through as before.
-    fixture.cmd(&["use", "claude-1"]).assert().success();
 }

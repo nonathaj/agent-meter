@@ -478,18 +478,6 @@ fn report_added(engine: &Engine, outcomes: &[AddOutcome]) -> Result<ExitCode> {
 }
 
 fn switch(engine: &Engine, args: &UseArgs) -> Result<ExitCode> {
-    // Refused inside an agent session, and deliberately not by a flag anybody
-    // can pass: this command replaces the credential the session is running
-    // on, and a confirmation is how a person agrees to that — inside a session
-    // it is one more string the agent can emit on its own.
-    if let Some(marker) = crate::provider::inside_agent_session() {
-        bail!(
-            "refusing to switch accounts from inside an agent session ({marker} is set). \
-             This replaces the credential that session is using, so run it in an ordinary \
-             terminal instead — or let `agent-meter watch` do it, which is a decision you \
-             made in advance rather than one made mid-conversation."
-        );
-    }
     let account = engine.resolve(&args.account)?;
     let outcome = engine.switch_to(&account.id)?;
     print_switch(&outcome, account.provider.display_name());

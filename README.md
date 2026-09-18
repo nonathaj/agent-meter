@@ -16,7 +16,7 @@ $ agent-meter list
  *   codex-1    Codex         dev@example.com      -             pro      8%    5h 0%  weekly 8%                    6d2h
 
 $ agent-meter watch
-Watching every 5m at a 90% threshold. Press Ctrl-C to stop.
+Watching every 1m at a 90% threshold. Press Ctrl-C to stop.
 Claude Code: switching to claude-2 (94% used; claude-2 is at 12%)
 ```
 
@@ -92,7 +92,7 @@ address asks you which one you meant.
 | `agent-meter list` | Every account with its usage. `--refresh` polls now, `--json` prints machine-readable output. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
-| `agent-meter use <account>` | Signs the agent CLI in to a stored account. Refused from inside an agent session, since it replaces the credential that session is running on. |
+| `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
 | `agent-meter tui` | The same operations in a full-screen interface. |

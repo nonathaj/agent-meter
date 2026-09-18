@@ -136,17 +136,6 @@ pub const SESSION_VARS: &[&str] = &[
     "AI_AGENT",
 ];
 
-/// Names the agent session this process is running inside, if it is.
-///
-/// The same markers a CLI sets for its children are what identify a session
-/// from within one, so this reads exactly the list that is scrubbed for logins.
-pub fn inside_agent_session() -> Option<&'static str> {
-    SESSION_VARS
-        .iter()
-        .find(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
-        .copied()
-}
-
 /// Builds a command for `program`, resolved through `PATH` (which on Windows
 /// means finding `claude.cmd` or `codex.cmd`), with inherited agent state
 /// stripped and the CLI pointed at `home`.

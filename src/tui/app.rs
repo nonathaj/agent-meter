@@ -75,8 +75,8 @@ pub struct App {
     pub message: Option<Message>,
     /// Set while the worker is busy.
     pub busy: Option<String>,
-    /// Whether automatic switching runs while the interface is open.
-    pub watching: bool,
+    /// Which harnesses switch automatically, as the configuration says.
+    pub switching: Vec<(ProviderKind, bool)>,
     pub threshold: f64,
     pub should_quit: bool,
     next_tick: Instant,
@@ -103,7 +103,7 @@ impl App {
             mode: Mode::Browse,
             message: None,
             busy: None,
-            watching: false,
+            switching: Vec::new(),
             threshold: engine.config().watch.threshold,
             should_quit: false,
             next_tick: Instant::now() + interval,
@@ -115,9 +115,11 @@ impl App {
 
     /// An interface built from the store but never run, for rendering a frame
     /// off-screen.
-    pub(super) fn preview(engine: &Engine, watching: bool) -> Result<Self> {
+    pub(super) fn preview(engine: &Engine, switching: bool) -> Result<Self> {
         let mut app = Self::new(engine)?;
-        app.watching = watching;
+        if switching {
+            app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
+        }
         app.rebuild(Some(engine));
         Ok(app)
     }
@@ -135,7 +137,7 @@ impl App {
             mode: Mode::Browse,
             message: None,
             busy: None,
-            watching: false,
+            switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
             threshold: 90.0,
             should_quit: false,
             next_tick: Instant::now(),
@@ -145,11 +147,41 @@ impl App {
         app
     }
 
-    /// Re-reads accounts and cached usage from the store.
+    /// Re-reads accounts, cached usage and the settings from the store.
+    ///
+    /// The settings are re-read rather than remembered, because `w` writes them
+    /// and the watcher reads them: holding a copy here would let the screen and
+    /// the thing doing the switching disagree.
     pub fn reload(&mut self, engine: &Engine) -> Result<()> {
         self.statuses = engine.status()?;
+        if let Ok(config) = engine.store().config() {
+            self.threshold = config.watch.threshold;
+            self.switching = ProviderKind::ALL
+                .map(|kind| (kind, config.is_switching_on(kind)))
+                .to_vec();
+        }
         self.rebuild(Some(engine));
         Ok(())
+    }
+
+    /// Whether this harness switches accounts on its own.
+    pub fn switching_on(&self, kind: ProviderKind) -> bool {
+        self.switching
+            .iter()
+            .find(|(provider, _)| *provider == kind)
+            .is_some_and(|(_, on)| *on)
+    }
+
+    /// Whether anything is switching, which is when a tick is worth running.
+    pub fn any_switching(&self) -> bool {
+        self.switching.iter().any(|(_, on)| *on)
+    }
+
+    /// Which account each harness is signed in to, for the headings.
+    pub fn active_of(&self, kind: ProviderKind) -> Option<&Status> {
+        self.statuses
+            .iter()
+            .find(|status| status.account.provider == kind && status.active)
     }
 
     /// Rebuilds the list: grouped by harness, and within each one in the order
@@ -346,7 +378,7 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
             app.reload(engine)?;
         }
 
-        if app.watching && app.busy.is_none() && Instant::now() >= app.next_tick {
+        if app.any_switching() && app.busy.is_none() && Instant::now() >= app.next_tick {
             app.next_tick = Instant::now() + app.tick_interval;
             submit(&mut app, &worker, Job::Tick);
         }
@@ -433,17 +465,16 @@ fn browse_key(
         KeyCode::Char('?') | KeyCode::F(1) => app.mode = Mode::Help,
         KeyCode::Char('a') => app.mode = Mode::ChooseProvider(ProviderAction::Add),
         KeyCode::Char('i') => app.mode = Mode::ChooseProvider(ProviderAction::Import),
-        KeyCode::Char('w') => {
-            app.watching = !app.watching;
-            if app.watching {
-                app.next_tick = Instant::now();
-                app.note(format!("Switching on: will move at {:.0}%", app.threshold));
-            } else {
-                app.note("Switching off");
+        KeyCode::Char('w') => match app.selected().map(|status| status.account.provider) {
+            Some(provider) => {
+                let on = !app.switching_on(provider);
+                if on {
+                    app.next_tick = Instant::now();
+                }
+                submit(app, worker, Job::SetSwitching { provider, on });
             }
-            // The order means something different now, so rebuild it.
-            app.rebuild(Some(engine));
-        }
+            None => app.fail("Select an account to switch its agent automatically"),
+        },
         KeyCode::Enter | KeyCode::Char('u') => match app.selected() {
             Some(status) if status.active => {
                 let id = status.account.id.clone();

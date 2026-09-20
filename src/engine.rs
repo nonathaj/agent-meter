@@ -50,7 +50,7 @@ pub struct Status {
 impl Status {
     /// Percent of the tightest window used, if known.
     pub fn used(&self, now: Timestamp) -> Option<f64> {
-        self.usage.as_ref().map(|u| u.used_at(now))
+        self.usage.as_ref().map(|usage| usage.worst_at(now))
     }
 }
 
@@ -603,10 +603,18 @@ impl Engine {
             return false;
         }
         let interval = self.poll_interval(account.provider).as_secs() as i64;
-        entry
-            .usage
-            .as_ref()
-            .is_none_or(|usage| usage.age_secs(now) >= interval)
+        entry.usage.as_ref().is_none_or(|usage| {
+            // A window that has turned over since this reading changes what the
+            // account can do, so the decision is worth re-running now rather
+            // than up to a whole interval later. It fires once per reset,
+            // because the reading that answers carries the next ones.
+            let reset_since = usage
+                .windows
+                .iter()
+                .filter_map(|window| window.resets_at)
+                .any(|at| at > usage.observed_at && at <= now);
+            reset_since || usage.age_secs(now) >= interval
+        })
     }
 
     /// How often one provider's accounts are actually polled.

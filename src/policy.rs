@@ -124,6 +124,9 @@ pub enum Blocked {
     NoAlternative,
 }
 
+/// A recovery this much sooner is worth a switch; anything closer is noise.
+const RECOVERY_MARGIN_SECS: i64 = 5 * 60;
+
 /// Decides what to do for one provider.
 pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> Decision {
     let Some(active) = candidates.iter().find(|c| c.active) else {
@@ -216,13 +219,10 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
                 // restart avoided by stranding someone on a wall is a restart
                 // they will have to take anyway.
                 return Decision::Stay(Stay::NotWorthARestart { used });
-            } else if remaining(candidate, usage)
-                >= remaining(active, active_usage) + rules.margin * weight(active, weighted)
-            {
-                // Only move for a worthwhile gain, or two busy accounts
-                // ping-pong. The margin is in points of the active account's
-                // own quota, so it means the same thing whichever way the
-                // ranking is being measured.
+            } else if worth_taking(active_usage, usage, rules, now) {
+                // Everything is past the threshold, so this is a choice between
+                // accounts that are comparably placed — worth making only for
+                // a meaningfully sooner recovery, or more left afterwards.
                 Reason::BestOfExhausted { used, target_used }
             } else {
                 return Decision::Stay(Stay::NoBetterAccount { used });
@@ -272,15 +272,57 @@ fn rank(
         let over = |(_, usage): &(&Candidate<'_>, &Usage)| usage.used_at(now) >= rules.threshold;
         over(a).cmp(&over(b)).then_with(|| {
             if over(a) {
-                remaining(b.0, b.1)
-                    .total_cmp(&remaining(a.0, a.1))
-                    .then_with(|| a.1.next_relief(now).cmp(&b.1.next_relief(now)))
-                    .then_with(|| a.0.id.cmp(b.0.id))
+                free_order(a.1, b.1, rules, now).then_with(|| a.0.id.cmp(b.0.id))
             } else {
                 recovery_order(*a, *b, remaining)
             }
         })
     });
+}
+
+/// Ranks two accounts that are both past the threshold, by when each can work
+/// again.
+///
+/// The soonest window an account is pressed against is the one that frees it,
+/// not the worst of them: at 99% of five hours and 95% of a week it is held by
+/// both, and the short window hands it a fresh allowance within the hour.
+/// Ranking on the worst figure would call that five days, because 95 is the
+/// larger number.
+///
+/// Where two recover at about the same time, the one with more left in its
+/// slowest window has more to give afterwards.
+fn free_order(a: &Usage, b: &Usage, rules: &Rules, now: Timestamp) -> std::cmp::Ordering {
+    let frees = |usage: &Usage| usage.recovers_at(now, rules.threshold).unwrap_or(Timestamp::MAX);
+    let slowest = |usage: &Usage| usage.slowest_headroom_at(now).unwrap_or(0.0);
+    frees(a)
+        .cmp(&frees(b))
+        .then_with(|| slowest(b).total_cmp(&slowest(a)))
+}
+
+/// Whether moving to `best` is worth it when both are past the threshold.
+///
+/// The margins exist to stop pointless shuffling between accounts that are
+/// comparably placed, which is why they are measured against what a switch
+/// buys: recovering meaningfully sooner is worth it, recovering later is not,
+/// and between the two it comes down to what is left afterwards.
+fn worth_taking(current: &Usage, best: &Usage, rules: &Rules, now: Timestamp) -> bool {
+    let frees = |usage: &Usage| usage.recovers_at(now, rules.threshold);
+    let sooner = match (frees(current), frees(best)) {
+        (Some(current), Some(best)) => current.as_second() - best.as_second(),
+        // One of them is not pressed against anything, so there is nothing to
+        // compare in time; fall through to what each has left.
+        _ => 0,
+    };
+    if sooner >= RECOVERY_MARGIN_SECS {
+        return true;
+    }
+    if sooner <= -RECOVERY_MARGIN_SECS {
+        return false;
+    }
+    match (best.slowest_headroom_at(now), current.slowest_headroom_at(now)) {
+        (Some(best), Some(current)) => best - current >= rules.margin,
+        _ => false,
+    }
 }
 
 /// The order these accounts would be taken in, best next first.
@@ -383,7 +425,10 @@ fn weight(candidate: &Candidate<'_>, weighted: bool) -> f64 {
 fn fresh<'a>(candidate: &Candidate<'a>, rules: &Rules, now: Timestamp) -> Option<&'a Usage> {
     candidate
         .usage
-        .filter(|u| u.age_secs(now) <= rules.max_reading_age_secs)
+        .filter(|usage| usage.age_secs(now) <= rules.max_reading_age_secs)
+        // Once every window it described has turned over it states no usage,
+        // which is not the same as stating there is room to switch into.
+        .filter(|usage| !usage.states_nothing_at(now))
 }
 
 #[cfg(test)]
@@ -449,6 +494,29 @@ mod tests {
                     scope: None,
                     used_percent: weekly,
                     resets_at: Timestamp::from_second(NOW + weekly_in_days * 86_400).ok(),
+                },
+            ],
+            limit_reached: false,
+        }
+    }
+
+    /// An account pressed against its week, which turns over in `weekly_in`
+    /// seconds, with its five-hour window comfortable.
+    fn pressed(weekly_used: f64, weekly_in: i64) -> Usage {
+        Usage {
+            observed_at: now(),
+            windows: vec![
+                Window {
+                    window_secs: FIVE_HOURS,
+                    scope: None,
+                    used_percent: 20.0,
+                    resets_at: Timestamp::from_second(NOW + 3600).ok(),
+                },
+                Window {
+                    window_secs: ONE_WEEK,
+                    scope: None,
+                    used_percent: weekly_used,
+                    resets_at: Timestamp::from_second(NOW + weekly_in).ok(),
                 },
             ],
             limit_reached: false,
@@ -850,90 +918,131 @@ mod tests {
         );
     }
 
-    /// With every account busy, the margin has to mean the same thing whichever
-    /// way the ranking is being measured: points of the active account's quota.
+    /// With every account busy, what a switch buys is a sooner return to
+    /// work — so that is what the margin is measured in.
     #[test]
-    fn the_margin_scales_with_the_quota_it_is_measured_against() {
-        // The margin only arises on a provider where switching is free.
+    fn past_the_threshold_the_account_that_frees_up_first_wins() {
         let rules = seamless();
+        // Both are pressed against their week. One turns over in an hour, the
+        // other in four days.
+        let soon = pressed(95.0, 3600);
+        let late = pressed(95.0, 4 * 86_400);
 
-        // 4 points of a 20x quota is 80 units, far beyond the 5-point margin,
-        // which is worth 100 units here. Not enough: stay.
-        let (active, other) = (usage(95.0), usage(91.0));
-        let decision = decide(
-            &[
-                sized("claude-1", Some(&active), true, 20),
-                sized("claude-2", Some(&other), false, 20),
-            ],
-            &rules,
-            now(),
-        );
-        assert_eq!(decision, Decision::Stay(Stay::NoBetterAccount { used: 95.0 }));
-
-        // The same two readings, but the candidate's quota is four times the
-        // active one's, so the work it can still do is far greater.
-        let decision = decide(
-            &[
-                sized("claude-1", Some(&active), true, 5),
-                sized("claude-2", Some(&other), false, 20),
-            ],
-            &rules,
-            now(),
-        );
+        // The account in use is the one waiting four days: move.
+        let candidates = [
+            candidate("claude-1", Some(&late), true),
+            candidate("claude-2", Some(&soon), false),
+        ];
         assert!(
             matches!(
-                &decision,
-                Decision::Switch {
-                    to,
-                    reason: Reason::BestOfExhausted { .. }
-                } if to == "claude-2"
+                decide(&candidates, &rules, now()),
+                Decision::Switch { ref to, .. } if to == "claude-2"
             ),
-            "{decision:?}"
+            "an hour of waiting beats four days"
         );
-    }
 
-    /// With switching on, the list somebody reads should be the order that
-    /// will actually happen — the account in use first, then the one that
-    /// would be taken next.
-    #[test]
-    fn the_queue_leads_with_the_account_in_use_then_the_one_that_is_next() {
-        let current = metered(50.0, 3600, 50.0, 5);
-        let soonest_week = metered(10.0, 3600, 10.0, 1);
-        let later_week = metered(0.0, 3600, 0.0, 9);
-        let spent = usage(100.0);
-
+        // The other way round there is nothing to gain by moving.
         let candidates = [
-            candidate("claude-2", Some(&later_week), false),
-            candidate("claude-4", Some(&spent), false),
-            candidate("claude-1", Some(&current), true),
-            candidate("claude-3", Some(&soonest_week), false),
+            candidate("claude-1", Some(&soon), true),
+            candidate("claude-2", Some(&late), false),
         ];
-        let order = queue(&candidates, &Rules::default(), now());
         assert_eq!(
-            order,
-            ["claude-1", "claude-3", "claude-2", "claude-4"],
-            "in use, then soonest-expiring week, then the rest, then the spent one"
+            decide(&candidates, &rules, now()),
+            Decision::Stay(Stay::NoBetterAccount { used: 95.0 })
         );
     }
 
-    /// Everything stays on the list even when the ranking has no place for it:
-    /// an account that cannot be switched to is still an account somebody has.
+    /// The soonest window an account is held by is the one that frees it, not
+    /// the worst figure it carries.
     #[test]
-    fn the_queue_keeps_accounts_it_cannot_rank() {
-        let current = usage(10.0);
-        let fine = usage(20.0);
+    fn recovery_is_the_soonest_window_pressed_against_not_the_worst_one() {
+        let now = now();
+        // 99% of five hours and 95% of a week: held by both, freed by the
+        // short one within the hour.
+        let both = metered(99.0, 3600, 95.0, 5);
+        assert_eq!(
+            both.recovers_at(now, 90.0)
+                .map(|at| at.as_second() - now.as_second()),
+            Some(3600),
+            "the worst figure is the week, but the hour is when work resumes"
+        );
+
+        // Nothing pressing against it: nothing to wait for.
+        let free = metered(10.0, 3600, 10.0, 5);
+        assert_eq!(free.recovers_at(now, 90.0), None);
+    }
+
+    /// Accounts that come back at the same moment are separated by what they
+    /// have left once they do.
+    #[test]
+    fn accounts_that_recover_together_are_separated_by_what_is_left_after() {
+        let rules = seamless();
+        // Both freed by the same five-hour window in an hour; one has far more
+        // of its week left for afterwards.
+        let thin = metered(95.0, 3600, 88.0, 5);
+        let deep = metered(95.0, 3600, 20.0, 5);
+
         let candidates = [
-            candidate("claude-1", Some(&current), true),
-            Candidate {
-                usable: false,
-                ..candidate("claude-2", Some(&fine), false)
-            },
-            candidate("claude-3", None, false),
+            candidate("claude-1", Some(&thin), true),
+            candidate("claude-2", Some(&deep), false),
         ];
-        let order = queue(&candidates, &Rules::default(), now());
-        assert_eq!(order.len(), 3);
-        assert_eq!(order[0], "claude-1");
-        assert!(order.contains(&"claude-2") && order.contains(&"claude-3"));
+        assert!(
+            matches!(
+                decide(&candidates, &rules, now()),
+                Decision::Switch { ref to, .. } if to == "claude-2"
+            ),
+            "same wait, more to give afterwards"
+        );
+
+        // Reversed, the gain is not there and the churn is not worth it.
+        let candidates = [
+            candidate("claude-1", Some(&deep), true),
+            candidate("claude-2", Some(&thin), false),
+        ];
+        assert!(
+            matches!(decide(&candidates, &rules, now()), Decision::Stay(_)),
+            "nothing to gain"
+        );
+    }
+
+    /// A per-model limit is not the account's: one capped model must not make
+    /// an otherwise free account look spent, or unusable to switch to.
+    #[test]
+    fn a_capped_model_does_not_make_the_account_spent() {
+        let now = now();
+        let mut reading = metered(10.0, 3600, 20.0, 5);
+        reading.windows.push(Window {
+            window_secs: ONE_WEEK,
+            scope: Some("Fable".into()),
+            used_percent: 100.0,
+            resets_at: Timestamp::from_second(NOW + 5 * 86_400).ok(),
+        });
+
+        assert_eq!(reading.worst_at(now), 100.0, "worth showing");
+        assert_eq!(reading.used_at(now), 20.0, "not worth refusing the account for");
+        assert!(!reading.is_exhausted_at(now));
+    }
+
+    /// A reading whose every window has turned over states no usage, which is
+    /// not the same as stating there is room.
+    #[test]
+    fn a_reading_that_has_wholly_expired_is_not_evidence_of_room() {
+        let spent = usage(100.0);
+        let now = now();
+        assert!(!spent.states_nothing_at(now));
+
+        // An hour later every window it described has reset.
+        let later = Timestamp::from_second(NOW + 7200).unwrap();
+        assert!(spent.states_nothing_at(later));
+
+        let fresh = usage(10.0);
+        let candidates = [
+            candidate("claude-1", Some(&fresh), true),
+            candidate("claude-2", Some(&spent), false),
+        ];
+        // It must not be offered as the roomiest thing available.
+        let order = queue(&candidates, &Rules::default(), later);
+        assert_eq!(order, ["claude-1", "claude-2"]);
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub enum Job {
     Import(ProviderKind),
     /// Run one watcher tick, switching if the policy says so.
     Tick,
+    /// Turn automatic switching on or off for one harness, and remember it.
+    SetSwitching { provider: ProviderKind, on: bool },
 }
 
 impl Job {
@@ -33,6 +35,11 @@ impl Job {
             Job::Remove(id) => format!("Removing {id}…"),
             Job::Import(provider) => format!("Importing from {}…", provider.display_name()),
             Job::Tick => "Checking whether to switch…".into(),
+            Job::SetSwitching { provider, on } => format!(
+                "Turning switching {} for {}…",
+                if *on { "on" } else { "off" },
+                provider.display_name()
+            ),
         }
     }
 }
@@ -129,6 +136,18 @@ fn run_job(engine: &Engine, job: &Job) -> Result<String> {
             Ok(format!(
                 "Imported {} from {}",
                 outcome.id(),
+                provider.display_name()
+            ))
+        }
+        Job::SetSwitching { provider, on } => {
+            // Written to the configuration rather than held for this run, so
+            // the watcher and the interface cannot disagree about it.
+            let mut config = engine.store().config()?;
+            config.set(&format!("provider.{provider}.enabled"), &on.to_string())?;
+            config.save(engine.store().dir())?;
+            Ok(format!(
+                "Switching {} for {}",
+                if *on { "on" } else { "off" },
                 provider.display_name()
             ))
         }

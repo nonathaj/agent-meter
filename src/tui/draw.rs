@@ -9,7 +9,7 @@
 use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
@@ -31,13 +31,21 @@ const PACE_SLACK: f64 = 25.0;
 const BAR: usize = 28;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
-            .areas(frame.area());
+    // The keys keep a line of their own. Sharing it with whatever just
+    // happened meant that every time something happened, the way to do the
+    // next thing disappeared.
+    let [header, body, message, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
     draw_header(frame, header, app);
     draw_body(frame, body, app);
-    draw_footer(frame, footer, app);
+    draw_message(frame, message, app);
+    draw_keys(frame, keys, app);
 
     match app.mode.clone() {
         Mode::Help => draw_help(frame),
@@ -54,20 +62,29 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::new()
                 .bg(Color::Blue)
                 .fg(Color::White)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(app.filter_label(), Style::new().fg(Color::Cyan)),
+        Span::raw("   "),
     ];
-    spans.push(Span::raw("  "));
-    spans.push(if app.watching {
-        Span::styled(
-            format!(" switching at {:.0}% ", app.threshold),
-            Style::new().bg(Color::Green).fg(Color::Black),
-        )
-    } else {
-        Span::styled("switching off", Style::new().fg(Color::DarkGray))
-    });
+    // Per harness, because they are switched on separately and one word for
+    // both would be a lie about whichever is off.
+    for (kind, on) in &app.switching {
+        spans.push(Span::styled(
+            format!("{} ", kind.display_name()),
+            Style::new().fg(Color::DarkGray),
+        ));
+        spans.push(if *on {
+            Span::styled(
+                format!(" auto {:.0}% ", app.threshold),
+                Style::new().bg(Color::Green).fg(Color::Black),
+            )
+        } else {
+            Span::styled("manual", Style::new().fg(Color::DarkGray))
+        });
+        spans.push(Span::raw("   "));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -124,20 +141,32 @@ fn provider_heading(kind: ProviderKind, app: &App, first: bool) -> Line<'static>
     }
     spans.push(Span::styled(
         format!("{} ", kind.display_name()),
-        Style::new()
-            .fg(Color::White)
-            .add_modifier(ratatui::style::Modifier::BOLD),
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
-        format!("({count})"),
+        format!("({count})  "),
         Style::new().fg(Color::DarkGray),
     ));
-    if app.watching {
+
+    // Naming it here answers "which account is this agent on" without reading
+    // down the list hunting for a marker.
+    match app.active_of(kind) {
+        Some(status) => {
+            spans.push(Span::styled("using ", Style::new().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                status.account.display_name().to_string(),
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        }
+        None => spans.push(Span::styled(
+            "not signed in to a stored account",
+            Style::new().fg(Color::Yellow),
+        )),
+    }
+    if app.switching_on(kind) {
         spans.push(Span::styled(
             "   in the order they will be taken",
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(ratatui::style::Modifier::ITALIC),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         ));
     }
     Line::from(spans)
@@ -162,9 +191,7 @@ fn account_block(
         Span::styled(format!("{position} "), number),
         Span::styled(
             account.display_name().to_string(),
-            Style::new()
-                .fg(Color::White)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
     if let Some(org) = &identity.workspace_name {
@@ -200,11 +227,14 @@ fn account_block(
 /// What this account is, in one word: in use, next, or spent.
 fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Span<'static> {
     if status.active {
+        // A filled badge rather than a word among words: this is the one fact
+        // somebody opens the interface to find.
         return Span::styled(
-            "● in use",
+            " IN USE ",
             Style::new()
-                .fg(Color::Green)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .bg(Color::Green)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
         );
     }
     if status.account.needs_login.is_some() {
@@ -219,13 +249,8 @@ fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Span
     }
     // Only meaningful when something is actually choosing: with switching off
     // the order is just an order.
-    if app.watching && position == 2 {
-        return Span::styled(
-            "next",
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        );
+    if app.switching_on(status.account.provider) && position == 2 {
+        return Span::styled("next", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
     Span::raw("")
 }
@@ -243,9 +268,7 @@ fn window_line(window: &Window, now: Timestamp) -> Line<'static> {
         Span::styled(meter(used, BAR), Style::new().fg(colour)),
         Span::styled(
             format!("{used:>4.0}%  "),
-            Style::new()
-                .fg(colour)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+            Style::new().fg(colour).add_modifier(Modifier::BOLD),
         ),
     ];
 
@@ -321,7 +344,7 @@ fn truncate(text: &str, width: usize) -> String {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
     let line = if let Some(busy) = &app.busy {
         Line::from(Span::styled(busy.clone(), Style::new().fg(Color::Cyan)))
     } else if let Some(message) = &app.message {
@@ -332,12 +355,56 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(Span::styled(message.text.clone(), Style::new().fg(colour)))
     } else {
-        Line::from(Span::styled(
-            "↑↓ select   enter use   r refresh   p provider   a add   i import   d remove   w switching   ? help   q quit",
-            Style::new().fg(Color::DarkGray),
-        ))
+        Line::raw("")
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// What can be done from here: always on screen, and always for this screen.
+fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
+    let keys: Vec<(&str, String)> = match &app.mode {
+        Mode::Help => vec![("any key", "close".into())],
+        Mode::ChooseProvider(_) => vec![("1 2", "choose an agent".into()), ("esc", "cancel".into())],
+        Mode::ConfirmRemove { .. } => vec![("y", "remove".into()), ("any key", "cancel".into())],
+        Mode::Browse => {
+            // Named for the harness the selection is in, since that is what the
+            // key will act on.
+            let switching = match app.selected().map(|status| status.account.provider) {
+                Some(kind) if app.switching_on(kind) => format!("{} manual", kind.display_name()),
+                Some(kind) => format!("{} auto", kind.display_name()),
+                None => "auto-switch".into(),
+            };
+            vec![
+                ("enter", "use".into()),
+                ("w", switching),
+                ("p", "by agent".into()),
+                ("r", "refresh".into()),
+                ("a", "add".into()),
+                ("i", "import".into()),
+                ("d", "remove".into()),
+                ("?", "keys".into()),
+                ("q", "quit".into()),
+            ]
+        }
+    };
+
+    // Built until it fills the width and no further: a bar that runs off the
+    // edge hides the keys at its end, which are still keys somebody needs.
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (key, what) in keys {
+        let width = key.chars().count() + what.chars().count() + 5;
+        if used + width > area.width as usize {
+            break;
+        }
+        used += width;
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::new().bg(Color::DarkGray).fg(Color::White),
+        ));
+        spans.push(Span::styled(format!(" {what}  "), Style::new().fg(Color::Gray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help(frame: &mut Frame) {
@@ -492,7 +559,8 @@ mod tests {
         // Resets are on the same line as the figure they belong to.
         assert!(screen.contains("resets 3h"), "{screen}");
         // The account in use says so.
-        assert!(screen.contains("● in use"), "{screen}");
+        assert!(screen.contains("IN USE"), "the account in use is unmistakable:
+{screen}");
         // And the harness groups them.
         assert!(screen.contains("Claude Code"), "{screen}");
     }
@@ -511,7 +579,7 @@ mod tests {
             "with switching off the order is just an order"
         );
 
-        app.watching = true;
+        app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
         let screen = render(&mut app, 110, 30);
         assert!(screen.contains("next"), "{screen}");
         assert!(screen.contains("in the order they will be taken"), "{screen}");

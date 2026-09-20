@@ -9,12 +9,12 @@ pub const ONE_WEEK: u64 = 7 * 24 * 3600;
 /// a few minutes of slack rather than exactly.
 const WINDOW_TOLERANCE: u64 = 300;
 
-/// What a rate-limit window measures.
+/// How long a limit's window is.
 ///
-/// The two are not interchangeable, and ranking accounts against each other
-/// depends on the difference. A five-hour window is a **rate**: at 90% it costs
-/// a few hours of waiting. A weekly window is a **budget**: at 90% it costs
-/// days, and whatever is left in it when it resets is thrown away.
+/// Both kinds are the same thing — a quota over a window — and the only
+/// difference is how long the window is, so the shorter one comes back sooner.
+/// That is what the difference is good for: not a rate against a budget, but
+/// how soon an account pressed against this limit can work again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowKind {
     FiveHour,
@@ -91,37 +91,60 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// The window closest to its limit as of `now` (ties go to the one that
-    /// resets last, since it blocks longest).
+    /// The account's own limits, ignoring the per-model ones.
+    ///
+    /// Every judgment is made on these. A per-model window at 100% stops one
+    /// model; the account can still do most of its work, and counting it would
+    /// refuse an account that is largely free — or send the watcher fleeing an
+    /// account that is fine.
+    fn account_windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.iter().filter(|w| w.is_account_wide())
+    }
+
+    /// The account-wide window closest to its limit as of `now`.
     pub fn binding_window(&self, now: Timestamp) -> Option<&Window> {
-        self.windows.iter().max_by(|a, b| {
+        self.account_windows().max_by(|a, b| {
             a.used_at(now)
                 .total_cmp(&b.used_at(now))
                 .then_with(|| a.resets_at.cmp(&b.resets_at))
         })
     }
 
-    /// Highest percent used across all windows as of `now`.
+    /// How much of the account's own quota is gone, as of `now`.
     pub fn used_at(&self, now: Timestamp) -> f64 {
         self.binding_window(now).map_or(0.0, |w| w.used_at(now))
     }
 
-    /// Percent left before the tightest window is exhausted.
+    /// The worst figure across every window, per-model ones included.
+    ///
+    /// For showing rather than deciding: "something here is capped" is true and
+    /// worth saying, even where it does not change what the account is good
+    /// for.
+    pub fn worst_at(&self, now: Timestamp) -> f64 {
+        self.windows.iter().map(|w| w.used_at(now)).fold(0.0, f64::max)
+    }
+
+    /// Percent left before the account's tightest own window is exhausted.
     pub fn headroom_at(&self, now: Timestamp) -> f64 {
         (100.0 - self.used_at(now)).max(0.0)
     }
 
+    /// Percent left in the window that takes longest to come back.
+    ///
+    /// The tie-break between accounts that recover at about the same time:
+    /// having spent the same short window, the one with more of its long window
+    /// left is the one with more to give afterwards.
+    pub fn slowest_headroom_at(&self, now: Timestamp) -> Option<f64> {
+        self.account_windows()
+            .max_by_key(|w| w.window_secs)
+            .map(|w| (100.0 - w.used_at(now)).max(0.0))
+    }
+
     /// Whether the account can do no work at all right now.
     ///
-    /// Only account-wide windows count. A per-model window at 100% costs that
-    /// model; the account can still do most of its work, and calling it spent
-    /// would refuse an account that is largely free.
+    /// Only account-wide windows count.
     pub fn is_exhausted_at(&self, now: Timestamp) -> bool {
-        let spent = self
-            .windows
-            .iter()
-            .filter(|w| w.is_account_wide())
-            .any(|w| w.used_at(now) >= 100.0);
+        let spent = self.account_windows().any(|w| w.used_at(now) >= 100.0);
         if spent {
             return true;
         }
@@ -129,14 +152,26 @@ impl Usage {
         self.limit_reached && self.windows.iter().all(|w| w.resets_at.is_none_or(|r| r > now))
     }
 
-    /// When the account's own window of `kind` resets.
+    /// When this account is next able to do more work than it can now.
     ///
-    /// Per-model windows are ignored: this answers when the *account* recovers.
-    /// `None` when the provider stated no such window, or no reset for it.
+    /// The **soonest** of the windows it is pressed against, not the worst of
+    /// them. An account at 99% of five hours and 95% of a week is held by both,
+    /// and in an hour the short window hands it a fresh allowance — so an hour
+    /// is when it recovers. Ranking on the worst window would call that five
+    /// days, because 95 is the larger number.
+    ///
+    /// `None` when nothing is pressing against it: there is nothing to wait for.
+    pub fn recovers_at(&self, now: Timestamp, threshold: f64) -> Option<Timestamp> {
+        self.account_windows()
+            .filter(|w| w.used_at(now) >= threshold)
+            .filter_map(|w| w.resets_at)
+            .min()
+    }
+
+    /// When the account's own window of `kind` resets.
     pub fn resets_at(&self, kind: WindowKind) -> Option<Timestamp> {
-        self.windows
-            .iter()
-            .filter(|w| w.is_account_wide() && w.kind() == kind)
+        self.account_windows()
+            .filter(|w| w.kind() == kind)
             .filter_map(|w| w.resets_at)
             .min()
     }
@@ -144,11 +179,19 @@ impl Usage {
     /// When the account becomes usable again: the instant every exhausted
     /// window has reset. `None` if not exhausted or the reset time is unknown.
     pub fn next_relief(&self, now: Timestamp) -> Option<Timestamp> {
-        self.windows
-            .iter()
+        self.account_windows()
             .filter(|w| w.used_at(now) >= 100.0)
             .filter_map(|w| w.resets_at)
             .max()
+    }
+
+    /// Whether this reading has stopped saying anything.
+    ///
+    /// Once every window it described has turned over, it states no usage —
+    /// which is not the same as stating that there is room. An absent
+    /// constraint must never be read as headroom.
+    pub fn states_nothing_at(&self, now: Timestamp) -> bool {
+        !self.windows.is_empty() && self.windows.iter().all(|w| w.resets_at.is_some_and(|r| r <= now))
     }
 
     /// Age of the reading in seconds.

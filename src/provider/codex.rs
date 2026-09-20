@@ -562,7 +562,11 @@ mod tests {
         assert_eq!(usage.windows[0].window_secs, FIVE_HOURS);
         assert_eq!(usage.windows[1].window_secs, ONE_WEEK);
         assert_eq!(usage.windows[2].label(), "5h GPT-5.3-Codex-Spark");
-        assert_eq!(usage.used_at(now), 42.0);
+        // The 42% belongs to one model. It is worth showing — something here
+        // is capped — but the account itself is only 8% spent, and judging it
+        // by the model's figure would refuse an account that is nearly free.
+        assert_eq!(usage.worst_at(now), 42.0, "shown");
+        assert_eq!(usage.used_at(now), 8.0, "judged");
         assert!(!usage.limit_reached);
 
         assert_eq!(parse_usage_identity(&response).email.unwrap(), "dev@example.com");

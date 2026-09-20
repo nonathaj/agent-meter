@@ -159,11 +159,24 @@ impl Config {
     }
 
     /// Whether the watcher should manage `provider`.
+    ///
+    /// Unset means yes: `agent-meter watch` was run on purpose, and it manages
+    /// everything unless it is told otherwise.
     pub fn is_enabled(&self, provider: ProviderKind) -> bool {
         self.provider
             .get(provider)
             .and_then(|p| p.enabled)
             .unwrap_or(true)
+    }
+
+    /// Whether somebody has actually asked this provider to switch itself.
+    ///
+    /// Unset means no. Opening a screen is not an instruction to start moving
+    /// credentials about, so the interface asks this rather than
+    /// [`Self::is_enabled`] — the same setting, read with the stricter default
+    /// that an interface needs.
+    pub fn is_switching_on(&self, provider: ProviderKind) -> bool {
+        self.provider.get(provider).and_then(|p| p.enabled) == Some(true)
     }
 
     /// Applies a `key = value` setting, as `agent-meter config set` does.

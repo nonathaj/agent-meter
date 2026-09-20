@@ -355,7 +355,7 @@ fn install_identity(home: &Path, account: &Account) -> Result<()> {
 
 /// Builds the credential blob to install: the stored account's tokens, the
 /// machine's own secrets, and whatever else the account carried.
-fn merge_credentials(live: &Map<String, Value>, account: &Account) -> Map<String, Value> {
+pub(crate) fn merge_credentials(live: &Map<String, Value>, account: &Account) -> Map<String, Value> {
     let mut oauth = Map::new();
     if let Some(Value::Object(extras)) = account.provider_data.get("oauthExtras") {
         oauth.extend(extras.clone());
@@ -467,7 +467,7 @@ fn parse_identity(account: Option<&Map<String, Value>>) -> Identity {
         user_id: get("accountUuid"),
         email: get("emailAddress"),
         workspace_id: get("organizationUuid"),
-        workspace_name: get("organizationName"),
+        workspace_name: get("organizationName").as_deref().and_then(sanitize_name),
         // The plan and the size of the quota come from the provider, not from
         // this file; see `capture`.
         plan: None,
@@ -496,44 +496,27 @@ fn parse_profile(response: &Value) -> Identity {
     Identity {
         user_id: string(account, "uuid"),
         workspace_id: string(organization, "uuid"),
-        workspace_name: workspace_name(organization, email.as_deref()),
+        workspace_name: organization
+            .and_then(|o| o.get("name"))
+            .and_then(Value::as_str)
+            .and_then(sanitize_name),
         plan: parse_plan(account, organization),
         capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
         email,
     }
 }
 
-/// What to call the organisation a seat belongs to.
+/// An organisation name as it is safe to keep.
 ///
-/// A personal organisation's provider-given name is the account's own address
-/// with several words stapled to it — "someone@example.com's Organization" —
-/// which repeats the column beside it and pushes the row onto a second line.
-/// It is one word: `personal`. A team's own name stands as it is, because that
-/// is the thing that tells two seats under one address apart.
-///
-/// A team name is written by whoever named the organisation, so it is trimmed
-/// of anything that could repaint the row it lands on.
-fn workspace_name(organization: Option<&Value>, email: Option<&str>) -> Option<String> {
-    let personal = matches!(
-        organization
-            .and_then(|o| o.get("organization_type"))
-            .and_then(Value::as_str),
-        Some("claude_max" | "claude_pro")
-    );
-    let raw = organization?.get("name")?.as_str()?;
-    // Some profiles state no organization type at all, and then the name is
-    // the only thing that says which kind of seat this is: a personal one is
-    // named after the address it will sit beside.
-    let named_after_the_person = email.is_some_and(|email| {
-        !email.is_empty() && raw.len() > email.len() && raw[..email.len()].eq_ignore_ascii_case(email)
-    });
-    if personal || named_after_the_person {
-        return Some("personal".into());
-    }
+/// A team's name is written by whoever named the organisation, so it is
+/// stripped of anything that could repaint the line it lands on or make it
+/// read as another organisation. What is left is the provider's own name,
+/// which is what another tool reading an export expects; shortening it for a
+/// column is `Identity::workspace_label`'s job.
+fn sanitize_name(raw: &str) -> Option<String> {
     let name: String = raw
         .chars()
         .filter(|c| !c.is_control() && !is_bidi_override(*c))
-        .take(40)
         .collect();
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_string())
@@ -888,52 +871,22 @@ mod tests {
         assert_eq!(identity.plan, None);
     }
 
-    /// A personal organisation is named after the address it sits beside, so
-    /// printing it verbatim repeats the column next to it and wraps the row.
+    /// A team names itself, so the name is kept only once it can no longer
+    /// repaint the line it lands on or read as another organisation.
     #[test]
-    fn a_personal_organization_is_called_personal_and_a_team_keeps_its_name() {
-        let named = |org_type: &str, name: &str| {
-            workspace_name(
-                Some(&json!({"organization_type": org_type, "name": name})),
-                Some("dev@example.com"),
-            )
-        };
+    fn an_organization_name_is_kept_as_the_provider_wrote_it_once_it_is_safe() {
+        assert_eq!(sanitize_name("Example Inc").as_deref(), Some("Example Inc"));
         assert_eq!(
-            named("claude_max", "dev@example.com's Organization").as_deref(),
-            Some("personal")
+            sanitize_name("dev@example.com's Organization").as_deref(),
+            Some("dev@example.com's Organization")
         );
         assert_eq!(
-            named("claude_pro", "dev@example.com's Org").as_deref(),
-            Some("personal")
-        );
-        assert_eq!(
-            named("claude_team", "Example Inc").as_deref(),
-            Some("Example Inc")
-        );
-
-        // A team names itself, so the name is trimmed of anything that could
-        // repaint the row or make it read as another organisation.
-        assert_eq!(
-            named("claude_team", "\u{1b}[31mEvil\u{202e}").as_deref(),
+            sanitize_name("\u{1b}[31mEvil\u{202e}").as_deref(),
             Some("[31mEvil")
         );
-        assert_eq!(named("claude_team", &"n".repeat(100)).unwrap().len(), 40);
-        assert_eq!(named("claude_team", "   ").as_deref(), None);
-        assert_eq!(workspace_name(None, None), None);
-
-        // Some profiles state no organization type at all, and then the name
-        // is the only thing saying this is a seat of one's own.
-        let untyped = json!({"name": "dev@example.com's Organization"});
-        assert_eq!(
-            workspace_name(Some(&untyped), Some("dev@example.com")).as_deref(),
-            Some("personal")
-        );
-        // A team whose name merely begins the same way is still a team.
-        let team = json!({"name": "dev@example.com Collective"});
-        assert_eq!(
-            workspace_name(Some(&team), Some("other@example.com")).as_deref(),
-            Some("dev@example.com Collective")
-        );
+        // Long names are kept whole here; the column decides how much fits.
+        assert_eq!(sanitize_name(&"n".repeat(100)).unwrap().len(), 100);
+        assert_eq!(sanitize_name("   "), None);
     }
 
     #[test]

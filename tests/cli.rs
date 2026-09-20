@@ -508,3 +508,149 @@ fn stored_credentials_are_not_world_readable() {
         assert_eq!(mode, 0o600, "account files must be readable by their owner only");
     }
 }
+
+/// Exporting writes into somebody else's store, so it merges: what that tool
+/// holds and agent-meter does not is left exactly as it was.
+#[test]
+fn exporting_adds_accounts_without_taking_away_the_tools_own() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_seat("dev@example.com", "uuid-1", "one", Some("team-org"));
+    fixture.run(&["import", "claude"]);
+
+    // A store that already holds an account of its own.
+    let store = fixture.data.parent().unwrap().join("gemctl");
+    std::fs::create_dir_all(&store).unwrap();
+    write_json(
+        &store.join("claude-9.json"),
+        &json!({
+            "schemaVersion": 1, "agent": "claude", "name": "claude-9",
+            "email": "someone-else@example.com", "orgId": "other-org",
+            "tokens": {"access_token": "a", "refresh_token": "theirs"}
+        }),
+    );
+
+    let dir = store.to_string_lossy().into_owned();
+    // Nothing is written until it is confirmed.
+    let planned = fixture.run(&["export", "--to", "gemctl", "--dir", &dir, "--yes"]);
+    assert!(planned.contains("add"), "{planned}");
+    assert!(planned.contains("1 account(s) gemctl holds"), "{planned}");
+
+    // Their account is untouched, ours is there.
+    let theirs: Value = read_json(&store.join("claude-9.json"));
+    assert_eq!(theirs["tokens"]["refresh_token"], "theirs");
+    let ours: Value = read_json(&store.join("claude-1.json"));
+    assert_eq!(ours["email"], "dev@example.com");
+    assert_eq!(ours["tokens"]["refresh_token"], "sk-ant-ort01-one");
+    assert_eq!(ours["orgId"], "team-org");
+
+    // Exporting again updates in place rather than adding a second copy.
+    let again = fixture.run(&["export", "--to", "gemctl", "--dir", &dir, "--yes"]);
+    assert!(again.contains("update"), "{again}");
+    let names: Vec<_> = std::fs::read_dir(&store)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(names.len(), 2, "no duplicate slot: {names:?}");
+}
+
+/// `personal` is our word for an organisation named after the address beside
+/// it — a column's shorthand, not the organisation's name. Writing it into
+/// another tool's store would rename the account on that tool's own screens.
+#[test]
+fn an_export_writes_the_name_the_provider_gave_not_our_shorthand() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_seat(
+        "dev@example.com",
+        "uuid-1",
+        "one",
+        Some("dev@example.com's Organization"),
+    );
+    fixture.run(&["import", "claude"]);
+
+    // Our own table shortens it.
+    let listed = fixture.run(&["list"]);
+    assert!(listed.contains("personal"), "{listed}");
+
+    // An earlier version wrote the shorthand into the record itself. The
+    // provider's own name survives beside the credential, so an export made
+    // from such a record still says what the provider said.
+    let record = fixture.data.join("accounts").join("claude-1.json");
+    let mut stored: Value = read_json(&record);
+    stored["identity"]["workspace_name"] = json!("personal");
+    write_json(&record, &stored);
+
+    let root = fixture.data.parent().unwrap().to_path_buf();
+    for tool in ["cswap", "gemctl"] {
+        let store = root.join(tool);
+        let dir = store.to_string_lossy().into_owned();
+        fixture.run(&["export", "--to", tool, "--dir", &dir, "--yes"]);
+
+        let written = std::fs::read_dir(&store)
+            .unwrap()
+            .flat_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .collect()
+                } else {
+                    vec![path]
+                }
+            })
+            .map(|path| std::fs::read_to_string(&path).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            written.contains("dev@example.com's Organization"),
+            "{tool} should carry the provider's name: {written}"
+        );
+        assert!(
+            !written.contains("\"personal\""),
+            "{tool} should not carry our shorthand: {written}"
+        );
+    }
+}
+
+/// What agent-meter writes, agent-meter can read: the shapes have to match the
+/// tools' own, and a round trip is the cheapest proof that they do.
+#[test]
+fn accounts_survive_a_round_trip_through_each_tool() {
+    for (tool, seats) in [("cswap", 2), ("gemctl", 2)] {
+        let fixture = Fixture::new();
+        fixture.sign_in_claude_seat("dev@example.com", "uuid-1", "one", Some("team-org"));
+        fixture.run(&["import", "claude"]);
+        fixture.sign_in_claude_seat("dev@example.com", "uuid-1", "two", Some("personal-org"));
+        fixture.run(&["import", "claude"]);
+        assert_eq!(fixture.accounts().len(), seats);
+
+        let dir = fixture
+            .data
+            .parent()
+            .unwrap()
+            .join(tool)
+            .to_string_lossy()
+            .into_owned();
+        fixture.run(&["export", "--to", tool, "--dir", &dir, "--yes"]);
+
+        // A second machine, importing what the first exported.
+        let other = Fixture::new();
+        other.run(&["import", "--from", tool, "--dir", &dir]);
+
+        let mut got: Vec<(String, String)> = other
+            .accounts()
+            .iter()
+            .map(|a| {
+                (
+                    a["email"].as_str().unwrap_or_default().to_string(),
+                    a["organization"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got.len(), seats, "{tool}: {got:?}");
+        // Two seats under one address stay two accounts through the trip.
+        assert_eq!(got[0].0, "dev@example.com");
+        assert_ne!(got[0].1, got[1].1, "{tool}: the organisations tell them apart");
+    }
+}

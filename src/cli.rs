@@ -57,6 +57,9 @@ enum Command {
     /// Store the account an agent CLI is already signed in to
     Import(ImportArgs),
 
+    /// Write these accounts into another tool's store
+    Export(ExportArgs),
+
     /// Sign an agent CLI in to one of the stored accounts
     #[command(visible_alias = "switch")]
     Use(UseArgs),
@@ -121,6 +124,22 @@ struct ImportArgs {
     /// Where that tool keeps its files, if not in its usual place
     #[arg(long, value_name = "PATH")]
     dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ExportArgs {
+    /// Which tool to write into
+    #[arg(long, value_enum)]
+    to: Source,
+    /// Only export accounts of this provider
+    #[arg(value_enum)]
+    provider: Option<ProviderKind>,
+    /// Where that tool keeps its files, if not in its usual place
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
+    /// Do not ask for confirmation
+    #[arg(short, long)]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -197,6 +216,7 @@ fn run() -> Result<ExitCode> {
         Command::List(args) => list(&engine, &args),
         Command::Add(args) => add(&engine, &args),
         Command::Import(args) => import(&engine, &args),
+        Command::Export(args) => export(&engine, &args),
         Command::Use(args) => switch(&engine, &args),
         Command::Remove(args) => remove(&engine, &args),
         Command::Watch(args) => watch(&engine, &args),
@@ -341,7 +361,7 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
             Cell::new(account.display_name()),
             // The organisation is part of which account this is: the same
             // address in two of them is two accounts, with separate limits.
-            Cell::new(account.identity.workspace_name.as_deref().unwrap_or("-")),
+            Cell::new(account.identity.workspace_label().unwrap_or("-".into())),
             Cell::new(account.identity.plan_label().unwrap_or_else(|| "-".into())),
             used_cell(
                 used,
@@ -474,6 +494,61 @@ fn report_added(engine: &Engine, outcomes: &[AddOutcome]) -> Result<ExitCode> {
     }
     println!();
     print!("{}", render_table(engine, &engine.status()?, Timestamp::now()));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Writes agent-meter's accounts into another tool's store.
+fn export(engine: &Engine, args: &ExportArgs) -> Result<ExitCode> {
+    let mut accounts = engine.store().accounts()?;
+    if let Some(provider) = args.provider {
+        accounts.retain(|account| account.provider == provider);
+    }
+    if accounts.is_empty() {
+        bail!("there are no accounts to export");
+    }
+
+    // Worked out first and shown before anything is written: this is somebody
+    // else's store, and it may be one they are still using.
+    let plan = crate::foreign::export(args.to, args.dir.as_deref(), &accounts, false)?;
+    let tool = args.to.display_name();
+    for line in &plan.added {
+        println!("  add     {line}");
+    }
+    for line in &plan.updated {
+        println!("  update  {line}");
+    }
+    for line in &plan.skipped {
+        println!("  skip    {line}");
+    }
+    if plan.untouched > 0 {
+        println!(
+            "  keep    {} account(s) {tool} holds that agent-meter does not",
+            plan.untouched
+        );
+    }
+    if plan.writes() == 0 {
+        println!("Nothing to write to {tool}.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !args.yes {
+        let prompt = format!(
+            "\nWrite {} account(s) into {tool}? Its own accounts are kept. [y/N] ",
+            plan.writes()
+        );
+        if !confirm(&prompt)? {
+            println!("Nothing was written.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    let done = crate::foreign::export(args.to, args.dir.as_deref(), &accounts, true)?;
+    println!(
+        "Wrote {} account(s) to {tool}: {} added, {} updated.",
+        done.writes(),
+        done.added.len(),
+        done.updated.len()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

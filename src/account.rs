@@ -1,5 +1,6 @@
 //! The account model shared by every layer.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use jiff::Timestamp;
@@ -9,6 +10,9 @@ use sha2::{Digest, Sha256};
 
 /// Schema version written into every account record.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// How much of a workspace name a row has space for.
+const WORKSPACE_LABEL_CHARS: usize = 40;
 
 /// An agent CLI whose accounts agent-meter can manage.
 #[derive(
@@ -100,6 +104,40 @@ impl Identity {
         if other.capacity.is_some() {
             self.capacity = other.capacity;
         }
+    }
+
+    /// What to call this workspace on screen.
+    ///
+    /// A personal organisation's provider-given name is the account's own
+    /// address with several words stapled to it — "someone@example.com's
+    /// Organization" — which repeats the column beside it and pushes the row
+    /// onto a second line. On screen that is one word: `personal`. A team's
+    /// own name stands as it is, because that is what tells two seats under
+    /// one address apart.
+    ///
+    /// The store keeps the provider's own name rather than this one. Another
+    /// tool reading an export expects the name its own screens show, and how
+    /// much of a name fits is a question only the thing drawing the column can
+    /// answer.
+    pub fn workspace_label(&self) -> Option<Cow<'_, str>> {
+        let name = self.workspace_name.as_deref()?;
+        // The test is redundancy with the column beside it, not the plan: a
+        // name that opens with the address says nothing the address did not.
+        let email = self.email.as_deref().unwrap_or_default();
+        let repeats_the_address = !email.is_empty()
+            && name.len() > email.len()
+            && name
+                .get(..email.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(email));
+        if repeats_the_address {
+            return Some(Cow::Borrowed("personal"));
+        }
+        let short: String = name.chars().take(WORKSPACE_LABEL_CHARS).collect();
+        Some(if short.len() == name.len() {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(short)
+        })
     }
 
     /// The plan as shown to the user, with the size of the quota when it is
@@ -251,6 +289,49 @@ mod tests {
             workspace_id: ws.map(Into::into),
             ..Default::default()
         }
+    }
+
+    /// The store keeps the provider's name; only the column is shortened. An
+    /// organisation named after the address it sits beside would otherwise
+    /// print that address twice and wrap the row.
+    #[test]
+    fn a_workspace_named_after_its_owner_is_shown_as_personal() {
+        let named = |email: &str, workspace: &str| Identity {
+            email: Some(email.into()),
+            workspace_name: Some(workspace.into()),
+            ..Default::default()
+        };
+        let label = |identity: Identity| identity.workspace_label().map(|l| l.into_owned());
+
+        assert_eq!(
+            label(named("dev@example.com", "dev@example.com's Organization")).as_deref(),
+            Some("personal")
+        );
+        // The address decides, not the case it is written in.
+        assert_eq!(
+            label(named("DEV@example.com", "dev@example.com's Organization")).as_deref(),
+            Some("personal")
+        );
+        // A team keeps its name: it is what tells two seats under one address
+        // apart, so replacing it would merge them on screen.
+        assert_eq!(
+            label(named("dev@example.com", "Example Inc")).as_deref(),
+            Some("Example Inc")
+        );
+        // A team whose name merely begins the same way is still a team.
+        assert_eq!(
+            label(named("other@example.com", "dev@example.com Collective")).as_deref(),
+            Some("dev@example.com Collective")
+        );
+        // A name the provider allowed but no column can hold.
+        assert_eq!(
+            label(named("dev@example.com", &"n".repeat(100)))
+                .unwrap()
+                .chars()
+                .count(),
+            WORKSPACE_LABEL_CHARS
+        );
+        assert_eq!(label(Identity::default()), None);
     }
 
     /// One address can hold two accounts: a personal seat and a team one. They

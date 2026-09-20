@@ -79,6 +79,17 @@ while you decide. Importing twice is safe: an account already stored is updated
 rather than added again, and that holds across tools too, so the same account
 found in both ends up as one.
 
+`agent-meter export --to cswap` and `--to gemctl` go the other way, writing
+these accounts into those tools' stores so a credential refreshed here is the
+one they hand out next. It is a merge, never a replacement: an account that
+tool holds and `agent-meter` does not is left exactly as it is, and an account
+both hold is matched on its address *and* its organisation, so exporting twice
+updates a seat rather than adding a second copy of it. What would be written is
+printed and confirmed before anything is; `--yes` skips the question and
+`--dir` points at an unusual location. Naming a provider — `export --to gemctl
+codex` — exports only that one, and claude-swap holds Claude accounts only, so
+Codex accounts are listed as skipped rather than written.
+
 One address can hold more than one account: a personal seat and a seat in a
 team share an address, and on Claude a user id too — only the organisation
 tells them apart, which is why it has a column of its own. They have separate
@@ -92,6 +103,7 @@ address asks you which one you meant.
 | `agent-meter list` | Every account with its usage. `--refresh` polls now, `--json` prints machine-readable output. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
+| `agent-meter export --to <tool>` | Writes these accounts into cswap's or gemctl's store, keeping the accounts they already hold. |
 | `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |

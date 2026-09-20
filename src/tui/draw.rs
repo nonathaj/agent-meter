@@ -194,7 +194,7 @@ fn account_block(
             Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(org) = &identity.workspace_name {
+    if let Some(org) = identity.workspace_label() {
         head.push(Span::styled(
             format!("  [{org}]"),
             Style::new().fg(Color::DarkGray),
@@ -559,8 +559,11 @@ mod tests {
         // Resets are on the same line as the figure they belong to.
         assert!(screen.contains("resets 3h"), "{screen}");
         // The account in use says so.
-        assert!(screen.contains("IN USE"), "the account in use is unmistakable:
-{screen}");
+        assert!(
+            screen.contains("IN USE"),
+            "the account in use is unmistakable:
+{screen}"
+        );
         // And the harness groups them.
         assert!(screen.contains("Claude Code"), "{screen}");
     }

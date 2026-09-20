@@ -13,7 +13,7 @@ use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::account::{Captured, Credential, Identity, ProviderKind};
+use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::fsutil;
 
 /// Where an account can be imported from.
@@ -70,12 +70,195 @@ fn read_json(path: &Path) -> Result<Option<Value>> {
         .with_context(|| format!("parsing {}", path.display()))
 }
 
+/// What exporting would do, before anything is written.
+#[derive(Debug, Default)]
+pub struct Plan {
+    /// Accounts this tool does not have yet.
+    pub added: Vec<String>,
+    /// Accounts it has, whose credential would be brought up to date.
+    pub updated: Vec<String>,
+    /// Accounts it holds that agent-meter does not, which are left alone.
+    pub untouched: usize,
+    /// Accounts that cannot be exported, and why.
+    pub skipped: Vec<String>,
+}
+
+impl Plan {
+    pub fn writes(&self) -> usize {
+        self.added.len() + self.updated.len()
+    }
+}
+
+/// Writes agent-meter's accounts into another tool's store.
+///
+/// A merge, never a replacement: entries that tool holds and agent-meter does
+/// not are left exactly as they are. Somebody may still be using that tool, and
+/// an export is not a reason to take its accounts away.
+pub fn export(source: Source, dir: Option<&Path>, accounts: &[Account], apply: bool) -> Result<Plan> {
+    match source {
+        Source::Live => bail!(
+            "the signed-in CLIs are written by `agent-meter use`, which signs one in rather than \
+             storing them all"
+        ),
+        Source::Cswap => cswap::export(dir, accounts, apply),
+        Source::Gemctl => gemctl::export(dir, accounts, apply),
+    }
+}
+
+/// A string the provider itself wrote about an account.
+///
+/// Another tool wants the names its own screens show, which is what the
+/// provider's record beside the credential holds. `Identity` is not that
+/// record: its workspace name is shortened for our columns in stores written
+/// by earlier versions, and its plan is always one of our own words.
+fn said(account: &Account, key: &str) -> Option<String> {
+    account
+        .provider_data
+        .get("oauthAccount")?
+        .as_object()?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Writes JSON somebody else's tool will read, formatted as it writes it.
+fn write_json(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fsutil::create_private_dir(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(value).context("serializing")?;
+    bytes.push(b'\n');
+    fsutil::write_atomic(path, &bytes, fsutil::Mode::Private)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 mod cswap {
     //! claude-swap keeps one credential per numbered slot, base64-encoded (the
     //! `.enc` suffix is historical; there is no encryption), with the accounts
     //! themselves listed in `sequence.json`.
 
     use super::*;
+
+    /// Writes accounts into claude-swap's backup directory.
+    pub(super) fn export(dir: Option<&Path>, accounts: &[Account], apply: bool) -> Result<Plan> {
+        let dir = match dir {
+            Some(dir) => dir.to_path_buf(),
+            None => default_dir()?,
+        };
+        let mut roster = super::read_json(&dir.join("sequence.json"))?
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut entries = roster
+            .get("accounts")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let before = entries.len();
+
+        let mut plan = Plan::default();
+        for account in accounts {
+            if account.provider != ProviderKind::Claude {
+                plan.skipped
+                    .push(format!("{} — claude-swap holds Claude accounts only", account.id));
+                continue;
+            }
+            let Some(email) = account.identity.email.clone() else {
+                plan.skipped.push(format!(
+                    "{} — claude-swap files accounts by address, and this one has none",
+                    account.id
+                ));
+                continue;
+            };
+
+            // Reuse the slot this account already occupies, so an export twice
+            // over does not fill the roster with copies of the same seat.
+            let slot = entries
+                .iter()
+                .find(|(_, entry)| {
+                    string(entry, "email").as_deref() == Some(email.as_str())
+                        && string(entry, "organizationUuid") == account.identity.workspace_id
+                })
+                .map(|(slot, _)| slot.clone());
+            let slot = match slot {
+                Some(slot) => {
+                    plan.updated.push(format!("{} -> slot {slot}", account.id));
+                    slot
+                }
+                None => {
+                    let next = (1..).find(|n| !entries.contains_key(&n.to_string())).unwrap_or(1);
+                    plan.added.push(format!("{} -> slot {next}", account.id));
+                    next.to_string()
+                }
+            };
+
+            if !apply {
+                entries.insert(slot, Value::Object(Map::new()));
+                continue;
+            }
+
+            // The roster entry and the config file written beside it are two
+            // descriptions of one account, so both are taken from the same
+            // place: the provider's own record, which is what claude-swap
+            // reads back and shows.
+            let said = |key: &str| super::said(account, key);
+            let mut entry = Map::new();
+            entry.insert("email".into(), json!(email));
+            for (key, value) in [
+                (
+                    "uuid",
+                    said("accountUuid").or_else(|| account.identity.user_id.clone()),
+                ),
+                (
+                    "organizationUuid",
+                    said("organizationUuid").or_else(|| account.identity.workspace_id.clone()),
+                ),
+                (
+                    "organizationName",
+                    said("organizationName").or_else(|| account.identity.workspace_name.clone()),
+                ),
+            ] {
+                if let Some(value) = value {
+                    entry.insert(key.into(), json!(value));
+                }
+            }
+            entry.insert("added".into(), json!(account.added_at.to_string()));
+            if let Some(label) = &account.label {
+                entry.insert("alias".into(), json!(label));
+            }
+            entries.insert(slot.clone(), Value::Object(entry));
+
+            // The credential, base64 as claude-swap stores it, and the identity
+            // block it keeps beside it.
+            let blob = crate::provider::claude::merge_credentials(&Map::new(), account);
+            let encoded = STANDARD.encode(serde_json::to_vec(&Value::Object(blob))?);
+            fsutil::create_private_dir(&dir.join("credentials"))?;
+            fsutil::write_atomic(
+                &dir.join("credentials").join(format!(".creds-{slot}-{email}.enc")),
+                encoded.as_bytes(),
+                fsutil::Mode::Private,
+            )?;
+            if let Some(block) = account.provider_data.get("oauthAccount") {
+                super::write_json(
+                    &dir.join("configs")
+                        .join(format!(".claude-config-{slot}-{email}.json")),
+                    &json!({ "oauthAccount": block }),
+                )?;
+            }
+        }
+
+        plan.untouched = before.saturating_sub(plan.updated.len());
+        if apply {
+            let mut sequence: Vec<i64> = entries.keys().filter_map(|slot| slot.parse().ok()).collect();
+            sequence.sort_unstable();
+            roster.insert("accounts".into(), Value::Object(entries));
+            roster.insert("sequence".into(), json!(sequence));
+            roster.insert("lastUpdated".into(), json!(Timestamp::now().to_string()));
+            roster.entry("activeAccountNumber").or_insert(Value::Null);
+            super::write_json(&dir.join("sequence.json"), &Value::Object(roster))?;
+        }
+        Ok(plan)
+    }
 
     /// Reads claude-swap's backups.
     pub(super) fn read(dir: Option<&Path>) -> Result<Vec<Found>> {
@@ -282,6 +465,116 @@ mod gemctl {
         let echoes_something_shown =
             bare.eq_ignore_ascii_case(name) || email.is_some_and(|email| bare.eq_ignore_ascii_case(email));
         (!bare.is_empty() && !echoes_something_shown).then(|| label.clone())
+    }
+
+    /// Writes accounts into the store gemctl and the launcher share.
+    pub(super) fn export(dir: Option<&Path>, accounts: &[Account], apply: bool) -> Result<Plan> {
+        let dir = match dir {
+            Some(dir) => dir.to_path_buf(),
+            None => default_dir()?,
+        };
+        let existing = super::read(Source::Gemctl, Some(&dir)).unwrap_or_default();
+        let mut plan = Plan::default();
+        let mut taken: Vec<String> = existing
+            .iter()
+            .map(|found| found.origin.trim_start_matches("gemctl ").to_string())
+            .collect();
+        let before = taken.len();
+
+        for account in accounts {
+            // Match on the address and the workspace, which is what tells two
+            // seats under one address apart.
+            let name = existing
+                .iter()
+                .find(|found| {
+                    found.provider == account.provider
+                        && found.captured.identity.email == account.identity.email
+                        && found.captured.identity.workspace_id == account.identity.workspace_id
+                        && account.identity.email.is_some()
+                })
+                .map(|found| found.origin.trim_start_matches("gemctl ").to_string());
+            let name = match name {
+                Some(name) => {
+                    plan.updated.push(format!("{} -> {name}", account.id));
+                    name
+                }
+                None => {
+                    let prefix = account.provider.as_str();
+                    let next = (1..)
+                        .map(|n| format!("{prefix}-{n}"))
+                        .find(|name| !taken.contains(name))
+                        .unwrap_or_else(|| format!("{prefix}-1"));
+                    plan.added.push(format!("{} -> {next}", account.id));
+                    taken.push(next.clone());
+                    next
+                }
+            };
+            if !apply {
+                continue;
+            }
+
+            let mut tokens = Map::new();
+            tokens.insert("access_token".into(), json!(account.credential.access_token));
+            tokens.insert("refresh_token".into(), json!(account.credential.refresh_token));
+            if let Some(id_token) = &account.credential.id_token {
+                tokens.insert("id_token".into(), json!(id_token));
+            }
+
+            // The two providers put different things in `accountId`: for Claude
+            // the account's own uuid, for Codex the workspace its seat is in.
+            let (account_id, user_id) = match account.provider {
+                ProviderKind::Claude => (account.identity.user_id.clone(), None),
+                ProviderKind::Codex => (
+                    account.identity.workspace_id.clone(),
+                    account.identity.user_id.clone(),
+                ),
+            };
+
+            let mut record = Map::new();
+            record.insert("schemaVersion".into(), json!(1));
+            record.insert("agent".into(), json!(account.provider.as_str()));
+            record.insert("name".into(), json!(name));
+            record.insert("tokens".into(), Value::Object(tokens));
+            record.insert("verified".into(), json!(account.needs_login.is_none()));
+            record.insert("label".into(), json!(account.display_name()));
+            record.insert("firstSeen".into(), json!(account.added_at.to_string()));
+            for (key, value) in [
+                ("accountId", account_id),
+                ("userId", user_id),
+                ("email", account.identity.email.clone()),
+                ("plan", account.identity.plan.clone()),
+                (
+                    "orgName",
+                    super::said(account, "organizationName")
+                        .or_else(|| account.identity.workspace_name.clone()),
+                ),
+            ] {
+                if let Some(value) = value {
+                    record.insert(key.into(), json!(value));
+                }
+            }
+            if account.provider == ProviderKind::Claude
+                && let Some(org) = &account.identity.workspace_id
+            {
+                record.insert("orgId".into(), json!(org));
+            }
+            // Seconds there, where Claude Code's own file uses milliseconds.
+            for (key, value) in [
+                ("expiresAt", account.credential.expires_at),
+                ("refreshExpiresAt", account.credential.refresh_expires_at),
+            ] {
+                if let Some(at) = value {
+                    record.insert(key.into(), json!(at.as_second()));
+                }
+            }
+            if let Some(reason) = &account.needs_login {
+                record.insert("needsLogin".into(), json!(reason));
+            }
+            super::write_json(&dir.join(format!("{name}.json")), &Value::Object(record))?;
+        }
+
+        plan.untouched = before.saturating_sub(plan.updated.len());
+        Ok(plan)
     }
 
     pub(super) fn read(dir: Option<&Path>) -> Result<Vec<Found>> {

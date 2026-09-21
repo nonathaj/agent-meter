@@ -377,10 +377,18 @@ impl Engine {
         let checked_at = captured.identity.plan.is_some().then(Timestamp::now);
 
         if let Some(mut account) = existing {
-            account.credential = captured.credential;
+            // Two tools can be holding the same account with different
+            // credentials, and only one of them still works: refreshing
+            // rotates a single-use refresh token, so whichever copy was
+            // refreshed last is live and the other was spent at that moment.
+            // A store nobody has opened in a week holds the spent one, and
+            // taking it would sign the account out.
+            if supersedes(&captured.credential, &account.credential) {
+                account.credential = captured.credential;
+                account.needs_login = None;
+            }
             account.identity.update_from(&captured.identity);
             account.provider_data = captured.provider_data;
-            account.needs_login = None;
             if checked_at.is_some() {
                 account.entitlement_checked_at = checked_at;
             }
@@ -806,6 +814,24 @@ impl Engine {
 ///
 /// Best effort, and deliberately outside the store lock: it is a network call,
 /// and an account with an unknown plan is better than a failed import.
+/// Whether `candidate` is a later copy of an account's credential than `held`.
+///
+/// Refreshing an OAuth credential rotates its refresh token and mints an
+/// access token with a fresh expiry, so of two copies of one account the one
+/// whose access token expires later is the one refreshed most recently — and
+/// the other was spent at that moment. When neither states an expiry there is
+/// nothing to compare, and the copy being offered is the most recent thing
+/// anybody has said about the account.
+fn supersedes(candidate: &Credential, held: &Credential) -> bool {
+    if candidate.refresh_token == held.refresh_token {
+        return true;
+    }
+    match (candidate.expires_at, held.expires_at) {
+        (Some(offered), Some(stored)) => offered > stored,
+        _ => true,
+    }
+}
+
 fn name_account(kind: ProviderKind, captured: &mut Captured) {
     if captured.identity.email.is_some() && captured.identity.plan.is_some() {
         return;

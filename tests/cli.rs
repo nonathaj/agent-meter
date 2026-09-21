@@ -243,6 +243,58 @@ fn importing_the_same_account_again_updates_it_rather_than_duplicating() {
     assert_eq!(accounts[0]["id"], "claude-1");
 }
 
+/// Two tools can hold the same account with different credentials, and only
+/// one of them still works: refreshing rotates a single-use token, so the copy
+/// refreshed last is live and the other was spent the moment it was replaced.
+/// Importing from a store nobody has opened in a week must not hand the
+/// account its spent copy and then report it as signed out.
+#[test]
+fn importing_an_older_store_keeps_the_credential_that_still_works() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("dev@example.com", "uuid-1", "live");
+    fixture.run(&["import", "claude"]);
+    // Another account takes the CLI, so the one under test is merely stored.
+    // The account actually signed in is a case of its own: whatever its CLI
+    // holds is what that agent is using, however old.
+    fixture.sign_in_claude("other@example.com", "uuid-2", "other");
+    fixture.run(&["import", "claude"]);
+
+    let store = fixture.data.parent().unwrap().join("gemctl");
+    std::fs::create_dir_all(&store).unwrap();
+    let path = store.join("claude-1.json");
+    let dir = store.to_string_lossy().into_owned();
+    let record = |refresh: &str, expires: i64| {
+        json!({
+            "schemaVersion": 1, "agent": "claude", "name": "claude-1",
+            "email": "dev@example.com", "orgId": "org-1",
+            "expiresAt": expires,
+            "tokens": {"access_token": "a", "refresh_token": refresh}
+        })
+    };
+    let stored = || read_json(&fixture.data.join("accounts").join("claude-1.json"));
+
+    // Their copy is the older one, so ours is the one that still works.
+    write_json(&path, &record("spent", 1_700_000_000));
+    fixture.run(&["import", "--from", "gemctl", "--dir", &dir]);
+    assert_eq!(
+        stored()["credential"]["refresh_token"],
+        "sk-ant-ort01-live",
+        "a spent copy replaced the live one: {}",
+        stored()
+    );
+    assert!(stored()["needs_login"].is_null(), "{}", stored());
+
+    // Their copy is the newer one, so it is taken.
+    write_json(&path, &record("refreshed-elsewhere", 2_000_000_000));
+    fixture.run(&["import", "--from", "gemctl", "--dir", &dir]);
+    assert_eq!(
+        stored()["credential"]["refresh_token"],
+        "refreshed-elsewhere",
+        "{}",
+        stored()
+    );
+}
+
 #[test]
 fn switching_replaces_the_live_credential_and_keeps_unrelated_settings() {
     let fixture = Fixture::new();

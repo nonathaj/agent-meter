@@ -207,21 +207,47 @@ fn account_block(
     head.push(standing(status, position, app, now));
 
     let mut lines = vec![Line::from(head)];
-    match (&account.needs_login, &status.error, &status.usage) {
-        (Some(reason), _, _) => lines.push(note(format!("sign in again — {reason}"), Color::Red, width)),
-        (None, Some(error), None) => lines.push(note(format!("no reading — {error}"), Color::Yellow, width)),
+    lines.extend(body(status, now, width));
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// What is drawn under an account's name: every limit it has, or why it has
+/// none to show.
+fn body(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
+    match (&status.account.needs_login, &status.error, &status.usage) {
+        (Some(reason), _, _) => vec![note(format!("sign in again — {reason}"), Color::Red, width)],
+        (None, Some(error), None) => vec![note(format!("no reading — {error}"), Color::Yellow, width)],
         (None, error, Some(usage)) => {
-            for window in &usage.windows {
-                lines.push(window_line(window, now));
-            }
+            let mut lines: Vec<Line<'static>> = usage
+                .windows
+                .iter()
+                .map(|window| window_line(window, now))
+                .collect();
             if let Some(error) = error {
                 lines.push(note(format!("not refreshed — {error}"), Color::Yellow, width));
             }
+            lines
         }
-        (None, None, None) => lines.push(note("no reading yet — press r".into(), Color::DarkGray, width)),
+        (None, None, None) => vec![note("no reading yet — press r".into(), Color::DarkGray, width)],
     }
-    lines.push(Line::raw(""));
-    lines
+}
+
+/// How many lines `body` draws.
+///
+/// Scrolling needs the height of a block before its lines exist, so it is
+/// stated here rather than guessed at from the number of limits: an account
+/// that needs a login shows one line whatever its last reading held, and an
+/// account with both a reading and an error shows one more than it has limits.
+/// Guessing got both wrong, which scrolled to a line other than the one the
+/// selection was on. A test holds this and `body` together.
+pub(super) fn body_height(status: &Status) -> usize {
+    match (&status.account.needs_login, &status.error, &status.usage) {
+        (Some(_), _, _) => 1,
+        (None, Some(_), None) => 1,
+        (None, error, Some(usage)) => usage.windows.len() + usize::from(error.is_some()),
+        (None, None, None) => 1,
+    }
 }
 
 /// What this account is, in one word: in use, next, or spent.
@@ -337,11 +363,23 @@ fn severity(used: f64) -> Color {
     }
 }
 
+/// `text`, cut to at most `width` characters, with an ellipsis where it was
+/// cut.
+///
+/// Counted in characters throughout. Cutting at a byte offset one back from a
+/// character boundary lands inside whatever multi-byte character precedes it —
+/// an em dash, or a name that is not written in ASCII — and panics, which
+/// takes the whole interface down mid-draw.
 fn truncate(text: &str, width: usize) -> String {
-    match text.char_indices().nth(width) {
-        Some((idx, _)) => format!("{}…", &text[..idx.saturating_sub(1)]),
-        None => text.to_string(),
+    if width == 0 {
+        return String::new();
     }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(width - 1).collect();
+    cut.push('…');
+    cut
 }
 
 fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
@@ -525,6 +563,104 @@ mod tests {
             observed_at: Timestamp::now(),
             windows,
             limit_reached: false,
+        }
+    }
+
+    /// Every state an account can be drawn in, for the tests that have to
+    /// cover all of them.
+    fn every_state() -> Vec<Status> {
+        let mut statuses = crate::tui::app::sample_statuses(5);
+        let limits = || {
+            usage(vec![
+                window(FIVE_HOURS, None, 68.0, 3 * 3600),
+                window(ONE_WEEK, None, 76.0, 4 * 86_400),
+                window(ONE_WEEK, Some("Fable"), 19.0, 4 * 86_400),
+            ])
+        };
+        let long = "the provider rejected its credential: invalid_grant (Refresh token not found \
+                    or invalid)";
+        // A reading, and nothing wrong.
+        statuses[0].usage = Some(limits());
+        // Signed out, but still holding the reading from before it was.
+        statuses[1].usage = Some(limits());
+        statuses[1].account.needs_login = Some(long.into());
+        // A reading that could not be brought up to date.
+        statuses[2].usage = Some(limits());
+        statuses[2].error = Some(long.into());
+        // An error and no reading at all.
+        statuses[3].error = Some(long.into());
+        // Never read.
+        statuses
+    }
+
+    /// Scrolling needs a block's height before the block exists, so the height
+    /// is stated in one place and the lines drawn in another. When they
+    /// disagree the interface scrolls to a line other than the one the
+    /// selection is on, and moving through the list walks the screen off the
+    /// account it says is selected.
+    #[test]
+    fn a_blocks_stated_height_is_the_number_of_lines_it_draws() {
+        for status in every_state() {
+            let drawn = body(&status, Timestamp::now(), 110).len();
+            assert_eq!(
+                body_height(&status),
+                drawn,
+                "{}: said {} lines, drew {drawn}",
+                status.account.id,
+                body_height(&status),
+            );
+        }
+    }
+
+    /// What the user does: hold a key and watch the list go by. The account
+    /// the interface says is selected has to be one that is on the screen.
+    #[test]
+    fn moving_through_the_list_keeps_the_selected_account_in_view() {
+        let statuses = every_state();
+        let names: Vec<String> = statuses.iter().map(|status| status.account.id.clone()).collect();
+        let mut app = App::for_tests(statuses);
+
+        // A window too short for the list, so the view has to follow.
+        render(&mut app, 110, 14);
+        for direction in [1, -1] {
+            for _ in 0..names.len() + 1 {
+                app.move_selection(direction);
+                let screen = render(&mut app, 110, 14);
+                let selected = app.selected().expect("a selected account").account.id.clone();
+                assert!(
+                    screen.contains(&selected),
+                    "selected {selected} is off screen:\n{screen}"
+                );
+            }
+        }
+    }
+
+    /// Provider messages are long and arrive in whatever alphabet the account
+    /// is named in. Cutting one at a byte offset lands inside a character and
+    /// panics, which takes the interface down in the middle of a frame.
+    #[test]
+    fn a_line_is_cut_by_characters_and_never_through_one() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello", 4), "hel…");
+        assert_eq!(truncate("hello", 1), "…");
+        assert_eq!(truncate("hello", 0), "");
+
+        // The characters this interface actually prints, and ones it may be
+        // handed: an em dash before the cut, and a name outside ASCII.
+        for text in [
+            "sign in again — the provider rejected its credential",
+            "просроченный токен обновления",
+            "アカウントの認証が必要です",
+            "✅ fine ▌ also fine █░…",
+        ] {
+            for width in 0..text.chars().count() + 2 {
+                let cut = truncate(text, width);
+                assert!(
+                    cut.chars().count() <= width,
+                    "{text:?} cut to {width} gave {cut:?}"
+                );
+            }
         }
     }
 

@@ -1,9 +1,13 @@
 //! Interface state and the event loop.
 
+use std::io;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 
 use super::worker::{Job, Worker};
 use crate::account::ProviderKind;
@@ -258,7 +262,7 @@ impl App {
     }
 
     /// Moves to the next or previous account, stepping over the headings.
-    fn move_selection(&mut self, delta: isize) {
+    pub(super) fn move_selection(&mut self, delta: isize) {
         let accounts: Vec<usize> = self
             .rows
             .iter()
@@ -299,14 +303,8 @@ impl App {
             .take(row)
             .map(|row| match row {
                 Row::Provider(_) => 1,
-                Row::Account { status, .. } => {
-                    let windows = status
-                        .usage
-                        .as_ref()
-                        .map_or(1, |usage| usage.windows.len().max(1));
-                    // Its name, each limit, and the blank line after it.
-                    2 + windows
-                }
+                // Its name, what is drawn under it, and the blank line after.
+                Row::Account { status, .. } => 2 + super::draw::body_height(status),
             })
             .sum()
     }
@@ -353,10 +351,46 @@ impl App {
 
 /// Runs the interface until the user quits.
 pub fn run(engine: &Engine) -> Result<()> {
-    let mut terminal = ratatui::try_init().context("starting the terminal interface")?;
+    let mut terminal = claim_screen()?;
     let result = event_loop(engine, &mut terminal);
-    ratatui::try_restore().context("restoring the terminal")?;
+    release_screen()?;
     result
+}
+
+/// Takes the screen, and stops the terminal wrapping long lines while we have
+/// it.
+///
+/// Every line is drawn to fit the width the terminal reports. When that width
+/// is larger than the window actually is — which a Windows console does after
+/// the alternate screen is entered — a line that reaches the last column wraps,
+/// and the wrapped half lands on top of the row below it. One long line then
+/// destroys the rest of the screen, and nothing redraws it, because as far as
+/// the interface is concerned it drew the right thing.
+///
+/// With wrapping off, a line the terminal has no room for is cut at the edge
+/// instead. That is the same thing the interface already does on purpose
+/// everywhere it knows a line is too long, and it cannot corrupt anything.
+fn claim_screen() -> Result<ratatui::DefaultTerminal> {
+    let terminal = ratatui::try_init().context("starting the terminal interface")?;
+    if execute!(io::stdout(), DisableLineWrap).is_ok() {
+        // Wrapping is a setting of the user's terminal, not ours, so it goes
+        // back even if we leave by panicking.
+        static RESTORE_WRAP: Once = Once::new();
+        RESTORE_WRAP.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = execute!(io::stdout(), EnableLineWrap);
+                previous(info);
+            }));
+        });
+    }
+    Ok(terminal)
+}
+
+/// Gives the screen back, as we found it.
+fn release_screen() -> Result<()> {
+    let _ = execute!(io::stdout(), EnableLineWrap);
+    ratatui::try_restore().context("restoring the terminal")
 }
 
 fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -383,11 +417,18 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
             submit(&mut app, &worker, Job::Tick);
         }
 
-        if event::poll(FRAME)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_key(&mut app, engine, &worker, terminal, key)?;
+        if event::poll(FRAME)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, engine, &worker, terminal, key)?;
+                }
+                // The window changed shape, so everything on it was drawn for
+                // a window that no longer exists. Paint all of it again rather
+                // than the difference against a screen we can no longer
+                // describe.
+                Event::Resize(..) => terminal.clear()?,
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -414,6 +455,12 @@ fn handle_key(
     // Ctrl-C quits from anywhere, as it does in every other terminal program.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         app.should_quit = true;
+        return Ok(());
+    }
+    // And Ctrl-L repaints, for when something outside this program has written
+    // over the screen.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('l')) {
+        terminal.clear()?;
         return Ok(());
     }
 
@@ -511,7 +558,7 @@ fn login(
     terminal: &mut ratatui::DefaultTerminal,
     provider: ProviderKind,
 ) -> Result<()> {
-    ratatui::try_restore().context("handing the terminal to the login")?;
+    release_screen().context("handing the terminal to the login")?;
 
     let result = engine.login(provider, None, false, |command| {
         println!(
@@ -523,7 +570,7 @@ fn login(
             .context("starting the login. Is the CLI installed and on PATH?")
     });
 
-    *terminal = ratatui::try_init().context("taking the terminal back after the login")?;
+    *terminal = claim_screen().context("taking the terminal back after the login")?;
     terminal.clear()?;
 
     match result {

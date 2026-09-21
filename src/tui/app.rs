@@ -591,6 +591,7 @@ pub(crate) fn sample_statuses(count: usize) -> Vec<Status> {
 
     (1..=count)
         .map(|n| Status {
+            fleet_home: None,
             account: Account {
                 schema_version: SCHEMA_VERSION,
                 id: format!("claude-{n}"),

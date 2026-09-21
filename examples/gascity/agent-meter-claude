@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+: "${GT_ROOT:?Gas City must supply GT_ROOT}"
+: "${GC_SESSION_ID:?Gas City must supply GC_SESSION_ID}"
+: "${CLAUDE_CONFIG_DIR:?Set the registered fleet home in the provider environment}"
+exec "${AGENT_METER_BIN:-agent-meter}" run --provider claude --expect-home "$CLAUDE_CONFIG_DIR" -- "$@"

@@ -1,0 +1,31 @@
+# Example include fragment. Replace account ids and absolute paths before use.
+# Install the two adjacent wrapper scripts on PATH (or use absolute commands).
+# Select these providers only for new pilot sessions; existing sessions retain
+# their current provider and credential home.
+[providers.claude-pinned]
+base = "builtin:claude"
+command = "agent-meter-claude"
+path_check = "agent-meter-claude"
+supports_acp = false
+[providers.claude-pinned.env]
+AGENT_METER_ACCOUNT = "claude-1"
+CLAUDE_CONFIG_DIR = "/absolute/path/to/claude-account-home"
+
+[providers.codex-pinned]
+base = "builtin:codex"
+command = "agent-meter-codex"
+path_check = "agent-meter-codex"
+supports_acp = false
+# Codex uses a resume subcommand. Gas City requires wrapped providers to
+# declare it explicitly so resume never bypasses account selection.
+resume_command = "agent-meter-codex resume {{.SessionKey}}"
+[providers.codex-pinned.env]
+AGENT_METER_ACCOUNT = "codex-1"
+CODEX_HOME = "/absolute/path/to/codex-account-home"
+
+[daemon]
+# Merge these entries with existing observe_paths; do not discard other roots.
+observe_paths = [
+  "/absolute/path/to/claude-account-home/projects",
+  "/absolute/path/to/codex-account-home/sessions",
+]

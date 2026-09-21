@@ -121,6 +121,7 @@ pub const AUTH_OVERRIDE_VARS: &[&str] = &[
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
 ];
 
 /// Variables an agent sets for its own child processes. Leaving them set makes

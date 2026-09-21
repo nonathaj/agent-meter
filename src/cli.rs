@@ -44,6 +44,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Register account homes and inspect persistent session assignments
+    Fleet(FleetArgs),
+    /// Launch or resume a CLI on its pinned subscription account
+    Run(RunArgs),
     /// Show every account and how much of its limits is used
     #[command(visible_alias = "ls")]
     List(ListArgs),
@@ -85,6 +89,99 @@ enum Command {
 
     /// Show where agent-meter keeps its files
     Where,
+}
+
+#[derive(Args, Debug)]
+struct FleetArgs {
+    #[command(subcommand)]
+    command: FleetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum FleetCommand {
+    /// Register an existing independently authenticated CLI home (never copies tokens)
+    Register {
+        account: String,
+        #[arg(long)]
+        home: PathBuf,
+    },
+    /// Print account homes and conversation bindings as credential-free JSON
+    List,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
+    #[arg(long, value_enum)]
+    provider: ProviderKind,
+    /// Account id or label; required on first launch, optional on resume
+    #[arg(long, env = "AGENT_METER_ACCOUNT")]
+    account: Option<String>,
+    /// Stable city namespace; Gas City sets GT_ROOT
+    #[arg(long, env = "GT_ROOT")]
+    scope: String,
+    /// Durable conversation identity; Gas City sets GC_SESSION_ID
+    #[arg(long, env = "GC_SESSION_ID")]
+    session: String,
+    /// Require the selected home to match runtime metadata supplied by an orchestrator
+    #[arg(long)]
+    expect_home: Option<PathBuf>,
+    /// Print launch metadata without launching or recording a binding
+    #[arg(long)]
+    dry_run: bool,
+    /// Arguments forwarded verbatim to the native CLI
+    #[arg(last = true)]
+    args: Vec<std::ffi::OsString>,
+}
+
+fn fleet(engine: &Engine, args: &FleetArgs) -> Result<ExitCode> {
+    match &args.command {
+        FleetCommand::Register { account, home } => {
+            let account = engine.resolve(account)?;
+            let home = crate::fleet::Fleet::register(engine.store(), &account.id, home)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"account": account.id, "home": home}))?
+            );
+        }
+        FleetCommand::List => println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::fleet::Fleet::load(engine.store())?)?
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_pinned(engine: &Engine, args: &RunArgs) -> Result<ExitCode> {
+    let account = args.account.as_deref().map(|id| engine.resolve(id)).transpose()?;
+    if let Some(expected) = &args.expect_home {
+        let plan = crate::fleet::Fleet::launch(
+            engine.store(),
+            args.provider,
+            &args.scope,
+            &args.session,
+            account.as_ref().map(|a| a.id.as_str()),
+            false,
+        )?;
+        anyhow::ensure!(
+            expected.is_absolute()
+                && expected.canonicalize().context("opening expected fleet home")? == plan.home,
+            "selected fleet home differs from the orchestrator's --expect-home; fix runtime metadata before launching"
+        );
+    }
+    let launch = crate::fleet::Fleet::launch(
+        engine.store(),
+        args.provider,
+        &args.scope,
+        &args.session,
+        account.as_ref().map(|a| a.id.as_str()),
+        !args.dry_run,
+    )?;
+    if args.dry_run {
+        println!("{}", serde_json::to_string_pretty(&launch)?);
+        Ok(ExitCode::SUCCESS)
+    } else {
+        launch.execute(&args.args)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -279,6 +376,8 @@ fn run() -> Result<ExitCode> {
         refresh: false,
         json: false,
     })) {
+        Command::Fleet(args) => fleet(&engine, &args),
+        Command::Run(args) => run_pinned(&engine, &args),
         Command::List(args) => list(&engine, &args),
         Command::Add(args) => add(&engine, &args),
         Command::Import(args) => import(&engine, &args),
@@ -333,6 +432,7 @@ fn status_json(status: &Status, now: Timestamp) -> serde_json::Value {
         "capacityMultiplier": status.account.identity.capacity,
         "organization": status.account.identity.workspace_name,
         "active": status.active,
+        "fleetHome": status.fleet_home,
         "needsLogin": status.account.needs_login,
         "usage": status.usage.as_ref().map(|usage| json!({
             "observedAt": usage.observed_at,
@@ -418,6 +518,7 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
                     crate::timefmt::since(now, usage.observed_at)
                 )),
             ),
+            (None, None, None) if status.fleet_home.is_some() => ("fleet home", None),
             (None, None, None) => ("", None),
         };
         notes.extend(detail);
@@ -567,7 +668,15 @@ fn report_added(engine: &Engine, outcomes: &[AddOutcome]) -> Result<ExitCode> {
 
 /// Writes agent-meter's accounts into another tool's store.
 fn export(engine: &Engine, args: &ExportArgs) -> Result<ExitCode> {
+    let fleet = crate::fleet::Fleet::load(engine.store())?;
     let mut accounts = engine.store().accounts()?;
+    accounts.retain(|account| {
+        let managed = fleet.homes.contains_key(&account.id);
+        if managed {
+            eprintln!("skip {}: fleet credentials stay in their native home", account.id);
+        }
+        !managed
+    });
     if let Some(provider) = args.provider {
         accounts.retain(|account| account.provider == provider);
     }
@@ -610,6 +719,13 @@ fn export(engine: &Engine, args: &ExportArgs) -> Result<ExitCode> {
         }
     }
 
+    // A fleet registration may have happened while confirmation was pending.
+    let _lock = engine.store().lock()?;
+    let fleet = crate::fleet::Fleet::load(engine.store())?;
+    anyhow::ensure!(
+        !accounts.iter().any(|a| fleet.homes.contains_key(&a.id)),
+        "an account was registered for fleet use during export; rerun to review the new export set"
+    );
     let done = crate::foreign::export(args.to, args.dir.as_deref(), &accounts, true)?;
     println!(
         "Wrote {} account(s) to {tool}: {} added, {} updated.",

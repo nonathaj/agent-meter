@@ -53,13 +53,19 @@ impl Fixture {
 
     /// Signs the fixture's Claude Code in to an account.
     fn sign_in_claude(&self, email: &str, uuid: &str, refresh: &str) {
+        self.sign_in_claude_expiring(email, uuid, refresh, 1_900_000_000_000);
+    }
+
+    /// The same, with a chosen access-token expiry — which is what says which
+    /// of two copies of one account was refreshed more recently.
+    fn sign_in_claude_expiring(&self, email: &str, uuid: &str, refresh: &str, expires_ms: i64) {
         write_json(
             &self.claude_home.join(".credentials.json"),
             &json!({
                 "claudeAiOauth": {
                     "accessToken": format!("sk-ant-oat01-{refresh}"),
                     "refreshToken": format!("sk-ant-ort01-{refresh}"),
-                    "expiresAt": 1_900_000_000_000i64,
+                    "expiresAt": expires_ms,
                     "scopes": ["user:inference", "user:profile"],
                     "subscriptionType": "max"
                 },
@@ -293,6 +299,140 @@ fn importing_an_older_store_keeps_the_credential_that_still_works() {
         "{}",
         stored()
     );
+}
+
+/// Points `here` at `there`, by running the binary directly instead of ssh.
+///
+/// This is the `exec` transport doing what it exists for: everything below the
+/// choice of how to start the other agent-meter — the conversation, the
+/// merge, the rules about which copy of a credential wins — is the same code
+/// that runs over ssh.
+fn link(here: &Fixture, there: &Fixture, name: &str) {
+    let binary = assert_cmd::cargo::cargo_bin("agent-meter");
+    let literal = |path: &std::path::Path| format!("'{}'", path.display());
+    std::fs::create_dir_all(&here.data).unwrap();
+    std::fs::write(
+        here.data.join("config.toml"),
+        format!(
+            "[remote.{name}]\nexec = [{}, 'sync', '--serve']\n\n\
+             [remote.{name}.env]\n\
+             AGENT_METER_DIR = {}\n\
+             CLAUDE_CONFIG_DIR = {}\n\
+             CODEX_HOME = {}\n\
+             AGENT_METER_OFFLINE = '1'\n",
+            literal(&binary),
+            literal(&there.data),
+            literal(&there.claude_home),
+            literal(&there.codex_home),
+        ),
+    )
+    .unwrap();
+}
+
+/// Two machines, each with accounts the other has not got, ending up with
+/// both — without either being asked to trust what it was sent over what it
+/// already had.
+#[test]
+fn syncing_gives_each_machine_what_the_other_is_holding() {
+    let desk = Fixture::new();
+    let laptop = Fixture::new();
+    desk.sign_in_claude("dev@example.com", "uuid-1", "desk");
+    desk.run(&["import", "claude"]);
+    laptop.sign_in_claude("other@example.com", "uuid-2", "laptop");
+    laptop.run(&["import", "claude"]);
+    link(&desk, &laptop, "laptop");
+
+    // Nothing is written until it is asked for.
+    let planned = desk.run(&["sync", "laptop", "--dry-run"]);
+    assert!(planned.contains("add"), "{planned}");
+    assert_eq!(laptop.accounts().len(), 1, "a dry run wrote to the other machine");
+    assert_eq!(desk.accounts().len(), 1, "a dry run wrote here");
+
+    let done = desk.run(&["sync", "laptop", "--yes"]);
+    assert!(done.contains("laptop"), "{done}");
+
+    // Both machines now hold both accounts, under their own names.
+    fn emails(fixture: &Fixture) -> Vec<String> {
+        fixture
+            .accounts()
+            .into_iter()
+            .map(|account| account["email"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+    let here = emails(&desk);
+    let there = emails(&laptop);
+    assert!(here.iter().any(|email| email == "other@example.com"), "{here:?}");
+    assert!(there.iter().any(|email| email == "dev@example.com"), "{there:?}");
+
+    // Doing it again moves nothing: both sides are already current.
+    let again = desk.run(&["sync", "laptop", "--dry-run"]);
+    assert!(again.contains("already current"), "{again}");
+    assert_eq!(desk.accounts().len(), 2);
+    assert_eq!(laptop.accounts().len(), 2);
+}
+
+/// The reason this cannot be a file copy. A refresh token is single-use, so
+/// two machines hold two copies of one account and only the one refreshed
+/// most recently works. Whichever direction the sync runs in, the live copy
+/// is the one both machines end up with.
+#[test]
+fn a_sync_never_replaces_a_live_credential_with_a_spent_one() {
+    for direction in ["push", "pull"] {
+        let desk = Fixture::new();
+        let laptop = Fixture::new();
+
+        // The same account on both machines. The laptop refreshed it later,
+        // which spent the copy the desk is holding.
+        desk.sign_in_claude_expiring("dev@example.com", "uuid-1", "spent", 1_800_000_000_000);
+        desk.run(&["import", "claude"]);
+        laptop.sign_in_claude_expiring("dev@example.com", "uuid-1", "live", 1_900_000_000_000);
+        laptop.run(&["import", "claude"]);
+        link(&desk, &laptop, "laptop");
+
+        desk.run(&["sync", "laptop", &format!("--{direction}"), "--yes"]);
+
+        let token = |fixture: &Fixture| {
+            read_json(&fixture.data.join("accounts").join("claude-1.json"))["credential"]["refresh_token"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Neither machine took the spent copy, whichever way the accounts moved.
+        assert_eq!(
+            token(&laptop),
+            "sk-ant-ort01-live",
+            "--{direction} overwrote the live copy"
+        );
+        if direction == "pull" {
+            assert_eq!(
+                token(&desk),
+                "sk-ant-ort01-live",
+                "--pull did not fetch the live copy"
+            );
+        }
+    }
+}
+
+/// A machine whose credential the provider has already rejected has nothing
+/// worth sending: the only thing its copy could do is replace a working one.
+#[test]
+fn an_account_known_to_be_signed_out_is_not_pushed() {
+    let desk = Fixture::new();
+    let laptop = Fixture::new();
+    desk.sign_in_claude("dev@example.com", "uuid-1", "desk");
+    desk.run(&["import", "claude"]);
+    link(&desk, &laptop, "laptop");
+
+    // Mark it the way a rejected refresh does.
+    let record = desk.data.join("accounts").join("claude-1.json");
+    let mut stored: Value = read_json(&record);
+    stored["needs_login"] = json!("the provider rejected its credential");
+    write_json(&record, &stored);
+
+    let planned = desk.run(&["sync", "laptop", "--push", "--dry-run"]);
+    assert!(!planned.contains("add     claude-1"), "{planned}");
+    desk.run(&["sync", "laptop", "--push", "--yes"]);
+    assert!(laptop.accounts().is_empty(), "a dead credential was sent anyway");
 }
 
 #[test]

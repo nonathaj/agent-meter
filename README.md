@@ -96,6 +96,51 @@ tells them apart, which is why it has a column of its own. They have separate
 limits, so `agent-meter` keeps them as separate accounts, and naming the shared
 address asks you which one you meant.
 
+### Several machines
+
+If you run agents on more than one machine, each has its own copy of the same
+accounts — and a refresh token is single-use, so the moment one machine
+refreshes an account the other's copy is spent. `agent-meter sync` keeps them
+in step:
+
+```sh
+# Once, per machine you want to keep up to date.
+agent-meter remote add laptop jon@laptop
+
+# See what would move, then do it.
+agent-meter sync laptop --dry-run
+agent-meter sync laptop
+```
+
+It runs `agent-meter` on the other machine over ssh and talks to it, rather
+than copying files across. The other machine merges what it is sent under its
+own lock and by its own rules, so nothing reaches around its locking and
+neither end has to know the other's file layout. agent-meter must be installed
+there and on the `PATH` — `--command` if it is somewhere else — and ssh must
+reach it without asking you anything.
+
+**Neither end takes a credential just because it arrived.** Both apply the same
+rule the importers do: of two copies of one account, the one whose access token
+expires later is the one refreshed most recently, and the other is the spent
+one. So a machine that has been switched off for a week cannot sign the others
+out when it wakes up, whichever direction the sync runs in. An account whose
+credential the provider has already rejected is not sent at all, since the only
+thing its copy could do is replace a working one.
+
+Accounts are matched by address and organisation, not by name: `claude-2` means
+a different account on each machine. By default it goes both ways — `--push` to
+only send, `--pull` to only take. Syncing twice over does nothing the second
+time.
+
+Once a machine is named, `agent-meter watch` sends to it on its own whenever a
+check changes a credential, which is the point of naming it: a token refreshed
+here is one the others do not have, and the account they hand out next would be
+the spent one. A machine that is asleep is reported and skipped, not waited
+for. `agent-meter remote add --no-auto` keeps a machine for `sync` alone.
+
+Nothing is ever removed by a sync, so an account you remove comes back from the
+next machine that still has it. Remove it on each.
+
 ## Commands
 
 | Command | What it does |
@@ -104,6 +149,8 @@ address asks you which one you meant.
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
 | `agent-meter export --to <tool>` | Writes these accounts into cswap's or gemctl's store, keeping the accounts they already hold. |
+| `agent-meter sync [machine]` | Keeps another machine's accounts in step with this one, over ssh. `--push`, `--pull`, `--dry-run`. |
+| `agent-meter remote add\|list\|remove` | The other machines to sync with. |
 | `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
@@ -301,6 +348,8 @@ stored account would be one failed refresh away from needing a manual login.
 - Only subscription (OAuth) accounts are managed.
 - `watch` runs in the foreground. Use your platform's service manager if you want
   it running all the time.
+- `sync` never removes anything, so an account removed on one machine returns
+  from the next one that still holds it.
 
 ## Contributing
 

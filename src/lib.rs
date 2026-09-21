@@ -8,6 +8,7 @@
 //! - [`store`] persists accounts and cached usage in agent-meter's data dir.
 //! - [`policy`] is the pure decision logic for automatic switching.
 //! - [`engine`] composes the above into the operations the CLI and TUI expose.
+//! - [`remote`] keeps another machine's store in step with this one.
 
 pub mod account;
 pub mod cli;
@@ -21,6 +22,7 @@ pub mod lock;
 pub mod paths;
 pub mod policy;
 pub mod provider;
+pub mod remote;
 pub mod store;
 pub mod timefmt;
 pub mod tui;

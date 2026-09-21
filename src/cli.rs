@@ -60,6 +60,12 @@ enum Command {
     /// Write these accounts into another tool's store
     Export(ExportArgs),
 
+    /// Keep another machine's accounts in step with this one
+    Sync(SyncArgs),
+
+    /// The other machines agent-meter knows how to reach
+    Remote(RemoteArgs),
+
     /// Sign an agent CLI in to one of the stored accounts
     #[command(visible_alias = "switch")]
     Use(UseArgs),
@@ -143,6 +149,66 @@ struct ExportArgs {
 }
 
 #[derive(Args, Debug)]
+struct SyncArgs {
+    /// Which machines; omit for every one configured
+    ///
+    /// A name that is not configured is taken as an ssh destination, so a
+    /// machine can be synced with once without being written down first.
+    #[arg(value_name = "MACHINE")]
+    names: Vec<String>,
+    /// Only send; take nothing back
+    #[arg(long)]
+    push: bool,
+    /// Only take; send nothing
+    #[arg(long, conflicts_with = "push")]
+    pull: bool,
+    /// Only accounts of this provider
+    #[arg(short, long, value_enum)]
+    provider: Option<ProviderKind>,
+    /// Say what would happen and write nothing, here or there
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    /// Do not ask for confirmation
+    #[arg(short, long)]
+    yes: bool,
+    /// Answer one exchange arriving on standard input
+    ///
+    /// This is the other end of `agent-meter sync`, started over ssh. It reads
+    /// one request and writes one reply, and prints nothing else.
+    #[arg(long, hide = true, conflicts_with_all = ["names", "push", "pull", "dry_run"])]
+    serve: bool,
+}
+
+#[derive(Args, Debug)]
+struct RemoteArgs {
+    #[command(subcommand)]
+    command: RemoteCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum RemoteCommand {
+    /// Remember a machine to sync with
+    Add {
+        /// What to call it here
+        name: String,
+        /// Where to reach it: `user@host`, or a host from your ssh config
+        destination: String,
+        /// What agent-meter is called there, if it is not on the PATH
+        #[arg(long)]
+        command: Option<String>,
+        /// Do not send to this machine from `agent-meter watch`
+        #[arg(long)]
+        no_auto: bool,
+    },
+    /// Show the machines that are configured
+    #[command(visible_alias = "ls")]
+    List,
+    /// Forget a machine
+    #[command(visible_alias = "rm")]
+    Remove { name: String },
+}
+
+#[derive(Args, Debug)]
 struct UseArgs {
     /// Account id, email or label
     account: String,
@@ -217,6 +283,8 @@ fn run() -> Result<ExitCode> {
         Command::Add(args) => add(&engine, &args),
         Command::Import(args) => import(&engine, &args),
         Command::Export(args) => export(&engine, &args),
+        Command::Sync(args) => sync(&engine, &args),
+        Command::Remote(args) => remote(&engine, &args),
         Command::Use(args) => switch(&engine, &args),
         Command::Remove(args) => remove(&engine, &args),
         Command::Watch(args) => watch(&engine, &args),
@@ -552,6 +620,181 @@ fn export(engine: &Engine, args: &ExportArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Keeps other machines' accounts in step with this one.
+fn sync(engine: &Engine, args: &SyncArgs) -> Result<ExitCode> {
+    if args.serve {
+        // The other end of the conversation. Nothing else may be printed on
+        // standard output while this runs: the reply is the whole of it.
+        return crate::remote::serve(engine, io::stdin().lock(), io::stdout().lock())
+            .map(|()| ExitCode::SUCCESS);
+    }
+
+    let machines = crate::remote::resolve(&engine.config().remote, &args.names)?;
+    let options = crate::remote::Options {
+        push: !args.pull,
+        pull: !args.push,
+        apply: false,
+        provider: args.provider,
+        unattended: false,
+    };
+
+    let mut failures = 0;
+    for (name, machine) in &machines {
+        // Worked out and shown before anything is written, here or there:
+        // these are credentials, and the machine at the other end may be one
+        // somebody is working on right now.
+        let planned = match crate::remote::exchange(engine, machine, options) {
+            Ok(planned) => planned,
+            Err(error) => {
+                eprintln!("{name}: {error:#}");
+                failures += 1;
+                continue;
+            }
+        };
+        report_exchange(name, &planned);
+
+        let writes = planned.sent.writes() + planned.received.writes();
+        if args.dry_run || writes == 0 {
+            continue;
+        }
+        if !args.yes && !confirm(&format!("\nApply to {name} and here? [y/N] "))? {
+            println!("Nothing was written.");
+            continue;
+        }
+        match crate::remote::exchange(
+            engine,
+            machine,
+            crate::remote::Options {
+                apply: true,
+                ..options
+            },
+        ) {
+            Ok(done) => println!(
+                "{name}: {} sent, {} taken.",
+                done.sent.writes(),
+                done.received.writes()
+            ),
+            Err(error) => {
+                eprintln!("{name}: {error:#}");
+                failures += 1;
+            }
+        }
+    }
+
+    if failures > 0 && failures == machines.len() {
+        bail!("no machine could be reached");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints what an exchange did, in both directions.
+fn report_exchange(name: &str, exchange: &crate::remote::Exchange) {
+    println!("{name} — agent-meter {}", exchange.version);
+    let side = |heading: String, report: &crate::remote::Report, there: &str| {
+        println!("  {heading}");
+        for id in &report.added {
+            println!("    add     {id} {there}");
+        }
+        for id in &report.updated {
+            println!("    update  {id} {there}");
+        }
+        for note in &report.skipped {
+            println!("    skip    {note}");
+        }
+        if report.unchanged > 0 {
+            println!("    {} already current {there}", report.unchanged);
+        }
+    };
+    side(
+        format!("sent {} account(s)", exchange.offered),
+        &exchange.sent,
+        "there",
+    );
+    side("taken back".to_string(), &exchange.received, "here");
+}
+
+/// Sends changed credentials to every machine that is kept in step
+/// automatically. Used by `watch`, where nobody is at the keyboard.
+fn push_to_remotes(engine: &Engine) {
+    let machines: Vec<_> = engine
+        .config()
+        .remote
+        .iter()
+        .filter(|(_, machine)| machine.is_automatic())
+        .map(|(name, machine)| (name.clone(), machine.clone()))
+        .collect();
+
+    for (name, machine) in machines {
+        let options = crate::remote::Options {
+            apply: true,
+            unattended: true,
+            ..crate::remote::Options::default()
+        };
+        match crate::remote::exchange(engine, &machine, options) {
+            Ok(done) if done.sent.writes() + done.received.writes() > 0 => println!(
+                "  synced with {name}: {} sent, {} taken",
+                done.sent.writes(),
+                done.received.writes()
+            ),
+            Ok(_) => {}
+            // A machine that is asleep is not a reason to stop watching this
+            // one, and the credentials it is missing will go next time.
+            Err(error) => eprintln!("  {name} was not reached: {error:#}"),
+        }
+    }
+}
+
+fn remote(engine: &Engine, args: &RemoteArgs) -> Result<ExitCode> {
+    let dir = engine.store().dir();
+    match &args.command {
+        RemoteCommand::Add {
+            name,
+            destination,
+            command,
+            no_auto,
+        } => {
+            let mut config = engine.config().clone();
+            config.set(&format!("remote.{name}.ssh"), destination)?;
+            if let Some(command) = command {
+                config.set(&format!("remote.{name}.command"), command)?;
+            }
+            if *no_auto {
+                config.set(&format!("remote.{name}.auto"), "false")?;
+            }
+            config.save(dir)?;
+            println!("{name} -> {destination}");
+            println!(
+                "Check it with `agent-meter sync {name} --dry-run`. agent-meter must be installed \
+                 there, and ssh must reach it without asking anything."
+            );
+        }
+        RemoteCommand::List => {
+            let machines = &engine.config().remote;
+            if machines.is_empty() {
+                println!("No other machines. Add one with `agent-meter remote add <name> <user@host>`.");
+            }
+            for (name, machine) in machines {
+                let where_ = machine.ssh.clone().unwrap_or_else(|| machine.exec.join(" "));
+                let automatic = if machine.is_automatic() {
+                    "watched"
+                } else {
+                    "on request"
+                };
+                println!("{name:<16} {where_:<30} {automatic}");
+            }
+        }
+        RemoteCommand::Remove { name } => {
+            let mut config = engine.config().clone();
+            if config.remote.remove(name).is_none() {
+                bail!("no machine called {name:?}");
+            }
+            config.save(dir)?;
+            println!("Removed {name}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn switch(engine: &Engine, args: &UseArgs) -> Result<ExitCode> {
     let account = engine.resolve(&args.account)?;
     let outcome = engine.switch_to(&account.id)?;
@@ -606,7 +849,7 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
     let interval = Duration::from_secs(engine.config().watch.poll_secs);
 
     if args.once {
-        let outcomes = run_tick(&engine, args.dry_run)?;
+        let outcomes = tick_and_share(&engine, args.dry_run)?;
         return Ok(exit_code_for(&outcomes));
     }
 
@@ -621,7 +864,7 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         engine.config().watch.threshold
     );
     while running.load(Ordering::SeqCst) {
-        let sleep_for = match run_tick(&engine, args.dry_run) {
+        let sleep_for = match tick_and_share(&engine, args.dry_run) {
             Ok(outcomes) => wait_after(&outcomes, &engine, interval),
             Err(error) => {
                 // A failed check should not end the watch: the provider may be
@@ -639,6 +882,32 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
     }
     println!("Stopped.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// One check, and then whatever it changed goes to the other machines.
+///
+/// This is the whole point of naming them: a credential refreshed here is one
+/// they do not have, and the account they hand out next would be the spent
+/// one. Only a check that actually changed a credential is worth an ssh
+/// connection, so the credentials are fingerprinted either side of it.
+fn tick_and_share(engine: &Engine, dry_run: bool) -> Result<Vec<TickOutcome>> {
+    let automatic = engine
+        .config()
+        .remote
+        .values()
+        .any(crate::config::RemoteConfig::is_automatic);
+    let before = (automatic && !dry_run)
+        .then(|| engine.credential_mark())
+        .transpose()?;
+
+    let outcomes = run_tick(engine, dry_run)?;
+
+    if let Some(before) = before
+        && engine.credential_mark()? != before
+    {
+        push_to_remotes(engine);
+    }
+    Ok(outcomes)
 }
 
 /// How long to wait before the next check.

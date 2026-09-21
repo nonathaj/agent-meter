@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::http;
 use crate::policy::{self, Candidate, Decision, Disruption, Rules};
 use crate::provider::{self, Provider};
+use crate::remote::Report;
 use crate::store::{Store, SwitchRecord, UsageCache};
 use crate::usage::Usage;
 
@@ -413,6 +414,134 @@ impl Engine {
         };
         self.store.put_account(&account)?;
         Ok(AddOutcome::Added { id: account.id })
+    }
+
+    /// Every account, as another machine receives it.
+    ///
+    /// Accounts the provider has already rejected here are left out. Their
+    /// credential is known not to work, and the only thing sending it could
+    /// achieve is replacing a working copy somewhere else.
+    pub fn records(&self) -> Result<Vec<crate::remote::Record>> {
+        Ok(self
+            .store
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.needs_login.is_none())
+            .map(|account| crate::remote::Record {
+                provider: account.provider,
+                label: account.label,
+                identity: account.identity,
+                credential: account.credential,
+                provider_data: account.provider_data,
+                added_at: account.added_at,
+                entitlement_checked_at: account.entitlement_checked_at,
+                origin_id: account.id,
+            })
+            .collect())
+    }
+
+    /// Takes accounts from another machine.
+    ///
+    /// The ids they carry are the other machine's, so matching is by identity
+    /// — the address and the workspace — exactly as importing from another
+    /// tool is. A credential is taken only when it supersedes the one held,
+    /// because a refresh token is single-use and the older of two copies is
+    /// the one that was spent.
+    ///
+    /// With `apply` false nothing is written and the report says what would
+    /// have been.
+    pub fn absorb(&self, records: &[crate::remote::Record], apply: bool) -> Result<Report> {
+        if records.is_empty() {
+            return Ok(Report::default());
+        }
+        let _lock = self.store.lock()?;
+        let mut held = self.store.accounts()?;
+        let mut report = Report::default();
+
+        for record in records {
+            let found = held.iter().position(|account| {
+                account.provider == record.provider
+                    && (account.credential.refresh_token == record.credential.refresh_token
+                        || same_identity(&account.identity, &record.identity) == Match::Same)
+            });
+
+            let Some(at) = found else {
+                report.added.push(record.origin_id.clone());
+                if apply {
+                    let account = Account {
+                        schema_version: SCHEMA_VERSION,
+                        id: self.store.next_id(record.provider)?,
+                        provider: record.provider,
+                        label: record.label.clone(),
+                        identity: record.identity.clone(),
+                        credential: record.credential.clone(),
+                        provider_data: record.provider_data.clone(),
+                        added_at: record.added_at,
+                        entitlement_checked_at: record.entitlement_checked_at,
+                        needs_login: None,
+                    };
+                    self.store.put_account(&account)?;
+                    held.push(account);
+                }
+                continue;
+            };
+
+            // A record is one machine's snapshot of an account, and what
+            // dates it is the credential: everything else in it was read at
+            // the same moment. So it is taken whole or not at all. The same
+            // token is the same generation and carries no news; an older one
+            // carries nothing but stale news.
+            let mut account = held[at].clone();
+            if record.credential.refresh_token == account.credential.refresh_token
+                || !supersedes(&record.credential, &account.credential)
+            {
+                report.unchanged += 1;
+                continue;
+            }
+            account.credential = record.credential.clone();
+            // Whatever a provider said about the credential just replaced is
+            // a verdict on a credential this account no longer has.
+            account.needs_login = None;
+            account.identity.update_from(&record.identity);
+            if !record.provider_data.is_empty() {
+                account.provider_data = record.provider_data.clone();
+            }
+            // The name this machine gave it stays: it is what the person
+            // sitting at this machine calls the account.
+            if account.label.is_none() {
+                account.label.clone_from(&record.label);
+            }
+            if record.entitlement_checked_at.is_some() {
+                account.entitlement_checked_at = record.entitlement_checked_at;
+            }
+
+            // Machines already in step should be quiet: a report that lists
+            // every account every time says nothing at all.
+            if account == held[at] {
+                report.unchanged += 1;
+                continue;
+            }
+            report.updated.push(account.id.clone());
+            if apply {
+                self.store.put_account(&account)?;
+            }
+            held[at] = account;
+        }
+        Ok(report)
+    }
+
+    /// A tag for the credentials held, which changes when any of them does.
+    ///
+    /// Refresh tokens rotate, so comparing fingerprints answers "has anything
+    /// happened worth telling the other machines about" without the tokens
+    /// themselves being compared, copied or printed.
+    pub fn credential_mark(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .store
+            .accounts()?
+            .into_iter()
+            .map(|account| (account.id, account.credential.fingerprint()))
+            .collect())
     }
 
     /// Forgets an account. The provider is not told, so the credential stays

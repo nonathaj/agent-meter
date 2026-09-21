@@ -1,5 +1,6 @@
 //! User configuration: `config.toml` in the data directory.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -34,6 +35,50 @@ pub struct Config {
     /// Per-provider overrides, keyed by provider name.
     #[serde(skip_serializing_if = "Overrides::is_empty")]
     pub provider: Overrides,
+    /// Other machines running agent-meter, keyed by the name you call them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote: BTreeMap<String, RemoteConfig>,
+}
+
+/// Another machine running agent-meter.
+///
+/// It is reached by running agent-meter over there and talking to it, rather
+/// than by copying files: the other machine merges what it is sent under its
+/// own lock, by its own rules, and it alone decides what its files look like.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RemoteConfig {
+    /// An ssh destination: `user@host`, or a host out of your ssh config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
+    /// What agent-meter is called over there, if it is not on the PATH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Run this instead of ssh. It must start an agent-meter that is serving,
+    /// and it is given the conversation on its standard input and output — so
+    /// `wsl`, `docker exec` or a jump host of your own all work.
+    ///
+    /// Whatever is named here is run by agent-meter, so it is as trusted as
+    /// this file is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exec: Vec<String>,
+    /// Environment for `exec`, added to what agent-meter itself was given.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Whether `watch` sends changed credentials here without being asked.
+    ///
+    /// Unset means yes. Naming a machine here is the decision to keep it in
+    /// step; having to then ask for it a second time would be a setting that
+    /// does nothing until it is turned on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+}
+
+impl RemoteConfig {
+    /// Whether `watch` pushes to this machine on its own.
+    pub fn is_automatic(&self) -> bool {
+        self.auto.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,6 +185,17 @@ impl Config {
         if !(0.0..=50.0).contains(&self.watch.margin) {
             bail!("watch.margin must be between 0 and 50, got {}", self.watch.margin);
         }
+        for (name, remote) in &self.remote {
+            match (remote.ssh.is_some(), remote.exec.is_empty()) {
+                (true, false) => bail!(
+                    "remote {name:?} states both ssh and exec, and only one of them can be how                      it is reached"
+                ),
+                (false, true) => {
+                    bail!("remote {name:?} states neither ssh nor exec, so there is no way to reach it")
+                }
+                _ => {}
+            }
+        }
         if self.watch.poll_secs < MIN_POLL_SECS {
             bail!(
                 "watch.poll-secs must be at least {MIN_POLL_SECS}. It is how often the watcher \
@@ -206,6 +262,15 @@ impl Config {
             ["watch", "margin"] => self.watch.margin = parse(key)?,
             ["watch", "cooldown-secs"] => self.watch.cooldown_secs = parse_u64(key)?,
             ["watch", "wait-for-reset"] => self.watch.wait_for_reset = parse_bool(key)?,
+            ["remote", name, field] => {
+                let entry = self.remote.entry((*name).to_string()).or_default();
+                match *field {
+                    "ssh" => entry.ssh = Some(value.to_string()),
+                    "command" => entry.command = Some(value.to_string()),
+                    "auto" => entry.auto = Some(parse_bool(key)?),
+                    _ => bail!("unknown setting {key:?}"),
+                }
+            }
             ["provider", name, field] => {
                 let provider =
                     ProviderKind::parse(name).with_context(|| format!("unknown provider {name:?}"))?;
@@ -223,7 +288,7 @@ impl Config {
             _ => bail!(
                 "unknown setting {key:?}. Known keys: watch.threshold, watch.poll-secs, \
                  watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
-                 provider.<claude|codex>.threshold, provider.<claude|codex>.enabled"
+                 provider.<claude|codex>.threshold, provider.<claude|codex>.enabled,                  remote.<name>.<ssh|command|auto>"
             ),
         }
         self.validate()

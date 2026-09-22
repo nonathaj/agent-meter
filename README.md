@@ -194,6 +194,30 @@ Every operation is on a key: `enter` to switch, `r` to refresh, `p` to filter by
 harness, `a` to add, `i` to import, `d` to remove, `w` to switch automatically,
 `?` for the rest.
 
+## Pin accounts to fleet conversations
+
+`agent-meter run` launches Claude Code or Codex against a registered account home
+and saves the account assignment under `(scope, provider, session)`. A restart or
+resume reuses that assignment; requesting another account for it fails.
+
+```sh
+agent-meter fleet register claude-1 --home /absolute/independent-claude-home
+agent-meter run --provider claude --account claude-1 --scope my-city --session worker-7 -- --model opus
+# Same account and home, with Claude's existing conversation id:
+agent-meter run --provider claude --scope my-city --session worker-7 -- --resume <conversation-id>
+agent-meter fleet list
+```
+
+The home must already have its own native login. Registration does not copy or
+refresh credentials. The native CLI owns refreshes; metering reads that home.
+Global switching, export and sync exclude registered accounts. `run --dry-run`
+prints credential-free launch metadata without creating a binding.
+
+This first milestone requires explicit account selection for new conversations.
+Automatic load balancing and live migration are not enabled. See the
+[Gas City pilot guide](examples/gascity/README.md) for onboarding, wrappers,
+transcript discovery, rollout checks and operational limitations.
+
 ## How switching decides
 
 On each check, for each provider:

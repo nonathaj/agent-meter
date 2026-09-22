@@ -22,6 +22,30 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn fleet_home(&self, provider: &str) -> PathBuf {
+        match provider {
+            "claude" => self.sign_in_claude("fleet@example.com", "fleet-user", "fleet"),
+            "codex" => self.sign_in_codex("fleet@example.com", "fleet-user", "fleet"),
+            _ => unreachable!(),
+        }
+        self.run(&["import", provider]);
+        let source = if provider == "claude" {
+            &self.claude_home
+        } else {
+            &self.codex_home
+        };
+        let home = self._dir.path().join(format!("fleet-{provider}"));
+        std::fs::rename(source, &home).unwrap();
+        std::fs::create_dir_all(source).unwrap();
+        self.run(&[
+            "fleet",
+            "register",
+            &format!("{provider}-1"),
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+        home
+    }
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let fixture = Self {
@@ -845,4 +869,423 @@ fn accounts_survive_a_round_trip_through_each_tool() {
         assert_eq!(got[0].0, "dev@example.com");
         assert_ne!(got[0].1, got[1].1, "{tool}: the organisations tell them apart");
     }
+}
+
+#[test]
+fn fleet_dry_run_is_read_only_and_reports_transcript_roots() {
+    let f = Fixture::new();
+    let home = f.fleet_home("claude");
+    let plan: Value = serde_json::from_str(&f.run(&[
+        "run",
+        "--provider",
+        "claude",
+        "--account",
+        "claude-1",
+        "--scope",
+        "city-a",
+        "--session",
+        "worker-1",
+        "--dry-run",
+        "--",
+        "--resume",
+        "conversation-1",
+    ]))
+    .unwrap();
+    assert_eq!(plan["home"], home.to_str().unwrap());
+    assert_eq!(
+        plan["transcript_roots"][0],
+        home.join("projects").to_str().unwrap()
+    );
+    let state = read_json(&f.data.join("fleet.json"));
+    assert_eq!(state["bindings"].as_array().unwrap().len(), 0);
+    assert!(!plan.to_string().contains("sk-ant"));
+}
+
+#[test]
+fn fleet_refuses_shared_credentials_and_does_not_damage_default_home() {
+    let f = Fixture::new();
+    f.sign_in_claude("fleet@example.com", "fleet-user", "same-token");
+    f.run(&["import", "claude"]);
+    let home = f._dir.path().join("copied-home");
+    std::fs::create_dir(&home).unwrap();
+    for name in [".credentials.json", ".claude.json"] {
+        std::fs::copy(f.claude_home.join(name), home.join(name)).unwrap();
+    }
+    f.cmd(&["fleet", "register", "claude-1", "--home", home.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("refresh credential"));
+    assert_eq!(
+        f.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-same-token"
+    );
+}
+
+#[test]
+fn fleet_poll_adopts_native_refresh_and_global_switching_cannot_touch_it() {
+    let f = Fixture::new();
+    let home = f.fleet_home("claude");
+    let path = home.join(".credentials.json");
+    let mut credential = read_json(&path);
+    credential["claudeAiOauth"]["refreshToken"] = json!("rotated-by-native-cli");
+    credential["claudeAiOauth"]["accessToken"] = json!("rotated-access");
+    write_json(&path, &credential);
+    f.run(&["list", "--refresh", "--json"]);
+    assert_eq!(
+        read_json(&f.data.join("accounts/claude-1.json"))["credential"]["refresh_token"],
+        "rotated-by-native-cli"
+    );
+    assert_eq!(read_json(&path), credential);
+    f.cmd(&["use", "claude-1"])
+        .assert()
+        .failure()
+        .stderr(contains("fleet"));
+    f.cmd(&["remove", "claude-1", "--yes"])
+        .assert()
+        .failure()
+        .stderr(contains("fleet"));
+}
+
+#[test]
+fn fleet_corrupt_state_never_silently_loses_affinity() {
+    let f = Fixture::new();
+    f.fleet_home("claude");
+    std::fs::write(f.data.join("fleet.json"), "{").unwrap();
+    f.cmd(&[
+        "run",
+        "--provider",
+        "claude",
+        "--account",
+        "claude-1",
+        "--scope",
+        "city",
+        "--session",
+        "worker",
+        "--dry-run",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("fleet.json"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_exec_preserves_arguments_exit_status_and_resume_affinity_for_both_providers() {
+    use std::os::unix::fs::PermissionsExt;
+    for provider in ["claude", "codex"] {
+        let f = Fixture::new();
+        let home = f.fleet_home(provider);
+        let bin = f._dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let script = bin.join(provider);
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$AGENT_METER_ACCOUNT\" \"$AGENT_METER_SESSION\" \"$CLAUDE_CONFIG_DIR\" \"$CODEX_HOME\" \"${ANTHROPIC_API_KEY-unset}\" \"${CODEX_ACCESS_TOKEN-unset}\" \"$@\"\nexit 23\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let account = format!("{provider}-1");
+        f.cmd(&[
+            "run",
+            "--provider",
+            provider,
+            "--account",
+            &account,
+            "--scope",
+            "city",
+            "--session",
+            "worker",
+            "--",
+            "--model",
+            "a model",
+            "$(must-stay-literal)",
+        ])
+        .env("PATH", &path)
+        .env("ANTHROPIC_API_KEY", "should-not-inherit")
+        .env("CODEX_ACCESS_TOKEN", "should-not-inherit")
+        .assert()
+        .code(23)
+        .stdout(
+            contains(home.to_str().unwrap())
+                .and(contains("a model\n$(must-stay-literal)"))
+                .and(contains("unset\nunset")),
+        );
+        f.cmd(&[
+            "run",
+            "--provider",
+            provider,
+            "--scope",
+            "city",
+            "--session",
+            "worker",
+            "--",
+            "resume",
+            "conversation",
+        ])
+        .env("PATH", &path)
+        .assert()
+        .code(23)
+        .stdout(contains(&account).and(contains("resume\nconversation")));
+        f.cmd(&[
+            "run",
+            "--provider",
+            provider,
+            "--account",
+            "different-account",
+            "--scope",
+            "city",
+            "--session",
+            "worker",
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+        f.cmd(&[
+            "run",
+            "--provider",
+            provider,
+            "--scope",
+            "other-city",
+            "--session",
+            "worker",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--account"));
+    }
+}
+
+#[test]
+fn fleet_rejects_a_different_login_in_a_registered_home() {
+    let f = Fixture::new();
+    let home = f.fleet_home("claude");
+    let path = home.join(".claude.json");
+    let mut identity = read_json(&path);
+    identity["oauthAccount"]["organizationUuid"] = json!("other-workspace");
+    write_json(&path, &identity);
+    f.cmd(&[
+        "run",
+        "--provider",
+        "claude",
+        "--account",
+        "claude-1",
+        "--scope",
+        "city",
+        "--session",
+        "worker",
+        "--dry-run",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("identity"));
+    f.run(&["list", "--refresh", "--json"]);
+    assert_eq!(
+        read_json(&f.data.join("accounts/claude-1.json"))["identity"]["workspace_id"],
+        "org-1"
+    );
+}
+
+#[test]
+fn fleet_expired_tokens_are_left_to_the_native_cli() {
+    let f = Fixture::new();
+    let home = f.fleet_home("claude");
+    let path = home.join(".credentials.json");
+    let mut credential = read_json(&path);
+    credential["claudeAiOauth"]["expiresAt"] = json!(1);
+    write_json(&path, &credential);
+    f.run(&["list", "--refresh", "--json"]);
+    let stored = read_json(&f.data.join("accounts/claude-1.json"));
+    assert!(
+        stored["needs_login"].is_null(),
+        "a failed meter refresh must not sign out the fleet"
+    );
+    assert_eq!(read_json(&path), credential);
+}
+
+#[test]
+fn fleet_watch_inside_managed_home_never_switches_to_another_account() {
+    let f = Fixture::new();
+    let home = f.fleet_home("claude");
+    f.sign_in_claude("other@example.com", "other-user", "other");
+    f.run(&["import", "claude"]);
+    f.cmd(&["use", "claude-2"])
+        .env("CLAUDE_CONFIG_DIR", &home)
+        .assert()
+        .failure()
+        .stderr(contains("fleet homes"));
+    let before = read_json(&home.join(".credentials.json"));
+    f.cmd(&["watch", "--once"])
+        .env("CLAUDE_CONFIG_DIR", &home)
+        .assert()
+        .success();
+    assert_eq!(read_json(&home.join(".credentials.json")), before);
+    let rows = f.accounts();
+    assert_eq!(rows[0]["fleetHome"], home.to_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_concurrent_launches_cannot_rebind_a_conversation() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    f.fleet_home("claude");
+    let second = Fixture::new();
+    let second_home = second.fleet_home("claude");
+    let mut account = read_json(&second.data.join("accounts/claude-1.json"));
+    account["id"] = json!("claude-2");
+    // A separate native login, with a different identity.
+    account["identity"]["user_id"] = json!("second-user");
+    let mut identity = read_json(&second_home.join(".claude.json"));
+    identity["oauthAccount"]["accountUuid"] = json!("second-user");
+    write_json(&second_home.join(".claude.json"), &identity);
+    write_json(&f.data.join("accounts/claude-2.json"), &account);
+    f.run(&[
+        "fleet",
+        "register",
+        "claude-2",
+        "--home",
+        second_home.to_str().unwrap(),
+    ]);
+    let bin = f._dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    symlink("/bin/true", bin.join("claude")).unwrap();
+    let children: Vec<_> = (0..12)
+        .map(|i| {
+            let account = if i % 2 == 0 { "claude-1" } else { "claude-2" };
+            f.cmd(&[
+                "run",
+                "--provider",
+                "claude",
+                "--account",
+                account,
+                "--scope",
+                "city",
+                "--session",
+                "same-session",
+            ])
+            .env("PATH", &bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+        })
+        .collect();
+    let successes = children
+        .into_iter()
+        .map(|mut child| child.wait().unwrap().success())
+        .filter(|success| *success)
+        .count();
+    assert_eq!(successes, 6);
+    let state = read_json(&f.data.join("fleet.json"));
+    assert_eq!(state["bindings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn fleet_runtime_home_mismatch_does_not_record_a_binding() {
+    let f = Fixture::new();
+    f.fleet_home("codex");
+    f.cmd(&[
+        "run",
+        "--provider",
+        "codex",
+        "--account",
+        "codex-1",
+        "--scope",
+        "city",
+        "--session",
+        "worker",
+        "--expect-home",
+        f.codex_home.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("--expect-home"));
+    assert_eq!(
+        read_json(&f.data.join("fleet.json"))["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_city_wrappers_preserve_city_identity_and_native_resume_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    for provider in ["claude", "codex"] {
+        let f = Fixture::new();
+        let home = f.fleet_home(provider);
+        let bin = f._dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let native = bin.join(provider);
+        std::fs::write(
+            &native,
+            "#!/bin/sh\nprintf '%s\\n' \"$GC_SESSION_ID\" \"$GT_ROOT\" \"$AGENT_METER_ACCOUNT\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("examples/gascity/agent-meter-{provider}"));
+        let mut command = Command::new(wrapper);
+        let fixture_command = f.cmd(&[]);
+        for (key, value) in fixture_command.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        let home_var = if provider == "claude" {
+            "CLAUDE_CONFIG_DIR"
+        } else {
+            "CODEX_HOME"
+        };
+        let resume = if provider == "claude" {
+            "--resume"
+        } else {
+            "resume"
+        };
+        command
+            .env("PATH", &bin)
+            .env("AGENT_METER_BIN", fixture_command.get_program())
+            .env("AGENT_METER_ACCOUNT", format!("{provider}-1"))
+            .env(home_var, &home)
+            .env("GT_ROOT", "/cities/federation")
+            .env("GC_SESSION_ID", "gc-durable-identity")
+            .args([resume, "native-conversation-id"])
+            .assert()
+            .success()
+            .stdout(
+                contains("gc-durable-identity\n/cities/federation")
+                    .and(contains(format!("{resume}\nnative-conversation-id"))),
+            );
+        assert_eq!(
+            read_json(&f.data.join("fleet.json"))["bindings"][0]["session"],
+            "gc-durable-identity"
+        );
+    }
+}
+
+#[test]
+fn fleet_credentials_are_not_exported_or_synced() {
+    let f = Fixture::new();
+    f.fleet_home("claude");
+    let out = f._dir.path().join("foreign-store");
+    f.cmd(&[
+        "export",
+        "--to",
+        "gemctl",
+        "--dir",
+        out.to_str().unwrap(),
+        "--yes",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("fleet credentials"));
+    assert!(!out.exists());
+    let store = agent_meter::store::Store::open(f.data.clone()).unwrap();
+    let engine = agent_meter::engine::Engine::with_store(store).unwrap();
+    assert!(engine.records().unwrap().is_empty());
 }

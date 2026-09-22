@@ -42,6 +42,8 @@ pub struct Engine {
 pub struct Status {
     pub account: Account,
     pub active: bool,
+    /// A native CLI home owns this account; global switching excludes it.
+    pub fleet_home: Option<PathBuf>,
     pub usage: Option<Usage>,
     /// Why the last usage poll failed, if it did, and when.
     pub error: Option<String>,
@@ -132,6 +134,7 @@ impl Engine {
     /// stored copy never falls behind the CLI's.
     pub fn status(&self) -> Result<Vec<Status>> {
         let _lock = self.store.lock()?;
+        let fleet = crate::fleet::Fleet::load(&self.store)?;
         let accounts = self.store.accounts()?;
         let mut active_ids = Vec::new();
         for kind in ProviderKind::ALL {
@@ -151,6 +154,7 @@ impl Engine {
                 let entry = cache.get(&account.id);
                 Status {
                     active: active_ids.contains(&account.id),
+                    fleet_home: fleet.homes.get(&account.id).cloned(),
                     usage: entry.and_then(|e| e.usage.clone()),
                     error: entry.and_then(|e| e.error.clone()),
                     error_at: entry.and_then(|e| e.failed_at),
@@ -179,7 +183,7 @@ impl Engine {
             id: &status.account.id,
             usage: status.usage.as_ref(),
             active: status.active,
-            usable: status.account.needs_login.is_none(),
+            usable: status.account.needs_login.is_none() && status.fleet_home.is_none(),
             capacity: status.account.identity.capacity,
         }
     }
@@ -422,11 +426,13 @@ impl Engine {
     /// credential is known not to work, and the only thing sending it could
     /// achieve is replacing a working copy somewhere else.
     pub fn records(&self) -> Result<Vec<crate::remote::Record>> {
+        let _lock = self.store.lock()?;
+        let fleet = crate::fleet::Fleet::load(&self.store)?;
         Ok(self
             .store
             .accounts()?
             .into_iter()
-            .filter(|account| account.needs_login.is_none())
+            .filter(|account| account.needs_login.is_none() && !fleet.homes.contains_key(&account.id))
             .map(|account| crate::remote::Record {
                 provider: account.provider,
                 label: account.label,
@@ -548,6 +554,10 @@ impl Engine {
     /// valid; the user can sign in again at any time.
     pub fn remove(&self, id: &str) -> Result<bool> {
         let _lock = self.store.lock()?;
+        anyhow::ensure!(
+            !crate::fleet::Fleet::load(&self.store)?.homes.contains_key(id),
+            "account is registered for fleet use; removing it would strand pinned sessions"
+        );
         self.store.remove_account(id)
     }
 
@@ -558,6 +568,11 @@ impl Engine {
     }
 
     fn switch_locked(&self, id: &str) -> Result<SwitchOutcome> {
+        let fleet = crate::fleet::Fleet::load(&self.store)?;
+        anyhow::ensure!(
+            !fleet.homes.contains_key(id),
+            "account is registered for fleet use; use agent-meter run instead of global switching"
+        );
         let account = self
             .store
             .account(id)?
@@ -573,6 +588,7 @@ impl Engine {
         let provider = provider::get(account.provider);
         let home = provider.config_home()?;
         let accounts = self.store.accounts()?;
+        fleet.guard_global_home(&home)?;
         // Save whatever the CLI rotated for the outgoing account before its
         // credential is overwritten.
         let from = self.sync_active(account.provider, &accounts)?;
@@ -617,6 +633,15 @@ impl Engine {
         let Some(account) = matched else {
             return Ok(None);
         };
+
+        // Fleet credentials are read only from their registered home. A global
+        // login or another tool may still hold an obsolete copy of this account.
+        if crate::fleet::Fleet::load(&self.store)?
+            .homes
+            .contains_key(&account.id)
+        {
+            return Ok(None);
+        }
 
         if account.credential != live.credential {
             let mut updated = account.clone();
@@ -773,6 +798,13 @@ impl Engine {
     /// retrying once if the provider rejects it.
     fn poll_one(&self, account: &Account, active: bool) -> Result<Usage, http::Error> {
         let provider = provider::get(account.provider);
+        let fleet = crate::fleet::Fleet::load(&self.store).map_err(http::Error::Transport)?;
+        if let Some(home) = fleet.homes.get(&account.id) {
+            let credential = self.capture_fleet_credential(account, home)?;
+            // A registered native CLI is the sole refresh writer. An expired
+            // credential produces a polling error until that CLI refreshes it.
+            return provider.fetch_usage(&credential);
+        }
         let mut credential = account.credential.clone();
 
         if expires_within(&credential, REFRESH_LEEWAY) {
@@ -788,6 +820,34 @@ impl Engine {
             }
             other => other,
         }
+    }
+
+    fn capture_fleet_credential(
+        &self,
+        account: &Account,
+        home: &std::path::Path,
+    ) -> Result<Credential, http::Error> {
+        let _lock = self
+            .store
+            .lock_account(&account.id)
+            .map_err(http::Error::Transport)?;
+        self.capture_fleet_credential_locked(account, home)
+    }
+
+    fn capture_fleet_credential_locked(
+        &self,
+        account: &Account,
+        home: &std::path::Path,
+    ) -> Result<Credential, http::Error> {
+        let current = self
+            .store
+            .account(&account.id)
+            .map_err(http::Error::Transport)?
+            .ok_or_else(|| http::Error::Transport(anyhow!("fleet account disappeared")))?;
+        let live = crate::fleet::capture_verified(&current, home).map_err(http::Error::Transport)?;
+        let credential = live.credential.clone();
+        crate::fleet::adopt(&self.store, &current, live).map_err(http::Error::Transport)?;
+        Ok(credential)
     }
 
     /// Exchanges the refresh token for a fresh one and stores the result.
@@ -810,6 +870,15 @@ impl Engine {
     ) -> Result<Credential, http::Error> {
         let transport = |e: anyhow::Error| http::Error::Transport(e);
         let _lock = self.store.lock_account(&account.id).map_err(transport)?;
+
+        // Registration may have completed after poll_one took its snapshot.
+        if let Some(home) = crate::fleet::Fleet::load(&self.store)
+            .map_err(transport)?
+            .homes
+            .get(&account.id)
+        {
+            return self.capture_fleet_credential_locked(account, home);
+        }
 
         // Someone may have refreshed while this process waited for the lock.
         if let Ok(Some(stored)) = self.store.account(&account.id)
@@ -876,6 +945,12 @@ impl Engine {
 
         for kind in ProviderKind::ALL {
             if !self.config.is_enabled(kind) {
+                continue;
+            }
+            if crate::fleet::Fleet::load(&self.store)?
+                .guard_global_home(&provider::get(kind).config_home()?)
+                .is_err()
+            {
                 continue;
             }
             let provider_statuses: Vec<_> = statuses.iter().filter(|s| s.account.provider == kind).collect();

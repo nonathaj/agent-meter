@@ -145,7 +145,7 @@ next machine that still has it. Remove it on each.
 
 | Command | What it does |
 | --- | --- |
-| `agent-meter list` | Every account with its usage. `--refresh` polls now, `--json` prints machine-readable output. |
+| `agent-meter list` | Every account with its usage. `--poll` refreshes only readings due under provider intervals/backoff; `--refresh` forces polling; `--json` prints machine-readable output. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
 | `agent-meter export --to <tool>` | Writes these accounts into cswap's or gemctl's store, keeping the accounts they already hold. |
@@ -193,6 +193,26 @@ that corrects itself.
 Every operation is on a key: `enter` to switch, `r` to refresh, `p` to filter by
 harness, `a` to add, `i` to import, `d` to remove, `w` to switch automatically,
 `?` for the rest.
+
+## JSON usage feed
+
+For dashboards and orchestrators, use `agent-meter list --poll --json`. It returns
+an account array, polls only readings due under provider intervals/backoff, and
+does not switch accounts. `list --json` reads the cached snapshot; reserve
+`--refresh` for an explicit forced refresh. `--provider claude` or `--provider
+codex` limits both polling and output.
+
+Each account includes `id`, `provider`, `active`, `needsLogin`,
+`pollIntervalSeconds`, `error`, `errorAt`, and nullable `usage`. Usage includes
+`observedAt`, `usedPercent`, `exhausted`, and `windows`. Each window carries
+`kind` (`five_hour`, `weekly`, `other`), nullable model `scope`, `windowSeconds`,
+`usedPercent`, `resetsAt`, and a human-readable `label`. Use `kind` and `scope`
+for ingestion rather than parsing the display label. A scoped model limit is
+not an account-wide limit.
+
+A successful command can contain failed account polls: inspect `error`,
+`needsLogin` and `usage.observedAt`. Missing or old usage is unknown, not zero
+consumption. Tokens, API keys and refresh credentials are never included.
 
 ## Pin accounts to fleet conversations
 

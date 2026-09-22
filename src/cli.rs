@@ -192,6 +192,9 @@ struct ListArgs {
     /// Poll usage now instead of showing the last reading
     #[arg(short, long)]
     refresh: bool,
+    /// Poll only readings due under provider intervals and backoff
+    #[arg(long, conflicts_with = "refresh")]
+    poll: bool,
     /// Print JSON instead of a table
     #[arg(long)]
     json: bool,
@@ -374,6 +377,7 @@ fn run() -> Result<ExitCode> {
     match cli.command.unwrap_or(Command::List(ListArgs {
         provider: None,
         refresh: false,
+        poll: false,
         json: false,
     })) {
         Command::Fleet(args) => fleet(&engine, &args),
@@ -397,8 +401,21 @@ fn run() -> Result<ExitCode> {
 }
 
 fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
-    if args.refresh {
-        engine.poll(&[], true)?;
+    if args.refresh || args.poll {
+        if let Some(provider) = args.provider {
+            let ids: Vec<_> = engine
+                .store()
+                .accounts()?
+                .into_iter()
+                .filter(|a| a.provider == provider)
+                .map(|a| a.id)
+                .collect();
+            if !ids.is_empty() {
+                engine.poll(&ids, args.refresh)?;
+            }
+        } else {
+            engine.poll(&[], args.refresh)?;
+        }
     }
     let mut statuses = engine.status()?;
     if let Some(provider) = args.provider {
@@ -407,7 +424,10 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
 
     if args.json {
         let now = Timestamp::now();
-        let rows: Vec<_> = statuses.iter().map(|s| status_json(s, now)).collect();
+        let rows: Vec<_> = statuses
+            .iter()
+            .map(|s| status_json(s, now, engine.poll_interval(s.account.provider).as_secs()))
+            .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(ExitCode::SUCCESS);
     }
@@ -422,7 +442,7 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn status_json(status: &Status, now: Timestamp) -> serde_json::Value {
+fn status_json(status: &Status, now: Timestamp, poll_interval: u64) -> serde_json::Value {
     json!({
         "id": status.account.id,
         "provider": status.account.provider,
@@ -434,18 +454,26 @@ fn status_json(status: &Status, now: Timestamp) -> serde_json::Value {
         "active": status.active,
         "fleetHome": status.fleet_home,
         "needsLogin": status.account.needs_login,
+        "pollIntervalSeconds": poll_interval,
         "usage": status.usage.as_ref().map(|usage| json!({
             "observedAt": usage.observed_at,
             "usedPercent": usage.used_at(now),
             "exhausted": usage.is_exhausted_at(now),
             "windows": usage.windows.iter().map(|w| json!({
                 "label": w.label(),
+                "kind": match w.kind() {
+                    crate::usage::WindowKind::FiveHour => "five_hour",
+                    crate::usage::WindowKind::Weekly => "weekly",
+                    crate::usage::WindowKind::Other => "other",
+                },
+                "scope": w.scope,
                 "windowSeconds": w.window_secs,
                 "usedPercent": w.used_at(now),
                 "resetsAt": w.resets_at,
             })).collect::<Vec<_>>(),
         })),
         "error": status.error,
+        "errorAt": status.error_at,
     })
 }
 

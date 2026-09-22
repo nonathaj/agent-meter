@@ -1289,3 +1289,29 @@ fn fleet_credentials_are_not_exported_or_synced() {
     let engine = agent_meter::engine::Engine::with_store(store).unwrap();
     assert!(engine.records().unwrap().is_empty());
 }
+
+#[test]
+fn json_usage_exposes_machine_scopes_and_rate_limited_polling() {
+    let f = Fixture::new();
+    f.sign_in_claude("user@example.com", "user", "refresh");
+    f.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let cache = json!({"entries": {"claude-1": {
+        "usage": {"observed_at": now.to_string(), "windows": [
+            {"window_secs": 18000, "scope": null, "used_percent": 23.0, "resets_at": (now + std::time::Duration::from_secs(3600)).to_string()},
+            {"window_secs": 604800, "scope": "Opus", "used_percent": 55.0}
+        ], "limit_reached": false}, "failures": 0
+    }}});
+    write_json(&f.data.join("usage.json"), &cache);
+    let rows: Value = serde_json::from_str(&f.run(&["list", "--poll", "--json"])).unwrap();
+    assert!(
+        rows[0]["error"].is_null(),
+        "fresh cache must not be polled while offline"
+    );
+    assert_eq!(rows[0]["usage"]["windows"][0]["kind"], "five_hour");
+    assert!(rows[0]["usage"]["windows"][0]["scope"].is_null());
+    assert_eq!(rows[0]["usage"]["windows"][1]["scope"], "Opus");
+    assert_eq!(rows[0]["pollIntervalSeconds"], 300);
+    assert!(!rows.to_string().contains("refresh_token"));
+    f.cmd(&["list", "--poll", "--refresh"]).assert().failure();
+}

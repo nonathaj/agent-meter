@@ -180,13 +180,19 @@ impl Store {
     /// to mean a different account later.
     pub fn next_id(&self, provider: ProviderKind) -> Result<String> {
         let prefix = format!("{provider}-");
-        let highest = self
+        let on_disk = self
             .accounts()?
             .iter()
             .filter_map(|a| a.id.strip_prefix(&prefix)?.parse::<u32>().ok())
             .max()
             .unwrap_or(0);
-        Ok(format!("{prefix}{}", highest + 1))
+        // The accounts that exist are the floor, not the answer: the highest
+        // of them may have been removed, and its number must not come back.
+        let mut state = self.state()?;
+        let number = on_disk.max(state.issued(provider)) + 1;
+        state.record_issued(provider, number);
+        self.put_state(&state)?;
+        Ok(format!("{prefix}{number}"))
     }
 
     /// The cached usage readings.
@@ -246,6 +252,16 @@ impl UsageCache {
     }
 
     /// Records a successful reading, clearing any failure state.
+    /// Drops readings no stored account claims.
+    ///
+    /// A poll lets go of the store lock while it is on the network, so an
+    /// account removed meanwhile has its reading written back after it is
+    /// gone. Left there, it is a stranger's usage — and their address, inside
+    /// the reading — waiting under an id for whoever is given it next.
+    pub fn retain(&mut self, ids: &[String]) {
+        self.entries.retain(|id, _| ids.iter().any(|kept| kept == id));
+    }
+
     pub fn record_success(&mut self, id: &str, usage: Usage) {
         let entry = self.entries.entry(id.to_string()).or_default();
         entry.usage = Some(usage);
@@ -272,6 +288,14 @@ impl UsageCache {
 pub struct State {
     /// Last automatic switch per provider, keyed by provider name.
     pub last_switch: BTreeMap<String, SwitchRecord>,
+    /// Highest account number ever issued per provider, keyed by provider name.
+    ///
+    /// Counting from the accounts that exist would hand the number back the
+    /// moment the highest one is removed, and then an id somebody wrote down
+    /// means a different account. Absent — a store written before this was
+    /// kept — reads as zero, and the accounts on disk carry the count.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub issued: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +313,14 @@ impl State {
 
     pub fn record_switch(&mut self, provider: ProviderKind, record: SwitchRecord) {
         self.last_switch.insert(provider.as_str().to_string(), record);
+    }
+
+    fn issued(&self, provider: ProviderKind) -> u32 {
+        self.issued.get(provider.as_str()).copied().unwrap_or(0)
+    }
+
+    fn record_issued(&mut self, provider: ProviderKind, number: u32) {
+        self.issued.insert(provider.as_str().to_string(), number);
     }
 }
 
@@ -416,6 +448,61 @@ mod tests {
             .unwrap();
         assert_eq!(store.next_id(ProviderKind::Claude).unwrap(), "claude-6");
         assert_eq!(store.next_id(ProviderKind::Codex).unwrap(), "codex-1");
+    }
+
+    /// An id is a name somebody writes down — in a script, in a shell history,
+    /// in a note to themselves. Counting from the accounts that exist hands
+    /// the highest number back the moment that account is removed, and then
+    /// the name means somebody else.
+    #[test]
+    fn an_id_is_never_handed_out_a_second_time() {
+        let (_tmp, store) = store();
+        for id in ["claude-1", "claude-2", "claude-3"] {
+            let minted = store.next_id(ProviderKind::Claude).unwrap();
+            assert_eq!(minted, id);
+            store
+                .put_account(&account(&minted, ProviderKind::Claude))
+                .unwrap();
+        }
+
+        // Remove the highest, which is the one whose number used to come back.
+        assert!(store.remove_account("claude-3").unwrap());
+        assert_eq!(store.next_id(ProviderKind::Claude).unwrap(), "claude-4");
+
+        // And removing all of them does not start the count again.
+        for id in ["claude-1", "claude-2"] {
+            store.remove_account(id).unwrap();
+        }
+        assert!(store.accounts().unwrap().is_empty());
+        assert_eq!(store.next_id(ProviderKind::Claude).unwrap(), "claude-5");
+
+        // A store written before the count was kept carries on from what is
+        // on disk rather than from one.
+        let (_older_tmp, older) = self::tests::store();
+        older
+            .put_account(&account("claude-7", ProviderKind::Claude))
+            .unwrap();
+        assert_eq!(older.next_id(ProviderKind::Claude).unwrap(), "claude-8");
+    }
+
+    /// A poll lets go of the store lock while it is on the network, so an
+    /// account removed meanwhile has its reading written back after it is
+    /// gone. A reading carries a stranger's usage and their address.
+    #[test]
+    fn a_reading_does_not_outlive_the_account_it_belongs_to() {
+        let mut cache = UsageCache::default();
+        for id in ["claude-1", "claude-2"] {
+            cache.record_failure(id, "went wrong".into(), None);
+        }
+        cache.retain(&["claude-1".to_string()]);
+        assert!(cache.get("claude-1").is_some());
+        assert!(
+            cache.get("claude-2").is_none(),
+            "a removed account kept its reading"
+        );
+
+        cache.retain(&[]);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]

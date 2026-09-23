@@ -459,6 +459,35 @@ fn an_account_known_to_be_signed_out_is_not_pushed() {
     assert!(laptop.accounts().is_empty(), "a dead credential was sent anyway");
 }
 
+/// A poll lets go of the store lock while it is on the network, so an account
+/// removed while it ran has its reading written back after it is gone. A
+/// reading holds a stranger's usage and their address, waiting under an id for
+/// whoever is given that id next.
+#[test]
+fn a_poll_drops_readings_no_account_claims() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("dev@example.com", "uuid-1", "one");
+    fixture.run(&["import", "claude"]);
+
+    // A reading left behind by an account that is no longer stored.
+    let cache = fixture.data.join("usage.json");
+    write_json(
+        &cache,
+        &json!({"entries": {"claude-9": {"error": "someone else's", "failures": 1}}}),
+    );
+
+    fixture.run(&["list", "--refresh"]);
+
+    let entries = read_json(&cache);
+    let entries = entries["entries"].as_object().unwrap();
+    assert!(
+        !entries.contains_key("claude-9"),
+        "a reading outlived its account: {entries:?}"
+    );
+    // The account that is actually stored keeps its own.
+    assert!(entries.contains_key("claude-1"), "{entries:?}");
+}
+
 #[test]
 fn switching_replaces_the_live_credential_and_keeps_unrelated_settings() {
     let fixture = Fixture::new();

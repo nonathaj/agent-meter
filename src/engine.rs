@@ -715,6 +715,12 @@ impl Engine {
                 }
             }
         }
+        // Re-read under this lock rather than reusing the list from before the
+        // network calls: an account removed while they ran has just had its
+        // reading written back, and a reading is a stranger's usage and
+        // address sitting under an id somebody else will be given.
+        let kept: Vec<String> = self.store.accounts()?.into_iter().map(|a| a.id).collect();
+        cache.retain(&kept);
         self.store.put_usage_cache(&cache)?;
         Ok(results)
     }

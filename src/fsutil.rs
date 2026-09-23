@@ -155,9 +155,132 @@ fn is_transient(e: &io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
+/// The longest path Windows accepts without the verbatim prefix, counting the
+/// terminator it does not show you.
+#[cfg(windows)]
+const MAX_PATH: usize = 260;
+
+/// A path with its symlinks resolved, written the way the rest of the system
+/// writes it.
+///
+/// `canonicalize` is how a directory is checked for being the same directory
+/// as another under a different name, which is worth doing before one of them
+/// is trusted. On Windows it answers with a verbatim path — `\\?\C:\Users\…`
+/// — naming the same place in a form nobody types, several Windows programs
+/// refuse to open, and no path a user gave us will ever compare equal to.
+pub fn canonical(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path).map(plain)
+}
+
+/// Drops a verbatim prefix where dropping it cannot change which file is
+/// meant. Everywhere but Windows there is nothing to drop.
+#[cfg(not(windows))]
+pub fn plain(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+pub fn plain(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let head = match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => format!("{}:\\", letter as char),
+        // `\\?\UNC\server\share` is `\\server\share` written the long way.
+        Prefix::VerbatimUNC(server, share) => {
+            format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
+        }
+        // Already plain, or a device path that means nothing without it.
+        _ => return path,
+    };
+
+    let rest = components.as_path();
+    // The verbatim form is the only way to name some of these, so dropping it
+    // would name a different file or none at all.
+    let needs_the_prefix = rest.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.ends_with('.') || name.ends_with(' ') || is_device_name(&name)
+    });
+    let dropped = Path::new(&head).join(rest);
+    if needs_the_prefix || dropped.as_os_str().len() >= MAX_PATH {
+        return path;
+    }
+    dropped
+}
+
+/// Names that mean a device rather than a file, whatever directory they are
+/// written in and whatever is put after a dot.
+///
+/// The numbered ones start at one: `COM0` is an ordinary name, and a file
+/// called that would be lost by treating it as a device.
+#[cfg(windows)]
+fn is_device_name(name: &str) -> bool {
+    const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "COM", "LPT"];
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    DEVICES.iter().any(|device| {
+        stem.eq_ignore_ascii_case(device)
+            || (matches!(*device, "COM" | "LPT")
+                && stem.len() == device.len() + 1
+                && stem[..device.len()].eq_ignore_ascii_case(device)
+                && matches!(stem.as_bytes()[device.len()], b'1'..=b'9'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `canonicalize` is used to tell whether two names are the same
+    /// directory. On Windows its answer is a form nobody else writes, and a
+    /// path a user typed will never compare equal to it.
+    #[test]
+    fn a_canonical_path_is_written_the_way_everything_else_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = canonical(dir.path()).unwrap();
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{canonical:?} is not a path anything else will match"
+        );
+        // Still the same directory, and still absolute.
+        assert!(canonical.is_absolute());
+        assert!(canonical.is_dir());
+        // And asking twice is stable, which is what the comparisons rely on.
+        assert_eq!(canonical, self::canonical(&canonical).unwrap());
+    }
+
+    /// Some names can only be written with the prefix, so dropping it would
+    /// name a different file, or none.
+    #[cfg(windows)]
+    #[test]
+    fn a_prefix_that_is_load_bearing_is_kept() {
+        let kept = |path: &str| {
+            let out = plain(PathBuf::from(path));
+            assert_eq!(out, PathBuf::from(path), "{path} lost a prefix it needed");
+        };
+        let dropped = |path: &str, want: &str| {
+            assert_eq!(plain(PathBuf::from(path)), PathBuf::from(want));
+        };
+
+        dropped(r"\\?\C:\Users\dev\project", r"C:\Users\dev\project");
+        dropped(r"\\?\UNC\server\share\file", r"\\server\share\file");
+        // Already plain, and left alone.
+        dropped(r"C:\Users\dev", r"C:\Users\dev");
+
+        // A trailing dot or space is only reachable through the prefix.
+        kept(r"\\?\C:\Users\dev\odd.");
+        kept(r"\\?\C:\Users\dev\odd ");
+        // So is a file named after a device.
+        kept(r"\\?\C:\Users\dev\NUL");
+        kept(r"\\?\C:\Users\dev\com1.txt");
+        // And anything too long to be named without it.
+        kept(&format!(r"\\?\C:\{}", "n".repeat(300)));
+        // A name that merely starts like a device is an ordinary name.
+        dropped(r"\\?\C:\Users\dev\communication", r"C:\Users\dev\communication");
+        dropped(r"\\?\C:\Users\dev\com0", r"C:\Users\dev\com0");
+    }
 
     #[test]
     fn write_atomic_replaces_and_leaves_no_temp_files() {

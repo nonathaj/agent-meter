@@ -164,7 +164,7 @@ fn run_pinned(engine: &Engine, args: &RunArgs) -> Result<ExitCode> {
         )?;
         anyhow::ensure!(
             expected.is_absolute()
-                && expected.canonicalize().context("opening expected fleet home")? == plan.home,
+                && crate::fsutil::canonical(expected).context("opening expected fleet home")? == plan.home,
             "selected fleet home differs from the orchestrator's --expect-home; fix runtime metadata before launching"
         );
     }

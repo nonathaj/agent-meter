@@ -73,9 +73,15 @@ impl Fleet {
             "unsupported fleet.json version {}",
             fleet.version
         );
-        for home in fleet.homes.values() {
+        // A home stored by an earlier build carries Windows' verbatim prefix.
+        // Normalising here means every comparison below is between paths
+        // written the same way, rather than each one remembering to ask.
+        let mut fleet = fleet;
+        for home in fleet.homes.values_mut() {
+            *home = fsutil::plain(std::mem::take(home));
             ensure!(home.is_absolute(), "fleet.json home must be absolute");
         }
+        let fleet = fleet;
         for (index, binding) in fleet.bindings.iter().enumerate() {
             ensure!(
                 fleet.homes.contains_key(&binding.account),
@@ -103,7 +109,7 @@ impl Fleet {
     /// Registers an existing, independently authenticated home without writing it.
     pub fn register(store: &Store, id: &str, home: &Path) -> Result<PathBuf> {
         ensure!(home.is_absolute(), "fleet home must be an absolute path");
-        let home = home.canonicalize().context("opening fleet home")?;
+        let home = fsutil::canonical(home).context("opening fleet home")?;
         ensure!(home.is_dir(), "fleet home must be a directory");
         let _lock = store.lock()?;
         let mut fleet = Self::load(store)?;
@@ -130,7 +136,7 @@ impl Fleet {
         });
         let configured = native.config_home()?;
         for global in [default, configured] {
-            let global = global.canonicalize().unwrap_or(global);
+            let global = fsutil::canonical(&global).unwrap_or(global);
             ensure!(
                 global != home,
                 "the global CLI home cannot be registered for fleet use"
@@ -196,7 +202,7 @@ impl Fleet {
             .clone();
         // Fail closed if a symlink or login changed after registration.
         ensure!(
-            home.canonicalize().context("opening registered fleet home")? == home,
+            fsutil::canonical(&home).context("opening registered fleet home")? == home,
             "registered fleet home moved"
         );
         capture_verified(&account, &home)?;
@@ -242,7 +248,7 @@ impl Fleet {
 
     /// Refuses global activation into a registered home, including aliases.
     pub fn guard_global_home(&self, home: &Path) -> Result<()> {
-        let home = home.canonicalize().unwrap_or_else(|_| home.to_owned());
+        let home = fsutil::canonical(home).unwrap_or_else(|_| home.to_owned());
         ensure!(
             !self.homes.values().any(|registered| *registered == home),
             "fleet homes cannot be changed by global use/watch"

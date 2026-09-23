@@ -212,6 +212,25 @@ fn id_token(email: &str, user: &str) -> String {
     )
 }
 
+/// Asserts that `reported` names the same directory as `expected`.
+///
+/// A resolved path is not the path that was handed in. macOS keeps the temp
+/// directory behind `/private`, and Windows may have been given a short name
+/// like `RUNNER~1`; resolving those is the point of resolving them. What is
+/// worth pinning is that the path names the fleet home — and that it is
+/// written the way other tools write it, since a verbatim `\\?\C:\...` names
+/// the right directory while matching nothing the user ever typed.
+fn names_the_same_directory(reported: &str, expected: &Path) {
+    assert!(
+        !reported.starts_with(r"\\?\"),
+        "{reported} is not a path anything else will match"
+    );
+    let resolve = |path: &Path| {
+        std::fs::canonicalize(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    };
+    assert_eq!(resolve(Path::new(reported)), resolve(expected));
+}
+
 fn write_json(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
@@ -920,10 +939,12 @@ fn fleet_dry_run_is_read_only_and_reports_transcript_roots() {
         "conversation-1",
     ]))
     .unwrap();
-    assert_eq!(plan["home"], home.to_str().unwrap());
+    names_the_same_directory(plan["home"].as_str().unwrap(), &home);
+    // The transcript root is stated relative to the home the plan named, so it
+    // is checked against that rather than against the path handed in.
     assert_eq!(
-        plan["transcript_roots"][0],
-        home.join("projects").to_str().unwrap()
+        PathBuf::from(plan["transcript_roots"][0].as_str().unwrap()),
+        PathBuf::from(plan["home"].as_str().unwrap()).join("projects")
     );
     let state = read_json(&f.data.join("fleet.json"));
     assert_eq!(state["bindings"].as_array().unwrap().len(), 0);
@@ -1150,13 +1171,13 @@ fn fleet_watch_inside_managed_home_never_switches_to_another_account() {
         .success();
     assert_eq!(read_json(&home.join(".credentials.json")), before);
     let rows = f.accounts();
-    assert_eq!(rows[0]["fleetHome"], home.to_str().unwrap());
+    names_the_same_directory(rows[0]["fleetHome"].as_str().unwrap(), &home);
 }
 
 #[cfg(unix)]
 #[test]
 fn fleet_concurrent_launches_cannot_rebind_a_conversation() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     f.fleet_home("claude");
     let second = Fixture::new();
@@ -1178,7 +1199,17 @@ fn fleet_concurrent_launches_cannot_rebind_a_conversation() {
     ]);
     let bin = f._dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    symlink("/bin/true", bin.join("claude")).unwrap();
+    // Written rather than symlinked to /bin/true: macOS keeps `true` in
+    // /usr/bin, so the link dangled there and every launch failed to exec.
+    let stand_in = bin.join("claude");
+    std::fs::write(
+        &stand_in,
+        "#!/bin/sh
+exit 0
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
     let children: Vec<_> = (0..12)
         .map(|i| {
             let account = if i % 2 == 0 { "claude-1" } else { "claude-2" };

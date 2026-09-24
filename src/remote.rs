@@ -207,12 +207,13 @@ pub fn exchange(engine: &Engine, remote: &RemoteConfig, options: Options) -> Res
     })
 }
 
-/// `report`, naming each account by provider and address instead of by the id
-/// it was sent under.
+/// `report`, naming each account by provider, address and organisation
+/// instead of by the id it was sent under.
 ///
-/// The organisation is added only where two of `sent` share an address, which
-/// is when it is what tells them apart. A name that matches nothing sent is
-/// kept as it came.
+/// The organisation is always given, because one address can hold a seat in
+/// several and neither machine sees all of the other's: an account that is
+/// not sent still shares its address with one that is. A name that matches
+/// nothing sent is kept as it came.
 fn addressed(mut report: Report, sent: &[Record]) -> Report {
     let name = |id: String| {
         let Some(record) = sent.iter().find(|record| record.origin_id == id) else {
@@ -221,16 +222,11 @@ fn addressed(mut report: Report, sent: &[Record]) -> Report {
         let Some(email) = &record.identity.email else {
             return id;
         };
-        let mut name = format!("{} {email}", record.provider.display_name());
-        let shared = sent
-            .iter()
-            .filter(|other| other.provider == record.provider && other.identity.email.as_ref() == Some(email))
-            .count()
-            > 1;
-        if shared && let Some(organisation) = &record.identity.workspace_name {
-            name.push_str(&format!(" ({organisation})"));
+        let provider = record.provider.display_name();
+        match &record.identity.workspace_name {
+            Some(organisation) => format!("{provider} {email} ({organisation})"),
+            None => format!("{provider} {email}"),
         }
-        name
     };
     report.added = report.added.into_iter().map(name).collect();
     report.updated = report.updated.into_iter().map(name).collect();

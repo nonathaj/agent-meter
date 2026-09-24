@@ -488,11 +488,11 @@ fn syncing_gives_each_machine_what_the_other_is_holding() {
     // Both are `claude-1` on their own machine, so an id would name either.
     // The report names each by what it is everywhere.
     assert!(
-        planned.contains("add     Claude Code dev@example.com there"),
+        planned.contains("add     Claude Code dev@example.com (Example Inc) there"),
         "{planned}"
     );
     assert!(
-        planned.contains("add     Claude Code other@example.com here"),
+        planned.contains("add     Claude Code other@example.com (Example Inc) here"),
         "{planned}"
     );
     assert!(!planned.contains("claude-1"), "{planned}");

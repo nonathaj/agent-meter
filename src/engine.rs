@@ -539,7 +539,7 @@ impl Engine {
                 report.unchanged += 1;
                 continue;
             }
-            report.updated.push(account.id.clone());
+            report.updated.push(record.origin_id.clone());
             if apply {
                 self.store.put_account(&account)?;
             }

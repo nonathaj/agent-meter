@@ -103,6 +103,10 @@ pub struct Response {
 }
 
 /// What merging a set of accounts did, or would do.
+///
+/// Accounts are named as the machine that sent them calls them — the
+/// `origin_id` they arrived with — because that is the one machine the report
+/// is read on for which those names mean anything.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Report {
     /// Accounts the receiver did not have.
@@ -191,12 +195,46 @@ pub fn exchange(engine: &Engine, remote: &RemoteConfig, options: Options) -> Res
     }
     let received = engine.absorb(&incoming, options.apply)?;
 
+    // Each report names accounts by the ids of the machine that sent them,
+    // which is ours for one and theirs for the other, and `claude-2` is a
+    // different account on each. Printed side by side they would read as the
+    // same names, so both are given as what does mean one thing everywhere.
     Ok(Exchange {
-        sent: response.applied,
-        received,
+        sent: addressed(response.applied, &offered),
+        received: addressed(received, &incoming),
         offered: offered.len(),
         version: response.version,
     })
+}
+
+/// `report`, naming each account by provider and address instead of by the id
+/// it was sent under.
+///
+/// The organisation is added only where two of `sent` share an address, which
+/// is when it is what tells them apart. A name that matches nothing sent is
+/// kept as it came.
+fn addressed(mut report: Report, sent: &[Record]) -> Report {
+    let name = |id: String| {
+        let Some(record) = sent.iter().find(|record| record.origin_id == id) else {
+            return id;
+        };
+        let Some(email) = &record.identity.email else {
+            return id;
+        };
+        let mut name = format!("{} {email}", record.provider.display_name());
+        let shared = sent
+            .iter()
+            .filter(|other| other.provider == record.provider && other.identity.email.as_ref() == Some(email))
+            .count()
+            > 1;
+        if shared && let Some(organisation) = &record.identity.workspace_name {
+            name.push_str(&format!(" ({organisation})"));
+        }
+        name
+    };
+    report.added = report.added.into_iter().map(name).collect();
+    report.updated = report.updated.into_iter().map(name).collect();
+    report
 }
 
 /// Starts agent-meter on the other machine and holds one conversation with it.

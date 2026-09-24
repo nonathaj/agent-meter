@@ -288,7 +288,8 @@ impl Config {
             _ => bail!(
                 "unknown setting {key:?}. Known keys: watch.threshold, watch.poll-secs, \
                  watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
-                 provider.<claude|codex>.threshold, provider.<claude|codex>.enabled,                  remote.<name>.<ssh|command|auto>"
+                 provider.<claude|codex>.threshold, provider.<claude|codex>.enabled, \
+                 remote.<name>.<ssh|command|auto>"
             ),
         }
         self.validate()

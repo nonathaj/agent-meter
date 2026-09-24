@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
@@ -201,29 +201,32 @@ pub fn exchange(engine: &Engine, remote: &RemoteConfig, options: Options) -> Res
 
 /// Starts agent-meter on the other machine and holds one conversation with it.
 fn talk(remote: &RemoteConfig, request: &Request, unattended: bool) -> Result<Response> {
-    let mut command = transport(remote, unattended)?;
-    let described = describe(&command);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("running {described}"))?;
-
     // On its own line, and stdin closed after it, so the other side knows the
     // question is finished without having to count bytes.
     let mut message = serde_json::to_vec(request).context("preparing what to send")?;
     message.push(b'\n');
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(&message)
-        .with_context(|| format!("sending to {described}"))?;
 
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("waiting for {described}"))?;
+    let mut command = transport(remote, unattended)?;
+    let mut output = converse(&mut command, &message)?;
+    if not_found(&output)
+        && let Some(searching) = search(remote, unattended)
+    {
+        // Nothing was read on the other side, so the question can be asked
+        // again as it stands.
+        command = searching;
+        output = converse(&mut command, &message)?;
+        if not_found(&output) {
+            let destination = remote.ssh.as_deref().unwrap_or_default();
+            bail!(
+                "agent-meter is not on the PATH ssh runs commands with on {destination}, nor in \
+                 ~/.cargo/bin or ~/.local/bin there. Install it on that machine, or say where it \
+                 is with `agent-meter remote add <name> {destination} --command \
+                 /path/to/agent-meter`."
+            );
+        }
+    }
+
+    let described = describe(&command);
     if !output.status.success() {
         let complaint = String::from_utf8_lossy(&output.stderr);
         let complaint = complaint.trim();
@@ -236,9 +239,101 @@ fn talk(remote: &RemoteConfig, request: &Request, unattended: bool) -> Result<Re
 
     parse_reply(&output.stdout).with_context(|| {
         format!(
-            "{described} answered with something that is not an agent-meter's reply. Check that              agent-meter is installed there and is new enough to know `sync --serve`."
+            "{described} answered with something that is not an agent-meter's reply. Check that \
+             agent-meter is installed there and is new enough to know `sync --serve`."
         )
     })
+}
+
+/// Runs `command`, hands it `message` and collects everything it says.
+fn converse(command: &mut Command, message: &[u8]) -> Result<Output> {
+    let described = describe(command);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {described}"))?;
+    // A program that was never found exits without reading this, and the
+    // pipe closing under us says nothing its exit status does not.
+    let sent = child.stdin.take().expect("stdin was piped").write_all(message);
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for {described}"))?;
+    if !not_found(&output) {
+        sent.with_context(|| format!("sending to {described}"))?;
+    }
+    Ok(output)
+}
+
+/// The status a POSIX shell exits with when it cannot find the command, and
+/// which ssh hands back as its own.
+const NOT_FOUND: i32 = 127;
+
+fn not_found(output: &Output) -> bool {
+    output.status.code() == Some(NOT_FOUND)
+}
+
+/// Where agent-meter usually is when the PATH ssh gives does not reach it.
+///
+/// `cargo install` puts it in the first and agent-meter's own installer in the
+/// second, and on a stock Linux neither is on that PATH: a command run over
+/// ssh starts a shell that is neither a login shell nor interactive, so it
+/// reads no `~/.profile`, and `~/.bashrc` returns before the lines that would
+/// add them.
+const USUAL_PLACES: [&str; 2] = ["$HOME/.cargo/bin/agent-meter", "$HOME/.local/bin/agent-meter"];
+
+/// How to start agent-meter on the other machine by looking in the usual
+/// places, for when it was not on the PATH.
+///
+/// None when the configuration already says how to reach it: a command named
+/// there is the one that was meant, and `exec` is not ssh at all.
+fn search(remote: &RemoteConfig, unattended: bool) -> Option<Command> {
+    if !remote.exec.is_empty() || remote.command.is_some() {
+        return None;
+    }
+    let destination = remote.ssh.as_deref()?;
+    // ssh hands the other machine one line for its own shell to run, which
+    // may not be a POSIX one, so the search is given to `sh` whole, inside
+    // quotes every shell reads the same way. That is why it holds no quote
+    // or backslash of its own beyond the double quotes around each place.
+    let places = USUAL_PLACES.map(|place| format!("\"{place}\"")).join(" ");
+    let script =
+        format!("for p in {places}; do [ -x \"$p\" ] && exec \"$p\" sync --serve; done; exit {NOT_FOUND}");
+    Some(ssh(
+        destination,
+        unattended,
+        &["sh", "-c", &format!("'{script}'")],
+    ))
+}
+
+/// How to start agent-meter on the other machine.
+fn transport(remote: &RemoteConfig, unattended: bool) -> Result<Command> {
+    if let Some((program, arguments)) = remote.exec.split_first() {
+        let mut command = Command::new(program);
+        command.args(arguments);
+        command.envs(&remote.env);
+        return Ok(command);
+    }
+    let Some(destination) = &remote.ssh else {
+        bail!("this remote states neither ssh nor exec, so there is no way to reach it");
+    };
+    let program = remote.command.as_deref().unwrap_or("agent-meter");
+    Ok(ssh(destination, unattended, &[program, "sync", "--serve"]))
+}
+
+/// ssh to `destination`, running `remote_command` there.
+fn ssh(destination: &str, unattended: bool, remote_command: &[&str]) -> Command {
+    let mut command = Command::new("ssh");
+    if unattended {
+        // Nobody is here to type a passphrase, and a machine that is asleep
+        // should be reported rather than waited on.
+        command.args(["-o", "BatchMode=yes"]);
+        command.args(["-o", &format!("ConnectTimeout={UNATTENDED_TIMEOUT_SECS}")]);
+    }
+    command.arg(destination);
+    command.args(remote_command);
+    command
 }
 
 /// Finds the reply in what the other machine said.
@@ -260,31 +355,6 @@ fn parse_reply(stdout: &[u8]) -> Result<Response> {
         Some(error) => Err(error).context("reading the reply"),
         None => bail!("it said nothing at all"),
     }
-}
-
-/// How to start agent-meter on the other machine.
-fn transport(remote: &RemoteConfig, unattended: bool) -> Result<Command> {
-    if let Some((program, arguments)) = remote.exec.split_first() {
-        let mut command = Command::new(program);
-        command.args(arguments);
-        command.envs(&remote.env);
-        return Ok(command);
-    }
-    let Some(destination) = &remote.ssh else {
-        bail!("this remote states neither ssh nor exec, so there is no way to reach it");
-    };
-
-    let mut command = Command::new("ssh");
-    if unattended {
-        // Nobody is here to type a passphrase, and a machine that is asleep
-        // should be reported rather than waited on.
-        command.args(["-o", "BatchMode=yes"]);
-        command.args(["-o", &format!("ConnectTimeout={UNATTENDED_TIMEOUT_SECS}")]);
-    }
-    command.arg(destination);
-    command.arg(remote.command.as_deref().unwrap_or("agent-meter"));
-    command.args(["sync", "--serve"]);
-    Ok(command)
 }
 
 /// The command as a person would write it, for an error message.
@@ -406,6 +476,38 @@ mod tests {
             describe(&transport(&elsewhere, false).unwrap()),
             "ssh jon@laptop /opt/bin/agent-meter sync --serve"
         );
+    }
+
+    /// ssh runs a command with the system PATH alone, which on a stock Linux
+    /// does not reach where `cargo install` put agent-meter. So when it was
+    /// not found there, the usual places are looked in — but only when nobody
+    /// said where it is.
+    #[test]
+    fn agent_meter_off_the_path_is_looked_for_where_it_is_usually_installed() {
+        let configured = RemoteConfig {
+            ssh: Some("jon@laptop".into()),
+            ..RemoteConfig::default()
+        };
+        let searching = describe(&search(&configured, true).unwrap());
+        assert!(
+            searching.starts_with("ssh -o BatchMode=yes -o ConnectTimeout=10 jon@laptop sh -c '"),
+            "{searching}"
+        );
+        for place in USUAL_PLACES {
+            assert!(searching.contains(&format!("\"{place}\"")), "{searching}");
+        }
+        assert!(searching.ends_with("exit 127'"), "{searching}");
+        // One quoted word to whatever shell the other machine has.
+        let script = searching.split_once("sh -c '").unwrap().1;
+        assert_eq!(script.matches('\'').count(), 1, "{searching}");
+        assert!(!script.contains('\\'), "{searching}");
+
+        let named = RemoteConfig {
+            command: Some("/opt/bin/agent-meter".into()),
+            ..configured
+        };
+        assert!(search(&named, false).is_none());
+        assert!(search(&remote(&["wsl", "agent-meter", "sync", "--serve"]), false).is_none());
     }
 
     #[test]

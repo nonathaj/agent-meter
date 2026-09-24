@@ -47,6 +47,23 @@ const MACHINE_KEYS: &[&str] = &[
     "pluginSecrets",
 ];
 
+/// The scopes Claude Code's own login grants, as it records them.
+///
+/// Claude Code decides whether it is signed in by reading `scopes` out of the
+/// credential file, not by asking the provider: without `user:inference` there
+/// it reports "Not logged in" and never sends the token at all. Other tools'
+/// stores keep only the tokens, so an account imported from one has no scopes
+/// of its own to write back, and gets these. They are what `claude auth login`
+/// asked for, so they are what the token was issued with.
+const LOGIN_SCOPES: &[&str] = &[
+    "user:file_upload",
+    "user:inference",
+    "user:mcp_servers",
+    "user:plugins",
+    "user:profile",
+    "user:sessions:claude_code",
+];
+
 /// Base name of the macOS Keychain item Claude Code stores its credential in.
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
@@ -368,6 +385,23 @@ pub(crate) fn merge_credentials(live: &Map<String, Value>, account: &Account) ->
     }
     if let Some(expires) = credential.refresh_expires_at {
         oauth.insert("refreshTokenExpiresAt".into(), expires.as_millisecond().into());
+    }
+    // A credential without scopes is one Claude Code will not use. See
+    // `LOGIN_SCOPES`.
+    let has_scopes = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .is_some_and(|scopes| !scopes.is_empty());
+    if !has_scopes {
+        oauth.insert("scopes".into(), json!(LOGIN_SCOPES));
+    }
+    // Claude Code chooses its default model and labels the session by this.
+    // The provider's answer is the one to give it when the account arrived
+    // without Claude Code's own copy.
+    if !oauth.contains_key("subscriptionType")
+        && let Some(plan) = &account.identity.plan
+    {
+        oauth.insert("subscriptionType".into(), plan.clone().into());
     }
 
     let mut blob = Map::new();
@@ -789,6 +823,67 @@ mod tests {
             Map::new(),
         );
         assert!(!merge_credentials(&live, &account).contains_key("primaryApiKey"));
+    }
+
+    /// Claude Code reads `scopes` to decide whether it is signed in at all, and
+    /// an account imported from another tool's store has none. Installed as it
+    /// came, it leaves every session saying "Not logged in" while the same
+    /// token reads usage perfectly well.
+    #[test]
+    fn an_account_imported_without_scopes_is_installed_with_the_login_ones() {
+        let live = credentials_json().as_object().unwrap().clone();
+        let mut provider_data = Map::new();
+        provider_data.insert("oauthAccount".into(), json!({"emailAddress": "dev@example.com"}));
+        let mut account = account_with(
+            Credential {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                id_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
+            },
+            provider_data,
+        );
+        account.identity.plan = Some("team".into());
+
+        let merged = merge_credentials(&live, &account);
+        let oauth = merged[OAUTH_KEY].as_object().unwrap();
+        assert!(
+            oauth["scopes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("user:inference")),
+            "without user:inference Claude Code will not use the token: {oauth:?}"
+        );
+        // The provider's word on the plan, since there is no copy of Claude
+        // Code's own to keep.
+        assert_eq!(oauth["subscriptionType"], "team");
+    }
+
+    /// The scopes and plan Claude Code wrote itself are the ones it keeps.
+    #[test]
+    fn scopes_claude_code_recorded_are_kept_as_they_are() {
+        let live = credentials_json().as_object().unwrap().clone();
+        let mut provider_data = Map::new();
+        provider_data.insert(
+            "oauthExtras".into(),
+            json!({"scopes": ["user:inference"], "subscriptionType": "pro"}),
+        );
+        let mut account = account_with(
+            Credential {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                id_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
+            },
+            provider_data,
+        );
+        account.identity.plan = Some("max".into());
+
+        let merged = merge_credentials(&live, &account);
+        assert_eq!(merged[OAUTH_KEY]["scopes"], json!(["user:inference"]));
+        assert_eq!(merged[OAUTH_KEY]["subscriptionType"], "pro");
     }
 
     #[test]

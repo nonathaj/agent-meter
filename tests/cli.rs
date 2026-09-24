@@ -344,6 +344,84 @@ fn importing_an_older_store_keeps_the_credential_that_still_works() {
     );
 }
 
+/// gemctl keeps only the tokens. Claude Code decides whether it is signed in
+/// by the `scopes` beside them, so an account taken from gemctl and switched to
+/// as it came left every session saying "Not logged in · Please run /login" —
+/// while `list`, reading usage with the very same token, called it healthy.
+#[test]
+fn an_account_imported_from_gemctl_signs_claude_code_in() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("other@example.com", "uuid-2", "other");
+    fixture.run(&["import", "claude"]);
+
+    let store = fixture.data.parent().unwrap().join("gemctl");
+    std::fs::create_dir_all(&store).unwrap();
+    write_json(
+        &store.join("claude-1.json"),
+        &json!({
+            "schemaVersion": 1, "agent": "claude", "name": "claude-1",
+            "accountId": "uuid-1", "email": "dev@example.com", "orgId": "org-9",
+            "expiresAt": 1_900_000_000,
+            "tokens": {"access_token": "sk-ant-oat01-gem", "refresh_token": "sk-ant-ort01-gem"}
+        }),
+    );
+    fixture.run(&["import", "--from", "gemctl", "--dir", &store.to_string_lossy()]);
+    fixture.run(&["use", "dev@example.com"]);
+
+    let oauth = &fixture.claude_credentials()["claudeAiOauth"];
+    assert_eq!(oauth["refreshToken"], "sk-ant-ort01-gem");
+    assert!(
+        oauth["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.contains(&json!("user:inference"))),
+        "Claude Code treats a credential without user:inference as no login: {oauth}"
+    );
+}
+
+/// Signing the account in use in again is how a person fixes a CLI that
+/// says it is logged out. The CLI's copy is then the stale one, and adopting
+/// it — as a copy the CLI rotated on its own would be — threw the new login
+/// away on the next `list` and left the CLI exactly as broken as before.
+#[test]
+fn a_newer_login_for_the_account_in_use_reaches_the_cli() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude_expiring("dev@example.com", "uuid-1", "old", 1_800_000_000_000);
+    fixture.run(&["import", "claude"]);
+
+    // The same account arrives signed in afresh: here from gemctl, which takes
+    // the same path as `agent-meter add` or a copy from another machine.
+    let store = fixture.data.parent().unwrap().join("gemctl");
+    std::fs::create_dir_all(&store).unwrap();
+    write_json(
+        &store.join("claude-1.json"),
+        &json!({
+            "schemaVersion": 1, "agent": "claude", "name": "claude-1",
+            "email": "dev@example.com", "orgId": "org-1",
+            "expiresAt": 1_900_000_000,
+            "tokens": {"access_token": "sk-ant-oat01-new", "refresh_token": "sk-ant-ort01-new"}
+        }),
+    );
+    fixture.run(&["import", "--from", "gemctl", "--dir", &store.to_string_lossy()]);
+    fixture.run(&["list"]);
+
+    let stored = read_json(&fixture.data.join("accounts").join("claude-1.json"));
+    assert_eq!(
+        stored["credential"]["refresh_token"], "sk-ant-ort01-new",
+        "the new login was replaced by the CLI's stale copy: {stored}"
+    );
+    let oauth = &fixture.claude_credentials()["claudeAiOauth"];
+    assert_eq!(oauth["refreshToken"], "sk-ant-ort01-new", "{oauth}");
+    assert!(
+        oauth["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.contains(&json!("user:inference"))),
+        "{oauth}"
+    );
+    // Nothing else of the CLI's was disturbed.
+    assert_eq!(fixture.claude_credentials()["mcpOAuth"]["machine"], "scoped");
+    assert_eq!(fixture.claude_settings()["numStartups"], 42);
+}
+
 /// Points `here` at `there`, by running the binary directly instead of ssh.
 ///
 /// This is the `exec` transport doing what it exists for: everything below the

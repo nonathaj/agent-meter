@@ -643,7 +643,23 @@ impl Engine {
             return Ok(None);
         }
 
-        if account.credential != live.credential {
+        if account.credential == live.credential {
+            return Ok(Some(account.id.clone()));
+        }
+        if refreshed_later(&account.credential, &live.credential) {
+            // The stored copy is the newer one: the person signed this account
+            // in again through agent-meter, or another machine sent a later
+            // copy. The CLI's is the stale one, and adopting it would throw
+            // away the login that was meant to fix it. Hand the CLI ours.
+            if crate::fleet::Fleet::load(&self.store)?
+                .guard_global_home(&home)
+                .is_ok()
+            {
+                provider
+                    .install(&home, account)
+                    .context("giving the newer credential to the agent CLI")?;
+            }
+        } else {
             let mut updated = account.clone();
             updated.credential = live.credential;
             updated.identity.update_from(&live.identity);
@@ -898,6 +914,7 @@ impl Engine {
             && let Ok(home) = provider.config_home()
             && let Ok(live) = provider.capture(&home)
             && live.credential != account.credential
+            && !refreshed_later(&account.credential, &live.credential)
         {
             let mut updated = account.clone();
             updated.credential = live.credential.clone();
@@ -1016,14 +1033,6 @@ impl Engine {
     }
 }
 
-/// Asks the provider who an account belongs to and what it is entitled to.
-///
-/// The credential files name the account but do not reliably state its plan or
-/// the size of its quota — Claude Code's copies of both drift from what the
-/// provider reports — so the provider is asked whenever either is missing.
-///
-/// Best effort, and deliberately outside the store lock: it is a network call,
-/// and an account with an unknown plan is better than a failed import.
 /// Whether `candidate` is a later copy of an account's credential than `held`.
 ///
 /// Refreshing an OAuth credential rotates its refresh token and mints an
@@ -1042,6 +1051,24 @@ fn supersedes(candidate: &Credential, held: &Credential) -> bool {
     }
 }
 
+/// Whether `a` is known to have been refreshed after `b`.
+///
+/// Stricter than `supersedes`, which lets an offered copy win whenever nothing
+/// says otherwise. This is for the other direction: keeping the stored copy
+/// over the one an agent CLI holds. The CLI's copy is the one in use, so it
+/// loses only to evidence — both expiries stated, and ours later.
+fn refreshed_later(a: &Credential, b: &Credential) -> bool {
+    a.refresh_token != b.refresh_token && matches!((a.expires_at, b.expires_at), (Some(a), Some(b)) if a > b)
+}
+
+/// Asks the provider who an account belongs to and what it is entitled to.
+///
+/// The credential files name the account but do not reliably state its plan or
+/// the size of its quota — Claude Code's copies of both drift from what the
+/// provider reports — so the provider is asked whenever either is missing.
+///
+/// Best effort, and deliberately outside the store lock: it is a network call,
+/// and an account with an unknown plan is better than a failed import.
 fn name_account(kind: ProviderKind, captured: &mut Captured) {
     if captured.identity.email.is_some() && captured.identity.plan.is_some() {
         return;

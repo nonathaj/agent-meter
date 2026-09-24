@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "Manage multiple AI coding-agent accounts (Claude Code, Codex): import, log in, meter usage, and auto-switch before you hit a limit."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/nonathaj/agent-meter"
 keywords = ["claude", "codex", "cli", "tui", "accounts"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/"]
@@ -37,3 +38,7 @@ tempfile = "3.27.0"
 [profile.release]
 lto = "thin"
 strip = true
+
+# What `dist` builds a release with.
+[profile.dist]
+inherits = "release"

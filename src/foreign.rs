@@ -122,6 +122,31 @@ fn said(account: &Account, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Why `account` must not be written over what `source` already holds, if so.
+///
+/// Refresh tokens are single-use, and the other tool may be refreshing its own
+/// copy as it works. When that copy is provably the later one, ours was spent
+/// the moment it was made, and writing ours over it would sign the account out
+/// of the tool it was exported to.
+fn holds_newer(source: Source, held: &[Found], account: &Account) -> Option<String> {
+    let theirs = held.iter().find(|found| {
+        found.provider == account.provider
+            && account.identity.email.is_some()
+            && found.captured.identity.email == account.identity.email
+            && found.captured.identity.workspace_id == account.identity.workspace_id
+    })?;
+    crate::engine::refreshed_later(&theirs.captured.credential, &account.credential).then(|| {
+        format!(
+            "{} — {} holds a newer copy ({}); run `agent-meter import --from {}` to take it",
+            account.id,
+            source.display_name(),
+            theirs.origin,
+            clap::ValueEnum::to_possible_value(&source)
+                .map_or_else(String::new, |v| v.get_name().to_string()),
+        )
+    })
+}
+
 /// Writes JSON somebody else's tool will read, formatted as it writes it.
 fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -155,12 +180,22 @@ mod cswap {
             .cloned()
             .unwrap_or_default();
         let before = entries.len();
+        // Only when there is a roster to read: a first export has nothing there.
+        let held = if entries.is_empty() {
+            Vec::new()
+        } else {
+            read(Some(&dir))?
+        };
 
         let mut plan = Plan::default();
         for account in accounts {
             if account.provider != ProviderKind::Claude {
                 plan.skipped
                     .push(format!("{} — claude-swap holds Claude accounts only", account.id));
+                continue;
+            }
+            if let Some(reason) = super::holds_newer(Source::Cswap, &held, account) {
+                plan.skipped.push(reason);
                 continue;
             }
             let Some(email) = account.identity.email.clone() else {
@@ -482,6 +517,10 @@ mod gemctl {
         let before = taken.len();
 
         for account in accounts {
+            if let Some(reason) = super::holds_newer(Source::Gemctl, &existing, account) {
+                plan.skipped.push(reason);
+                continue;
+            }
             // Match on the address and the workspace, which is what tells two
             // seats under one address apart.
             let name = existing

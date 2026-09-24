@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::{SignedDuration, Timestamp};
+use serde_json::{Map, Value};
 
 use crate::account::{Account, Captured, Credential, Match, ProviderKind, SCHEMA_VERSION, same_identity};
 use crate::config::Config;
@@ -388,12 +389,16 @@ impl Engine {
             // refreshed last is live and the other was spent at that moment.
             // A store nobody has opened in a week holds the spent one, and
             // taking it would sign the account out.
+            //
+            // What sits beside the credential — the scopes it was issued with,
+            // the CLI's own record of the account — describes that credential,
+            // so it travels with it or not at all.
             if supersedes(&captured.credential, &account.credential) {
                 account.credential = captured.credential;
                 account.needs_login = None;
+                overlay_provider_data(&mut account.provider_data, captured.provider_data);
             }
             account.identity.update_from(&captured.identity);
-            account.provider_data = captured.provider_data;
             if checked_at.is_some() {
                 account.entitlement_checked_at = checked_at;
             }
@@ -427,6 +432,15 @@ impl Engine {
     /// achieve is replacing a working copy somewhere else.
     pub fn records(&self) -> Result<Vec<crate::remote::Record>> {
         let _lock = self.store.lock()?;
+        // A CLI may have rotated its credential since anything last looked,
+        // and the copy stored from before that is spent. Sending it would
+        // hand the other machine an account that is already signed out.
+        let accounts = self.store.accounts()?;
+        for kind in ProviderKind::ALL {
+            if accounts.iter().any(|a| a.provider == kind) {
+                self.sync_active(kind, &accounts)?;
+            }
+        }
         let fleet = crate::fleet::Fleet::load(&self.store)?;
         Ok(self
             .store
@@ -509,9 +523,7 @@ impl Engine {
             // a verdict on a credential this account no longer has.
             account.needs_login = None;
             account.identity.update_from(&record.identity);
-            if !record.provider_data.is_empty() {
-                account.provider_data = record.provider_data.clone();
-            }
+            overlay_provider_data(&mut account.provider_data, record.provider_data.clone());
             // The name this machine gave it stays: it is what the person
             // sitting at this machine calls the account.
             if account.label.is_none() {
@@ -1057,8 +1069,28 @@ fn supersedes(candidate: &Credential, held: &Credential) -> bool {
 /// says otherwise. This is for the other direction: keeping the stored copy
 /// over the one an agent CLI holds. The CLI's copy is the one in use, so it
 /// loses only to evidence — both expiries stated, and ours later.
-fn refreshed_later(a: &Credential, b: &Credential) -> bool {
+pub(crate) fn refreshed_later(a: &Credential, b: &Credential) -> bool {
     a.refresh_token != b.refresh_token && matches!((a.expires_at, b.expires_at), (Some(a), Some(b)) if a > b)
+}
+
+/// Lays what a newer copy of an account carries over what is held.
+///
+/// Sources differ in how much they keep: Claude Code's own files hold the
+/// scopes and a full account record, while gemctl keeps the tokens and four
+/// fields of identity. A key a source never kept is not a key it removed, so
+/// what it did not say is left as it was — one level deep, so a thin
+/// `oauthAccount` refreshes the fields it has without erasing the ones it
+/// lacks. Replacing wholesale is what left accounts without the scopes Claude
+/// Code needs to consider itself signed in.
+fn overlay_provider_data(held: &mut Map<String, Value>, offered: Map<String, Value>) {
+    for (key, value) in offered {
+        match (held.get_mut(&key), value) {
+            (Some(Value::Object(held)), Value::Object(offered)) => held.extend(offered),
+            (_, value) => {
+                held.insert(key, value);
+            }
+        }
+    }
 }
 
 /// Asks the provider who an account belongs to and what it is entitled to.
@@ -1133,7 +1165,6 @@ fn backoff_until(error: &http::Error, previous_failures: u32) -> Option<Timestam
 mod tests {
     use super::*;
     use crate::account::Identity;
-    use serde_json::Map;
 
     fn engine() -> (tempfile::TempDir, Engine) {
         let dir = tempfile::tempdir().unwrap();

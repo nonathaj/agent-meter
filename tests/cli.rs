@@ -332,6 +332,15 @@ fn importing_an_older_store_keeps_the_credential_that_still_works() {
         stored()
     );
     assert!(stored()["needs_login"].is_null(), "{}", stored());
+    // What sits beside the credential describes it, so a copy that lost did
+    // not replace that either.
+    let scopes = || stored()["provider_data"]["oauthExtras"]["scopes"].clone();
+    assert_eq!(
+        scopes(),
+        json!(["user:inference", "user:profile"]),
+        "{}",
+        stored()
+    );
 
     // Their copy is the newer one, so it is taken.
     write_json(&path, &record("refreshed-elsewhere", 2_000_000_000));
@@ -339,6 +348,20 @@ fn importing_an_older_store_keeps_the_credential_that_still_works() {
     assert_eq!(
         stored()["credential"]["refresh_token"],
         "refreshed-elsewhere",
+        "{}",
+        stored()
+    );
+    // gemctl keeps no scopes; taking its token does not erase ours, nor the
+    // parts of Claude Code's account record gemctl never kept.
+    assert_eq!(
+        scopes(),
+        json!(["user:inference", "user:profile"]),
+        "{}",
+        stored()
+    );
+    assert_eq!(
+        stored()["provider_data"]["oauthAccount"]["accountUuid"],
+        "uuid-1",
         "{}",
         stored()
     );
@@ -411,12 +434,9 @@ fn a_newer_login_for_the_account_in_use_reaches_the_cli() {
     );
     let oauth = &fixture.claude_credentials()["claudeAiOauth"];
     assert_eq!(oauth["refreshToken"], "sk-ant-ort01-new", "{oauth}");
-    assert!(
-        oauth["scopes"]
-            .as_array()
-            .is_some_and(|scopes| scopes.contains(&json!("user:inference"))),
-        "{oauth}"
-    );
+    // gemctl keeps no scopes, which is not the same as the account having
+    // none: the ones Claude Code recorded itself came through.
+    assert_eq!(oauth["scopes"], json!(["user:inference", "user:profile"]));
     // Nothing else of the CLI's was disturbed.
     assert_eq!(fixture.claude_credentials()["mcpOAuth"]["machine"], "scoped");
     assert_eq!(fixture.claude_settings()["numStartups"], 42);
@@ -490,6 +510,28 @@ fn syncing_gives_each_machine_what_the_other_is_holding() {
     assert!(again.contains("already current"), "{again}");
     assert_eq!(desk.accounts().len(), 2);
     assert_eq!(laptop.accounts().len(), 2);
+}
+
+/// Claude Code refreshes as it works, and nothing may have looked since. What
+/// a sync sends is the copy the CLI holds, not the one stored before it
+/// rotated — that one is spent, and the other machine would be handed an
+/// account that is already signed out.
+#[test]
+fn a_sync_sends_the_credential_the_cli_rotated_since_it_was_stored() {
+    let desk = Fixture::new();
+    let laptop = Fixture::new();
+    desk.sign_in_claude_expiring("dev@example.com", "uuid-1", "stored", 1_800_000_000_000);
+    desk.run(&["import", "claude"]);
+    desk.sign_in_claude_expiring("dev@example.com", "uuid-1", "rotated", 1_900_000_000_000);
+    link(&desk, &laptop, "laptop");
+
+    desk.run(&["sync", "laptop", "--yes"]);
+
+    let there = read_json(&laptop.data.join("accounts").join("claude-1.json"));
+    assert_eq!(
+        there["credential"]["refresh_token"], "sk-ant-ort01-rotated",
+        "the other machine was sent the spent copy: {there}"
+    );
 }
 
 /// The reason this cannot be a file copy. A refresh token is single-use, so
@@ -893,6 +935,59 @@ fn exporting_adds_accounts_without_taking_away_the_tools_own() {
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
     assert_eq!(names.len(), 2, "no duplicate slot: {names:?}");
+}
+
+/// The other tool may be refreshing its own copy as it works, and a refresh
+/// token is single-use. Exporting our older copy over its newer one would sign
+/// the account out of that tool, so it is skipped and the person told how to
+/// take theirs instead.
+#[test]
+fn an_export_never_replaces_a_newer_copy_the_other_tool_holds() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    for tool in ["gemctl", "cswap"] {
+        let fixture = Fixture::new();
+        fixture.sign_in_claude_expiring("dev@example.com", "uuid-1", "ours", 1_800_000_000_000);
+        fixture.run(&["import", "claude"]);
+        let store = fixture.data.parent().unwrap().join(tool);
+        let dir = store.to_string_lossy().into_owned();
+        fixture.run(&["export", "--to", tool, "--dir", &dir, "--yes"]);
+
+        // The tool refreshes its copy after the export.
+        let (path, rewrite): (PathBuf, fn(&Path)) = if tool == "gemctl" {
+            (store.join("claude-1.json"), |path| {
+                let mut record = read_json(path);
+                record["tokens"]["refresh_token"] = json!("sk-ant-ort01-theirs");
+                record["expiresAt"] = json!(1_900_000_000);
+                write_json(path, &record);
+            })
+        } else {
+            let credentials = store.join("credentials");
+            let file = std::fs::read_dir(&credentials).unwrap().next().unwrap().unwrap();
+            (file.path(), |path| {
+                let decoded = STANDARD.decode(std::fs::read(path).unwrap()).unwrap();
+                let mut blob: Value = serde_json::from_slice(&decoded).unwrap();
+                blob["claudeAiOauth"]["refreshToken"] = json!("sk-ant-ort01-theirs");
+                blob["claudeAiOauth"]["expiresAt"] = json!(1_900_000_000_000i64);
+                std::fs::write(path, STANDARD.encode(serde_json::to_vec(&blob).unwrap())).unwrap();
+            })
+        };
+        rewrite(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let output = fixture.run(&["export", "--to", tool, "--dir", &dir, "--yes"]);
+        assert!(output.contains("holds a newer copy"), "{tool}: {output}");
+        assert!(
+            output.contains(&format!("import --from {tool}")),
+            "{tool}: {output}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "{tool}: our older copy was written over theirs"
+        );
+    }
 }
 
 /// `personal` is our word for an organisation named after the address beside

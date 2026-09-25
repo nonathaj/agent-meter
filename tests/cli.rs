@@ -13,6 +13,69 @@ use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::{Value, json};
 
+#[cfg(unix)]
+#[test]
+fn update_hands_off_to_the_installed_updater_without_opening_the_account_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let updater = dir.path().join("agent-meter-update");
+    std::fs::write(&updater, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n").unwrap();
+    std::fs::set_permissions(&updater, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let blocked_store = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_store, "not an account store").unwrap();
+
+    let latest = Command::cargo_bin("agent-meter")
+        .unwrap()
+        .arg("update")
+        .env("PATH", dir.path())
+        .env("AGENT_METER_DIR", dir.path().join("not-a-directory"))
+        .output()
+        .unwrap();
+    assert_eq!(latest.status.code(), Some(7));
+    assert_eq!(String::from_utf8(latest.stdout).unwrap(), "\n");
+
+    let output = Command::cargo_bin("agent-meter")
+        .unwrap()
+        .args(["update", "--tag", "v1.2.3", "--prerelease"])
+        .env("PATH", dir.path())
+        .env("AGENT_METER_DIR", blocked_store)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "--tag\nv1.2.3\n--prerelease\n"
+    );
+
+    let version = Command::cargo_bin("agent-meter")
+        .unwrap()
+        .args(["update", "--version", "0.1.2"])
+        .env("PATH", dir.path())
+        .env("AGENT_METER_DIR", dir.path().join("not-a-directory"))
+        .output()
+        .unwrap();
+    assert_eq!(version.status.code(), Some(7));
+    assert_eq!(String::from_utf8(version.stdout).unwrap(), "--version\n0.1.2\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn update_explains_how_to_get_the_missing_release_updater() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("agent-meter")
+        .unwrap()
+        .arg("update")
+        .env("PATH", dir.path())
+        .env("AGENT_METER_DIR", dir.path().join("not-a-directory"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("agent-meter-update was not found"), "{stderr}");
+    assert!(stderr.contains("release installer"), "{stderr}");
+}
+
 /// A temporary machine: an agent-meter data directory plus one home per agent CLI.
 struct Fixture {
     _dir: tempfile::TempDir,

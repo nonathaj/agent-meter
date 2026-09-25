@@ -44,6 +44,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Install the newest release with the updater shipped by the installer
+    Update(UpdateArgs),
     /// Register account homes and inspect persistent session assignments
     Fleet(FleetArgs),
     /// Launch or resume a CLI on its pinned subscription account
@@ -89,6 +91,64 @@ enum Command {
 
     /// Show where agent-meter keeps its files
     Where,
+}
+
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// Install a particular release tag
+    #[arg(long, conflicts_with = "version")]
+    tag: Option<String>,
+    /// Install a particular release version
+    #[arg(long, conflicts_with = "tag")]
+    version: Option<String>,
+    /// Include prereleases when updating to the latest version
+    #[arg(long)]
+    prerelease: bool,
+}
+
+fn update(args: &UpdateArgs) -> Result<ExitCode> {
+    let name = format!("agent-meter-update{}", std::env::consts::EXE_SUFFIX);
+    let beside_meter = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join(&name)));
+    let updater = beside_meter
+        .filter(|path| path.is_file())
+        .or_else(|| which::which(&name).ok())
+        .with_context(|| {
+            format!(
+                "{name} was not found beside agent-meter or on PATH; install agent-meter with \
+                 the release installer from https://github.com/nonathaj/agent-meter/releases"
+            )
+        })?;
+    let mut command = std::process::Command::new(&updater);
+    if let Some(tag) = &args.tag {
+        command.args(["--tag", tag]);
+    }
+    if let Some(version) = &args.version {
+        command.args(["--version", version]);
+    }
+    if args.prerelease {
+        command.arg("--prerelease");
+    }
+
+    // Replacing this process lets the updater replace agent-meter's executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec()).with_context(|| format!("running {}", updater.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .with_context(|| format!("running {}", updater.display()))?;
+        Ok(ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1),
+        ))
+    }
 }
 
 #[derive(Args, Debug)]
@@ -372,14 +432,20 @@ pub fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let engine = Engine::open()?;
-
-    match cli.command.unwrap_or(Command::List(ListArgs {
+    let command = cli.command.unwrap_or(Command::List(ListArgs {
         provider: None,
         refresh: false,
         poll: false,
         json: false,
-    })) {
+    }));
+    // An update needs no account store, and the updater may replace this binary.
+    if let Command::Update(args) = &command {
+        return update(args);
+    }
+    let engine = Engine::open()?;
+
+    match command {
+        Command::Update(_) => unreachable!("handled before opening the account store"),
         Command::Fleet(args) => fleet(&engine, &args),
         Command::Run(args) => run_pinned(&engine, &args),
         Command::List(args) => list(&engine, &args),

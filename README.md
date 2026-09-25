@@ -46,7 +46,8 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/nonathaj/agent-met
 ```
 
 Either puts `agent-meter` in `~/.local/bin` and adds that to your `PATH`. Run
-`agent-meter-update` later to move to the newest release. Prebuilt binaries for
+`agent-meter update` later to move to the newest release; it invokes the
+`agent-meter-update` executable installed alongside it. Prebuilt binaries for
 each platform are on the [releases page](https://github.com/nonathaj/agent-meter/releases).
 
 Or build from source with `cargo install --git https://github.com/nonathaj/agent-meter`.
@@ -168,6 +169,7 @@ next machine that still has it. Remove it on each.
 | Command | What it does |
 | --- | --- |
 | `agent-meter list` | Every account with its usage. `--poll` refreshes only readings due under provider intervals/backoff; `--refresh` forces polling; `--json` prints machine-readable output. |
+| `agent-meter update` | Install the newest release with the bundled updater; `--tag`, `--version`, `--prerelease`. |
 | `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
 | `agent-meter export --to <tool>` | Writes these accounts into cswap's or gemctl's store, keeping the accounts they already hold. |

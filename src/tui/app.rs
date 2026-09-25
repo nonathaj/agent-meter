@@ -5,28 +5,36 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 
+use super::login::{self, Login};
 use super::worker::{Job, Worker};
 use crate::account::ProviderKind;
 use crate::engine::{Engine, Status};
 
 /// How often to redraw while idle. Short enough that countdowns tick visibly.
 const FRAME: Duration = Duration::from_millis(250);
+/// How often to redraw while something is animating, such as a spinner.
+const ANIMATION_FRAME: Duration = Duration::from_millis(80);
 
 /// What the interface is waiting for the user to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     /// Browsing the account list.
     Browse,
-    /// Asking which provider an action applies to.
-    ChooseProvider(ProviderAction),
+    /// Asking which provider an action applies to, with `index` the one the
+    /// cursor is on.
+    ChooseProvider { action: ProviderAction, index: usize },
     /// Asking whether to remove an account.
     ConfirmRemove { id: String, name: String },
     /// Showing the key bindings.
     Help,
+    /// Following a login, which `App::login` holds.
+    Login,
 }
 
 /// An action that needs a provider before it can run.
@@ -82,6 +90,10 @@ pub struct App {
     /// Which harnesses switch automatically, as the configuration says.
     pub switching: Vec<(ProviderKind, bool)>,
     pub threshold: f64,
+    /// The login under way, while the login panel is up.
+    pub login: Option<Login>,
+    /// When the interface started, which the spinners count from.
+    pub epoch: Instant,
     pub should_quit: bool,
     next_tick: Instant,
     tick_interval: Duration,
@@ -109,6 +121,8 @@ impl App {
             busy: None,
             switching: Vec::new(),
             threshold: engine.config().watch.threshold,
+            login: None,
+            epoch: Instant::now(),
             should_quit: false,
             next_tick: Instant::now() + interval,
             tick_interval: interval,
@@ -143,6 +157,8 @@ impl App {
             busy: None,
             switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
             threshold: 90.0,
+            login: None,
+            epoch: Instant::now(),
             should_quit: false,
             next_tick: Instant::now(),
             tick_interval: Duration::from_secs(60),
@@ -174,6 +190,11 @@ impl App {
             .iter()
             .find(|(provider, _)| *provider == kind)
             .is_some_and(|(_, on)| *on)
+    }
+
+    /// Whether something on screen is moving, and needs drawing more often.
+    pub fn animating(&self) -> bool {
+        self.busy.is_some() || self.login.as_ref().is_some_and(Login::is_running)
     }
 
     /// Whether anything is switching, which is when a tick is worth running.
@@ -370,8 +391,13 @@ pub fn run(engine: &Engine) -> Result<()> {
 /// With wrapping off, a line the terminal has no room for is cut at the edge
 /// instead. That is the same thing the interface already does on purpose
 /// everywhere it knows a line is too long, and it cannot corrupt anything.
+///
+/// Bracketed paste is turned on too, so a code pasted into the login panel
+/// arrives as one piece rather than as a burst of keys, any of which might be
+/// a key the panel acts on.
 fn claim_screen() -> Result<ratatui::DefaultTerminal> {
     let terminal = ratatui::try_init().context("starting the terminal interface")?;
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     if execute!(io::stdout(), DisableLineWrap).is_ok() {
         // Wrapping is a setting of the user's terminal, not ours, so it goes
         // back even if we leave by panicking.
@@ -379,7 +405,7 @@ fn claim_screen() -> Result<ratatui::DefaultTerminal> {
         RESTORE_WRAP.call_once(|| {
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
-                let _ = execute!(io::stdout(), EnableLineWrap);
+                let _ = execute!(io::stdout(), EnableLineWrap, DisableBracketedPaste);
                 previous(info);
             }));
         });
@@ -389,7 +415,7 @@ fn claim_screen() -> Result<ratatui::DefaultTerminal> {
 
 /// Gives the screen back, as we found it.
 fn release_screen() -> Result<()> {
-    let _ = execute!(io::stdout(), EnableLineWrap);
+    let _ = execute!(io::stdout(), EnableLineWrap, DisableBracketedPaste);
     ratatui::try_restore().context("restoring the terminal")
 }
 
@@ -412,16 +438,19 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
             app.reload(engine)?;
         }
 
+        follow_login(&mut app, engine, &worker)?;
+
         if app.any_switching() && app.busy.is_none() && Instant::now() >= app.next_tick {
             app.next_tick = Instant::now() + app.tick_interval;
             submit(&mut app, &worker, Job::Tick);
         }
 
-        if event::poll(FRAME)? {
+        if event::poll(if app.animating() { ANIMATION_FRAME } else { FRAME })? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(&mut app, engine, &worker, terminal, key)?;
                 }
+                Event::Paste(text) => paste(&mut app, &text),
                 // The window changed shape, so everything on it was drawn for
                 // a window that no longer exists. Paint all of it again rather
                 // than the difference against a screen we can no longer
@@ -430,6 +459,28 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
                 _ => {}
             }
         }
+    }
+    Ok(())
+}
+
+/// Takes in what the login has done, and closes its panel once it has stored
+/// an account.
+///
+/// A failed login keeps the panel up: the reason is only useful next to what
+/// the CLI said before it gave up.
+fn follow_login(app: &mut App, engine: &Engine, worker: &Worker) -> Result<()> {
+    let Some(login) = app.login.as_mut() else {
+        return Ok(());
+    };
+    login.update();
+    if let login::State::Succeeded(note) = login.state.clone() {
+        app.login = None;
+        app.mode = Mode::Browse;
+        app.note(note);
+        app.reload(engine)?;
+        // A first reading makes the new account eligible for switching. Not
+        // forced: only the account that has never been read is due.
+        submit(app, worker, Job::Poll { force: false });
     }
     Ok(())
 }
@@ -452,14 +503,16 @@ fn handle_key(
     terminal: &mut ratatui::DefaultTerminal,
     key: KeyEvent,
 ) -> Result<()> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     // Ctrl-C quits from anywhere, as it does in every other terminal program.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+    // A login under way is stopped on the way out, by dropping it.
+    if control && matches!(key.code, KeyCode::Char('c')) {
         app.should_quit = true;
         return Ok(());
     }
     // And Ctrl-L repaints, for when something outside this program has written
     // over the screen.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('l')) {
+    if control && matches!(key.code, KeyCode::Char('l')) {
         terminal.clear()?;
         return Ok(());
     }
@@ -476,42 +529,80 @@ fn handle_key(
                 app.note("Nothing was removed");
             }
         },
-        Mode::ChooseProvider(action) => {
-            let chosen = match key.code {
-                KeyCode::Char('1') => Some(ProviderKind::Claude),
-                KeyCode::Char('2') => Some(ProviderKind::Codex),
-                _ => None,
-            };
-            app.mode = Mode::Browse;
-            match (chosen, action) {
-                (Some(provider), ProviderAction::Import) => submit(app, worker, Job::Import(provider)),
-                (Some(provider), ProviderAction::Add) => login(app, engine, terminal, provider)?,
-                (None, _) => {}
+        Mode::ChooseProvider { action, index } => match choose_provider_key(index, key) {
+            Choice::Move(index) => app.mode = Mode::ChooseProvider { action, index },
+            Choice::Cancel => app.mode = Mode::Browse,
+            Choice::Chosen(provider) => {
+                app.mode = Mode::Browse;
+                match action {
+                    ProviderAction::Import => submit(app, worker, Job::Import(provider)),
+                    ProviderAction::Add => start_login(app, engine, provider, None),
+                }
             }
-        }
-        Mode::Browse => browse_key(app, engine, worker, terminal, key)?,
+        },
+        Mode::Login => login_key(app, key),
+        Mode::Browse => browse_key(app, engine, worker, key),
     }
     Ok(())
 }
 
-fn browse_key(
-    app: &mut App,
-    engine: &Engine,
-    worker: &Worker,
-    terminal: &mut ratatui::DefaultTerminal,
-    key: KeyEvent,
-) -> Result<()> {
+/// What a key does in the provider chooser.
+#[derive(Debug, PartialEq)]
+enum Choice {
+    Move(usize),
+    Chosen(ProviderKind),
+    Cancel,
+}
+
+fn choose_provider_key(index: usize, key: KeyEvent) -> Choice {
+    let count = ProviderKind::ALL.len();
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => Choice::Move((index + count - 1) % count),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => Choice::Move((index + 1) % count),
+        KeyCode::Enter => ProviderKind::ALL
+            .get(index)
+            .copied()
+            .map_or(Choice::Cancel, Choice::Chosen),
+        // The number each agent is listed under.
+        KeyCode::Char(c) => c
+            .to_digit(10)
+            .and_then(|n| (n as usize).checked_sub(1))
+            .and_then(|n| ProviderKind::ALL.get(n).copied())
+            .map_or(Choice::Cancel, Choice::Chosen),
+        _ => Choice::Cancel,
+    }
+}
+
+fn browse_key(app: &mut App, engine: &Engine, worker: &Worker, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-        KeyCode::Home => app.move_selection(-(app.rows.len() as isize)),
-        KeyCode::End => app.move_selection(app.rows.len() as isize),
+        KeyCode::Home | KeyCode::Char('g') => app.move_selection(-(app.rows.len() as isize)),
+        KeyCode::End | KeyCode::Char('G') => app.move_selection(app.rows.len() as isize),
         KeyCode::Char('r') => submit(app, worker, Job::Poll { force: true }),
-        KeyCode::Char('p') => app.cycle_filter(Some(engine)),
+        KeyCode::Char('p') | KeyCode::Tab => app.cycle_filter(Some(engine)),
         KeyCode::Char('?') | KeyCode::F(1) => app.mode = Mode::Help,
-        KeyCode::Char('a') => app.mode = Mode::ChooseProvider(ProviderAction::Add),
-        KeyCode::Char('i') => app.mode = Mode::ChooseProvider(ProviderAction::Import),
+        KeyCode::Char('a') => {
+            app.mode = Mode::ChooseProvider {
+                action: ProviderAction::Add,
+                index: 0,
+            }
+        }
+        KeyCode::Char('i') => {
+            app.mode = Mode::ChooseProvider {
+                action: ProviderAction::Import,
+                index: 0,
+            }
+        }
+        KeyCode::Char('l') => match app.selected() {
+            Some(status) => {
+                let provider = status.account.provider;
+                let name = status.account.display_name().to_string();
+                start_login(app, engine, provider, Some(name));
+            }
+            None => app.fail("Select an account to sign in to it again"),
+        },
         KeyCode::Char('w') => match app.selected().map(|status| status.account.provider) {
             Some(provider) => {
                 let on = !app.switching_on(provider);
@@ -544,44 +635,85 @@ fn browse_key(
         },
         _ => {}
     }
-    let _ = terminal;
-    Ok(())
 }
 
-/// Runs an interactive login, which needs the terminal the interface is using.
-///
-/// The interface stands down for the duration: an OAuth flow prints a URL and
-/// may ask questions, and no redraw may scribble over it.
-fn login(
-    app: &mut App,
-    engine: &Engine,
-    terminal: &mut ratatui::DefaultTerminal,
-    provider: ProviderKind,
-) -> Result<()> {
-    release_screen().context("handing the terminal to the login")?;
-
-    let result = engine.login(provider, None, false, |command| {
-        println!(
-            "Starting the {} login. Any running session keeps its own account.\n",
-            provider.display_name()
-        );
-        command
-            .status()
-            .context("starting the login. Is the CLI installed and on PATH?")
-    });
-
-    *terminal = claim_screen().context("taking the terminal back after the login")?;
-    terminal.clear()?;
-
-    match result {
-        Ok(outcome) => {
-            app.note(format!("Added {}", outcome.id()));
-            // A first reading makes the new account eligible for switching.
-            app.reload(engine)?;
+/// Starts a login and puts its panel up. The interface keeps running
+/// throughout: the CLI's output is shown in the panel, not handed the
+/// terminal.
+fn start_login(app: &mut App, engine: &Engine, provider: ProviderKind, account: Option<String>) {
+    match Login::start(engine.store().clone(), provider, account) {
+        Ok(login) => {
+            app.login = Some(login);
+            app.mode = Mode::Login;
         }
         Err(error) => app.fail(format!("{error:#}")),
     }
-    Ok(())
+}
+
+/// Keys while the login panel is up.
+///
+/// While the CLI waits for a code every printable key is typing, so the link
+/// actions are on Ctrl; with no code wanted, the plain letters work too.
+fn login_key(app: &mut App, key: KeyEvent) {
+    let Some(login) = app.login.as_mut() else {
+        app.mode = Mode::Browse;
+        return;
+    };
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let typing = login.is_running() && login.wants_input();
+
+    // Over and failed: the reason moves to the status line as it closes.
+    if !login.is_running() && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+        if let login::State::Failed(error) = login.state.clone() {
+            app.fail(error);
+        }
+        app.login = None;
+        app.mode = Mode::Browse;
+        return;
+    }
+
+    let result: Result<Option<&str>> = match key.code {
+        KeyCode::Esc => {
+            login.cancel();
+            Ok(None)
+        }
+        KeyCode::Char('o') if control || !typing => match login.link() {
+            Some(link) => {
+                login::open_in_browser(link).map(|()| Some("Opened the sign-in page in your browser"))
+            }
+            None => Ok(None),
+        },
+        KeyCode::Char('y') if control || !typing => match login.link() {
+            Some(link) => login::copy_to_clipboard(link).map(|()| Some("Copied the sign-in link")),
+            None => Ok(None),
+        },
+        KeyCode::Enter if typing => login.submit_input().map(|()| None),
+        KeyCode::Backspace if typing => {
+            login.input.pop();
+            Ok(None)
+        }
+        KeyCode::Char(c) if typing && !control => {
+            login.input.push(c);
+            Ok(None)
+        }
+        _ => Ok(None),
+    };
+    match result {
+        Ok(Some(note)) => app.note(note),
+        Ok(None) => {}
+        Err(error) => app.fail(format!("{error:#}")),
+    }
+}
+
+/// A paste lands in the login panel's code field, and nowhere else: pasted
+/// text anywhere in the list would be read as a string of commands.
+fn paste(app: &mut App, text: &str) {
+    if let Some(login) = app.login.as_mut()
+        && login.is_running()
+        && login.wants_input()
+    {
+        login.input.extend(text.chars().filter(|c| !c.is_whitespace()));
+    }
 }
 
 /// Accounts with no usage reading, for tests in this module and in `draw`.
@@ -705,6 +837,32 @@ mod tests {
         app.cycle_filter(None);
         assert_eq!(app.filter, None);
         assert_eq!(accounts(&app), 2);
+    }
+
+    /// The chooser takes arrows and enter, or the number an agent is listed
+    /// under; anything else backs out without doing anything.
+    #[test]
+    fn an_agent_is_chosen_by_arrows_or_by_number() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let last = ProviderKind::ALL.len() - 1;
+
+        assert_eq!(choose_provider_key(0, key(KeyCode::Down)), Choice::Move(1));
+        // Round from either end.
+        assert_eq!(choose_provider_key(0, key(KeyCode::Up)), Choice::Move(last));
+        assert_eq!(choose_provider_key(last, key(KeyCode::Down)), Choice::Move(0));
+
+        assert_eq!(
+            choose_provider_key(1, key(KeyCode::Enter)),
+            Choice::Chosen(ProviderKind::ALL[1])
+        );
+        assert_eq!(
+            choose_provider_key(1, key(KeyCode::Char('1'))),
+            Choice::Chosen(ProviderKind::ALL[0])
+        );
+
+        assert_eq!(choose_provider_key(0, key(KeyCode::Char('9'))), Choice::Cancel);
+        assert_eq!(choose_provider_key(0, key(KeyCode::Char('0'))), Choice::Cancel);
+        assert_eq!(choose_provider_key(0, key(KeyCode::Esc)), Choice::Cancel);
     }
 
     #[test]

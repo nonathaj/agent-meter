@@ -6,6 +6,7 @@
 
 mod app;
 mod draw;
+mod login;
 mod worker;
 
 pub use app::run;

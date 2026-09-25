@@ -191,32 +191,40 @@ within the hour. Every limit of every account is on screen at once, so two
 accounts can be compared without selecting either.
 
 ```text
- agent-meter   10 accounts   switching at 90%
-Claude Code (8)   in the order they will be taken
-▌1 dev@example.com  [personal]  max 20x  ● in use
-    5h            ████████████████████████░░░░   85%  resets 3h43m
-    weekly        ██████████████████████░░░░░░   80%  resets 4d19h  (49% ahead of pace)
-    weekly Fable  █████░░░░░░░░░░░░░░░░░░░░░░░   19%  resets 4d19h
+ ◆ agent-meter    All 10   Claude Code 8   Codex 2
+──────────────────────────────────────────────────────────────────────────────────────
+ Claude Code  8  ·  using dev@example.com   in the order they will be taken   ● auto at 90%
+┃ 1  dev@example.com  personal · max 20x                                         IN USE
+┃    5h            ━━━━━━━━━━━━━━━━━━━━━━━━╸━━━   85%   resets in 3h43m
+┃    weekly        ━━━━━━━━━━━━━━━━━━━━━━╸━━━━━   80%   resets in 4d19h   ▲ 49% ahead of pace
+┃    weekly Fable  ━━━━━╸━━━━━━━━━━━━━━━━━━━━━━   19%   resets in 4d19h
 
- 2 oncall@example.com  [Example Inc]  team 5x  next
-    5h            ███░░░░░░░░░░░░░░░░░░░░░░░░░    9%  resets 43m
-    weekly        ███████████████████████████░   97%  resets 1d22h
+  2  oncall@example.com  Example Inc · team 5x                                  next up
+     5h            ━━━╸━━━━━━━━━━━━━━━━━━━━━━━━    9%   resets in 43m
+     weekly        ━━━━━━━━━━━━━━━━━━━━━━━━━━━╸   97%   resets in 1d22h
 ```
 
-Accounts are grouped by harness, and `p` shows one harness at a time. **With
+Accounts are grouped by harness, and `tab` steps through showing one harness
+at a time. **With
 switching on, the list is the queue**: the account in use is first and says so,
 the one that would be taken next says so too, and the rest follow in the order
 they would actually be chosen — so the order on screen is the order that will
 happen, not an arrangement of its own.
 
-`(ahead of pace)` marks a weekly allowance being spent faster than the clock
+`▲ ahead of pace` marks a weekly allowance being spent faster than the clock
 that refills it: 60% of a week is unremarkable on day five and a warning on day
 two. It is only ever said of a weekly window, because a five-hour one is a rate
 that corrects itself.
 
-Every operation is on a key: `enter` to switch, `r` to refresh, `p` to filter by
-harness, `a` to add, `i` to import, `d` to remove, `w` to switch automatically,
-`?` for the rest.
+Every operation is on a key: `enter` to switch, `r` to refresh, `tab` to filter
+by harness, `a` to add, `l` to sign in to the selected account again, `i` to
+import, `d` to remove, `w` to switch automatically, `?` for the rest.
+
+Logging in never leaves the interface. `a` and `l` run the agent CLI's own
+login in the background and show it in a panel: the sign-in page opens in your
+browser (`o` opens it again, `y` copies the link), and if the page hands back a
+code instead of finishing by itself, paste it into the panel and press `enter`.
+`esc` stops the login, and nothing is stored unless it finishes.
 
 ## JSON usage feed
 

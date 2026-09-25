@@ -5,15 +5,19 @@
 //! at 5% of its five hours and 98% of its week is nearly spent, and one the
 //! other way round is fine in an hour. Every window is on screen for every
 //! account, so two accounts can be compared without selecting either.
+//!
+//! Colours are the terminal's own named ones, never fixed RGB values, so the
+//! interface follows whatever theme the terminal is set to, light or dark.
 
 use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use super::app::{App, Mode, ProviderAction, Row};
+use super::login::{self, Login};
 use crate::account::ProviderKind;
 use crate::engine::Status;
 use crate::timefmt;
@@ -30,11 +34,20 @@ const PACE_SLACK: f64 = 25.0;
 /// Width of the meter drawn for each window.
 const BAR: usize = 28;
 
+/// The one colour that means "this is where you are".
+const ACCENT: Color = Color::Cyan;
+/// Everything that supports the text rather than being it.
+const DIM: Color = Color::DarkGray;
+
+/// Frames of the spinner shown while something runs.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // The keys keep a line of their own. Sharing it with whatever just
     // happened meant that every time something happened, the way to do the
     // next thing disappeared.
-    let [header, body, message, keys] = Layout::vertical([
+    let [header, rule, body, message, keys] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -43,136 +56,191 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     draw_header(frame, header, app);
+    frame.render_widget(
+        Paragraph::new("─".repeat(rule.width as usize)).style(Style::new().fg(DIM)),
+        rule,
+    );
     draw_body(frame, body, app);
     draw_message(frame, message, app);
     draw_keys(frame, keys, app);
 
+    if app.mode != Mode::Browse {
+        // The footer stays lit: it holds the keys for the dialog.
+        dim_backdrop(frame, header.union(body));
+    }
     match app.mode.clone() {
         Mode::Help => draw_help(frame),
-        Mode::ChooseProvider(action) => draw_provider_chooser(frame, action),
+        Mode::ChooseProvider { action, index } => draw_provider_chooser(frame, action, index),
         Mode::ConfirmRemove { id, name } => draw_confirm_remove(frame, &id, &name),
+        Mode::Login => {
+            if let Some(login) = &app.login {
+                draw_login(frame, login, spinner(app));
+            }
+        }
         Mode::Browse => {}
     }
 }
 
+/// Greys out what is already drawn in `area`, so a dialog stands in front of
+/// the list rather than among it.
+fn dim_backdrop(frame: &mut Frame, area: Rect) {
+    frame.buffer_mut().set_style(
+        area,
+        Style::new()
+            .fg(DIM)
+            .bg(Color::Reset)
+            .remove_modifier(Modifier::BOLD),
+    );
+}
+
+/// The name, and a tab for every agent: which one is showing is the question
+/// the header answers.
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
-        Span::styled(
-            " agent-meter ",
-            Style::new()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(app.filter_label(), Style::new().fg(Color::Cyan)),
+        Span::styled(" ◆ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("agent-meter", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
     ];
-    // Per harness, because they are switched on separately and one word for
-    // both would be a lie about whichever is off.
-    for (kind, on) in &app.switching {
-        spans.push(Span::styled(
-            format!("{} ", kind.display_name()),
-            Style::new().fg(Color::DarkGray),
-        ));
-        spans.push(if *on {
-            Span::styled(
-                format!(" auto {:.0}% ", app.threshold),
-                Style::new().bg(Color::Green).fg(Color::Black),
-            )
+    let tabs = std::iter::once((None, "All", app.statuses.len())).chain(ProviderKind::ALL.map(|kind| {
+        let count = app
+            .statuses
+            .iter()
+            .filter(|status| status.account.provider == kind)
+            .count();
+        (Some(kind), kind.display_name(), count)
+    }));
+    for (filter, name, count) in tabs {
+        if filter == app.filter {
+            spans.push(Span::styled(
+                format!(" {name} {count} "),
+                Style::new()
+                    .bg(ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ));
         } else {
-            Span::styled("manual", Style::new().fg(Color::DarkGray))
-        });
-        spans.push(Span::raw("   "));
+            spans.push(Span::raw(format!(" {name} ")));
+            spans.push(Span::styled(format!("{count} "), Style::new().fg(DIM)));
+        }
+        spans.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.visible_height = area.height as usize;
     if app.rows.is_empty() {
-        let text = Paragraph::new(vec![
-            Line::raw(""),
-            Line::raw("No accounts yet."),
-            Line::raw(""),
-            Line::raw("Press i to import the account an agent CLI is already signed in to,"),
-            Line::raw("or a to log in to another one."),
-        ])
-        .alignment(Alignment::Center);
-        frame.render_widget(text, area);
+        draw_empty(frame, area);
         return;
     }
 
     let now = Timestamp::now();
+    let width = area.width as usize;
     let mut lines = Vec::new();
     for (index, row) in app.rows.iter().enumerate() {
         match row {
-            Row::Provider(kind) => lines.push(provider_heading(*kind, app, lines.is_empty())),
+            Row::Provider(kind) => lines.push(provider_heading(*kind, app, width)),
             Row::Account { status, position } => {
                 let selected = app.selected_row() == Some(index);
-                lines.extend(account_block(
-                    status,
-                    *position,
-                    selected,
-                    app,
-                    now,
-                    area.width as usize,
-                ));
+                lines.extend(account_block(status, *position, selected, app, now, width));
             }
         }
     }
 
     // Keep the selected block in view without a scrollbar: the list is short
     // enough that a moving window is less to read than a bar beside it.
-    app.visible_height = area.height as usize;
     let first = app.scroll.min(lines.len().saturating_sub(1));
     let shown: Vec<Line> = lines.into_iter().skip(first).take(area.height as usize).collect();
     frame.render_widget(Paragraph::new(shown), area);
 }
 
-fn provider_heading(kind: ProviderKind, app: &App, first: bool) -> Line<'static> {
+fn draw_empty(frame: &mut Frame, area: Rect) {
+    let key = |key: &'static str| Span::styled(key, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let lines = vec![
+        Line::from(Span::styled(
+            "No accounts yet",
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            key("i"),
+            Span::styled(
+                "  import the account an agent CLI is already signed in to",
+                Style::new().fg(DIM),
+            ),
+        ]),
+        Line::from(vec![
+            key("a"),
+            Span::styled("  log in to another one", Style::new().fg(DIM)),
+        ]),
+    ];
+    let [middle] = Layout::vertical([Constraint::Length(lines.len() as u16)])
+        .flex(Flex::Center)
+        .areas(area);
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+}
+
+/// A harness: which account it is on, and whether it picks its own.
+fn provider_heading(kind: ProviderKind, app: &App, width: usize) -> Line<'static> {
     let count = app
         .rows
         .iter()
         .filter(|row| matches!(row, Row::Account { status, .. } if status.account.provider == kind))
         .count();
-    let mut spans = Vec::new();
-    if !first {
-        spans.push(Span::raw(""));
-    }
-    spans.push(Span::styled(
-        format!("{} ", kind.display_name()),
-        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        format!("({count})  "),
-        Style::new().fg(Color::DarkGray),
-    ));
+    let mut left = vec![
+        Span::raw(" "),
+        Span::styled(
+            kind.display_name().to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {count}"), Style::new().fg(DIM)),
+        Span::styled("  ·  ", Style::new().fg(DIM)),
+    ];
 
     // Naming it here answers "which account is this agent on" without reading
     // down the list hunting for a marker.
     match app.active_of(kind) {
         Some(status) => {
-            spans.push(Span::styled("using ", Style::new().fg(Color::DarkGray)));
-            spans.push(Span::styled(
+            left.push(Span::styled("using ", Style::new().fg(DIM)));
+            left.push(Span::styled(
                 status.account.display_name().to_string(),
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::new().fg(Color::Green),
             ));
         }
-        None => spans.push(Span::styled(
+        None => left.push(Span::styled(
             "not signed in to a stored account",
             Style::new().fg(Color::Yellow),
         )),
     }
-    if app.switching_on(kind) {
-        spans.push(Span::styled(
-            "   in the order they will be taken",
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+
+    // Per harness, because they are switched on separately and one word for
+    // both would be a lie about whichever is off.
+    let status = if app.switching_on(kind) {
+        Span::styled(
+            format!(" ● auto at {:.0}% ", app.threshold),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" ○ manual ", Style::new().fg(DIM))
+    };
+    // The order is explained only where there is room: the status is the part
+    // that must not be pushed off the edge.
+    let mut right = Vec::new();
+    let hint = "in the order they will be taken  ";
+    if app.switching_on(kind) && spans_width(&left) + hint.len() + status.width() + 3 <= width {
+        right.push(Span::styled(
+            hint,
+            Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
         ));
     }
-    Line::from(spans)
+    right.push(status);
+    spread(left, right, width)
 }
 
 /// One account: who it is, then every limit it has.
+///
+/// The selected one carries a bar down its whole height, so it reads as one
+/// thing rather than a name with some lines after it.
 fn account_block(
     status: &Status,
     position: usize,
@@ -183,53 +251,86 @@ fn account_block(
 ) -> Vec<Line<'static>> {
     let account = &status.account;
     let identity = &account.identity;
-    let marker = if selected { "▌" } else { " " };
-    let number = Style::new().fg(if selected { Color::White } else { Color::DarkGray });
+    let gutter = || {
+        if selected {
+            Span::styled("┃", Style::new().fg(ACCENT))
+        } else {
+            Span::raw(" ")
+        }
+    };
 
+    let name = if selected {
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD)
+    };
     let mut head = vec![
-        Span::styled(marker.to_string(), Style::new().fg(Color::Cyan)),
-        Span::styled(format!("{position} "), number),
-        Span::styled(
-            account.display_name().to_string(),
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
+        gutter(),
+        Span::styled(format!(" {position}  "), Style::new().fg(DIM)),
+        Span::styled(account.display_name().to_string(), name),
     ];
-    if let Some(org) = identity.workspace_label() {
+    let details: Vec<String> = [
+        identity.workspace_label().map(|org| org.into_owned()),
+        identity.plan_label(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !details.is_empty() {
         head.push(Span::styled(
-            format!("  [{org}]"),
-            Style::new().fg(Color::DarkGray),
+            format!("  {}", details.join(" · ")),
+            Style::new().fg(DIM),
         ));
     }
-    if let Some(plan) = identity.plan_label() {
-        head.push(Span::styled(format!("  {plan}"), Style::new().fg(Color::Blue)));
-    }
-    head.push(Span::raw("  "));
-    head.push(standing(status, position, app, now));
 
-    let mut lines = vec![Line::from(head)];
-    lines.extend(body(status, now, width));
+    let mut lines = vec![spread(head, standing(status, position, app, now), width)];
+    for line in body(status, now, width) {
+        let mut spans = vec![gutter()];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
     lines.push(Line::raw(""));
     lines
+}
+
+/// `left` at the start of a line and `right` a column short of its end, or
+/// simply one after the other when the line is too narrow for both.
+fn spread(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let gap = width
+        .saturating_sub(spans_width(&left) + spans_width(&right) + 1)
+        .max(2);
+    left.push(Span::raw(" ".repeat(gap)));
+    left.extend(right);
+    Line::from(left)
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
 }
 
 /// What is drawn under an account's name: every limit it has, or why it has
 /// none to show.
 fn body(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
     match (&status.account.needs_login, &status.error, &status.usage) {
-        (Some(reason), _, _) => vec![note(format!("sign in again — {reason}"), Color::Red, width)],
-        (None, Some(error), None) => vec![note(format!("no reading — {error}"), Color::Yellow, width)],
+        (Some(reason), _, _) => vec![note(
+            "✗ signed out — press l to sign in again",
+            reason,
+            Color::Red,
+            width,
+        )],
+        (None, Some(error), None) => vec![note("! no reading", error, Color::Yellow, width)],
         (None, error, Some(usage)) => {
             let mut lines: Vec<Line<'static>> = usage
                 .windows
                 .iter()
-                .map(|window| window_line(window, now))
+                .map(|window| window_line(window, now, meter_width(width)))
                 .collect();
             if let Some(error) = error {
-                lines.push(note(format!("not refreshed — {error}"), Color::Yellow, width));
+                lines.push(note("! not refreshed", error, Color::Yellow, width));
             }
             lines
         }
-        (None, None, None) => vec![note("no reading yet — press r".into(), Color::DarkGray, width)],
+        (None, None, None) => vec![note("no reading yet — press r", "", DIM, width)],
     }
 }
 
@@ -250,70 +351,87 @@ pub(super) fn body_height(status: &Status) -> usize {
     }
 }
 
-/// What this account is, in one word: in use, next, or spent.
-fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Span<'static> {
-    if status.active {
-        // A filled badge rather than a word among words: this is the one fact
-        // somebody opens the interface to find.
-        return Span::styled(
-            " IN USE ",
+/// What this account is, in a badge: in use, next, or spent.
+fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Vec<Span<'static>> {
+    let badge = |text: &str, colour: Color| {
+        vec![Span::styled(
+            format!(" {text} "),
             Style::new()
-                .bg(Color::Green)
+                .bg(colour)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
-        );
+        )]
+    };
+    if status.active {
+        // Filled, rather than a word among words: this is the one fact
+        // somebody opens the interface to find.
+        return badge("IN USE", Color::Green);
     }
     if status.account.needs_login.is_some() {
-        return Span::styled("login needed", Style::new().fg(Color::Red));
+        return vec![Span::styled(" login needed ", Style::new().fg(Color::Red))];
     }
     if status
         .usage
         .as_ref()
         .is_some_and(|usage| usage.is_exhausted_at(now))
     {
-        return Span::styled("spent", Style::new().fg(Color::Red));
+        return vec![Span::styled(" spent ", Style::new().fg(Color::Red))];
     }
     // Only meaningful when something is actually choosing: with switching off
     // the order is just an order.
     if app.switching_on(status.account.provider) && position == 2 {
-        return Span::styled("next", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        return vec![Span::styled(
+            " next up ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
     }
-    Span::raw("")
+    Vec::new()
+}
+
+/// How wide the meters are in a window `width` columns across.
+///
+/// Full size where there is room, and narrower rather than cut off where
+/// there is not: everything after the meter on a line — when the window
+/// resets, and whether it is being spent too fast — is worth more than the
+/// meter's resolution.
+fn meter_width(width: usize) -> usize {
+    // Everything else on the longest line a window draws.
+    const REST: usize = 66;
+    width.saturating_sub(REST).clamp(10, BAR)
 }
 
 /// One limit: its name, a meter, the figure, and when it turns over.
-fn window_line(window: &Window, now: Timestamp) -> Line<'static> {
+fn window_line(window: &Window, now: Timestamp, bar: usize) -> Line<'static> {
     let used = window.used_at(now);
     let colour = severity(used);
+    let (filled, track) = meter(used, bar);
     let mut spans = vec![
         Span::raw("    "),
         Span::styled(
             format!("{:<14}", truncate(&window.label(), 14)),
             Style::new().fg(Color::Gray),
         ),
-        Span::styled(meter(used, BAR), Style::new().fg(colour)),
+        Span::styled(filled, Style::new().fg(colour)),
+        Span::styled(track, Style::new().fg(DIM)),
         Span::styled(
-            format!("{used:>4.0}%  "),
+            format!("{used:>5.0}%"),
             Style::new().fg(colour).add_modifier(Modifier::BOLD),
         ),
     ];
 
     match window.resets_at {
         Some(at) if at > now => spans.push(Span::styled(
-            format!("resets {}", timefmt::until(now, at)),
-            Style::new().fg(Color::DarkGray),
+            format!("   resets in {}", timefmt::until(now, at)),
+            Style::new().fg(DIM),
         )),
-        Some(_) => spans.push(Span::styled(
-            "resetting".to_string(),
-            Style::new().fg(Color::DarkGray),
-        )),
+        Some(_) => spans.push(Span::styled("   resetting", Style::new().fg(DIM))),
         None => {}
     }
     // Spending faster than the window refills is the thing a percentage alone
     // cannot say: 60% of a week is fine on day five and a warning on day two.
     if let Some(over) = ahead_of_pace(window, now) {
         spans.push(Span::styled(
-            format!("  ({over:.0}% ahead of pace)"),
+            format!("   ▲ {over:.0}% ahead of pace"),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -339,19 +457,39 @@ fn ahead_of_pace(window: &Window, now: Timestamp) -> Option<f64> {
     (over > PACE_SLACK).then_some(over)
 }
 
-fn note(text: String, colour: Color, width: usize) -> Line<'static> {
+/// Why an account has no figures: what it means in `colour`, then the
+/// provider's own words, dimmed, since they explain rather than instruct.
+fn note(headline: &str, detail: &str, colour: Color, width: usize) -> Line<'static> {
     // Provider messages run long, and a line that overruns the window is cut
     // mid-word with no sign that anything is missing.
-    Line::from(vec![
+    let room = width.saturating_sub(6);
+    let headline = truncate(headline, room);
+    let mut spans = vec![
         Span::raw("    "),
-        Span::styled(truncate(&text, width.saturating_sub(6)), Style::new().fg(colour)),
-    ])
+        Span::styled(headline.clone(), Style::new().fg(colour)),
+    ];
+    let left = room.saturating_sub(headline.chars().count() + 3);
+    if !detail.is_empty() && left > 0 {
+        spans.push(Span::styled(
+            format!(" · {}", truncate(detail, left)),
+            Style::new().fg(DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
-/// A meter: `███████░░░░░░░`.
-fn meter(used: f64, width: usize) -> String {
-    let filled = ((used / 100.0).clamp(0.0, 1.0) * width as f64).round() as usize;
-    format!("{}{} ", "█".repeat(filled), "░".repeat(width - filled))
+/// A meter, as the part used and the part left: `━━━━━━╸` and `━━━━━━━━`.
+///
+/// Drawn to half a cell, so two figures a few points apart do not draw the
+/// same bar. The two parts are coloured separately by the caller.
+fn meter(used: f64, width: usize) -> (String, String) {
+    let halves = ((used / 100.0).clamp(0.0, 1.0) * (width * 2) as f64).round() as usize;
+    let (full, half) = (halves / 2, halves % 2);
+    let mut filled = "━".repeat(full);
+    if half == 1 {
+        filled.push('╸');
+    }
+    (filled, "━".repeat(width - full - half))
 }
 
 fn severity(used: f64) -> Color {
@@ -382,16 +520,64 @@ fn truncate(text: &str, width: usize) -> String {
     cut
 }
 
+/// `text` broken into lines of at most `width` characters, at spaces where
+/// there are any.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_string();
+        // A word longer than a whole line is split wherever it has to be.
+        while word.chars().count() > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let rest = word.chars().skip(width).collect();
+            lines.push(word.chars().take(width).collect());
+            word = rest;
+        }
+        let needed = line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
+        if needed > width && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The spinner's current frame, counted from when the interface started so
+/// it turns at the same speed however often the screen is drawn.
+fn spinner(app: &App) -> &'static str {
+    SPINNER[(app.epoch.elapsed().as_millis() / 80) as usize % SPINNER.len()]
+}
+
 fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.saturating_sub(4) as usize;
     let line = if let Some(busy) = &app.busy {
-        Line::from(Span::styled(busy.clone(), Style::new().fg(Color::Cyan)))
+        Line::from(vec![
+            Span::styled(format!(" {} ", spinner(app)), Style::new().fg(ACCENT)),
+            Span::styled(truncate(busy, width), Style::new().fg(ACCENT)),
+        ])
     } else if let Some(message) = &app.message {
-        let colour = if message.is_error {
-            Color::Red
+        let (mark, colour) = if message.is_error {
+            ("✗", Color::Red)
         } else {
-            Color::Green
+            ("✓", Color::Green)
         };
-        Line::from(Span::styled(message.text.clone(), Style::new().fg(colour)))
+        Line::from(vec![
+            Span::styled(
+                format!(" {mark} "),
+                Style::new().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate(&message.text, width), Style::new().fg(colour)),
+        ])
     } else {
         Line::raw("")
     };
@@ -402,8 +588,26 @@ fn draw_message(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
     let keys: Vec<(&str, String)> = match &app.mode {
         Mode::Help => vec![("any key", "close".into())],
-        Mode::ChooseProvider(_) => vec![("1 2", "choose an agent".into()), ("esc", "cancel".into())],
+        Mode::ChooseProvider { .. } => vec![
+            ("↑↓", "choose".into()),
+            ("enter", "confirm".into()),
+            ("esc", "cancel".into()),
+        ],
         Mode::ConfirmRemove { .. } => vec![("y", "remove".into()), ("any key", "cancel".into())],
+        Mode::Login => match &app.login {
+            Some(login) if !login.is_running() => vec![("esc", "close".into())],
+            Some(login) if login.wants_input() => vec![
+                ("enter", "submit code".into()),
+                ("ctrl+o", "open link".into()),
+                ("ctrl+y", "copy link".into()),
+                ("esc", "cancel".into()),
+            ],
+            _ => vec![
+                ("o", "open link".into()),
+                ("y", "copy link".into()),
+                ("esc", "cancel".into()),
+            ],
+        },
         Mode::Browse => {
             // Named for the harness the selection is in, since that is what the
             // key will act on.
@@ -414,8 +618,9 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             };
             vec![
                 ("enter", "use".into()),
+                ("l", "sign in".into()),
                 ("w", switching),
-                ("p", "by agent".into()),
+                ("tab", "agents".into()),
                 ("r", "refresh".into()),
                 ("a", "add".into()),
                 ("i", "import".into()),
@@ -428,90 +633,210 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
 
     // Built until it fills the width and no further: a bar that runs off the
     // edge hides the keys at its end, which are still keys somebody needs.
-    let mut spans = Vec::new();
-    let mut used = 0usize;
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1usize;
     for (key, what) in keys {
-        let width = key.chars().count() + what.chars().count() + 5;
+        let width = key.chars().count() + what.chars().count() + 4;
         if used + width > area.width as usize {
             break;
         }
         used += width;
         spans.push(Span::styled(
-            format!(" {key} "),
-            Style::new().bg(Color::DarkGray).fg(Color::White),
+            key.to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {what}  "), Style::new().fg(Color::Gray)));
+        spans.push(Span::styled(format!(" {what}   "), Style::new().fg(DIM)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help(frame: &mut Frame) {
+    let row = |key: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!("{key:<12}"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(what),
+        ])
+    };
     let lines = vec![
-        Line::from("↑ ↓ / j k    select an account".to_string()),
-        Line::from("enter, u     sign the agent CLI in to it".to_string()),
-        Line::from("r            read usage now".to_string()),
-        Line::from("p            show one agent at a time, or all".to_string()),
-        Line::from("a            log in to a new account".to_string()),
-        Line::from("i            import the account a CLI is signed in to".to_string()),
-        Line::from("d            forget the selected account".to_string()),
-        Line::from("w            switch automatically as limits approach".to_string()),
-        Line::from("q, esc       quit".to_string()),
-        Line::from(""),
-        Line::from("With switching on, accounts are listed in the order they".to_string()),
-        Line::from("will be taken: the one in use first, then the one next.".to_string()),
-        Line::from(""),
+        row("↑ ↓  j k", "select an account"),
+        row("enter  u", "sign the agent CLI in to it"),
+        row("l", "sign in to the selected account again"),
+        row("a", "log in to a new account"),
+        row("i", "import the account a CLI is signed in to"),
+        row("d", "forget the selected account"),
+        row("w", "switch automatically as limits approach"),
+        row("tab  p", "show one agent at a time, or all"),
+        row("r", "read usage now"),
+        row("q  esc", "quit"),
+        Line::raw(""),
         Line::from(Span::styled(
-            "Press any key to close",
-            Style::new().fg(Color::DarkGray),
+            "With switching on, accounts are listed in the order they",
+            Style::new().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "will be taken: the one in use first, then the one next.",
+            Style::new().fg(DIM),
         )),
     ];
-    let area = popup(frame.area(), 62, lines.len() as u16 + 2);
+    let area = popup(frame.area(), 64, lines.len() as u16 + 4);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(bordered("Keys")), area);
+    frame.render_widget(Paragraph::new(lines).block(dialog("Keys")), area);
 }
 
-fn draw_provider_chooser(frame: &mut Frame, action: ProviderAction) {
-    let mut lines = vec![Line::from(action.title()), Line::from("")];
-    for (index, provider) in ProviderKind::ALL.iter().enumerate() {
-        lines.push(Line::from(format!(
-            "  {}  {}",
-            index + 1,
-            provider.display_name()
-        )));
+fn draw_provider_chooser(frame: &mut Frame, action: ProviderAction, index: usize) {
+    let mut lines = vec![
+        Line::from(Span::styled(action.title(), Style::new().fg(DIM))),
+        Line::raw(""),
+    ];
+    for (at, provider) in ProviderKind::ALL.iter().enumerate() {
+        let (marker, style) = if at == index {
+            ("▸", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            (" ", Style::new())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::new().fg(ACCENT)),
+            Span::styled(format!("{}  ", at + 1), Style::new().fg(DIM)),
+            Span::styled(provider.display_name(), style),
+        ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Any other key cancels",
-        Style::new().fg(Color::DarkGray),
-    )));
 
-    let area = popup(frame.area(), 46, lines.len() as u16 + 2);
+    let area = popup(frame.area(), 46, lines.len() as u16 + 4);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(bordered("Which agent?")), area);
+    frame.render_widget(Paragraph::new(lines).block(dialog("Which agent?")), area);
 }
 
 fn draw_confirm_remove(frame: &mut Frame, id: &str, name: &str) {
     let lines = vec![
-        Line::from(format!("Remove {id} ({name})?")),
-        Line::from(""),
-        Line::from("The account itself is untouched: agent-meter just"),
-        Line::from("forgets it, and you can add it back by signing in."),
-        Line::from(""),
+        Line::from(vec![
+            Span::raw("Remove "),
+            Span::styled(id.to_string(), Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" ({name})?")),
+        ]),
+        Line::raw(""),
         Line::from(Span::styled(
-            "y to remove, any other key to cancel",
-            Style::new().fg(Color::DarkGray),
+            "The account itself is untouched: agent-meter just",
+            Style::new().fg(DIM),
         )),
+        Line::from(Span::styled(
+            "forgets it, and you can add it back by signing in.",
+            Style::new().fg(DIM),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" remove   ", Style::new().fg(DIM)),
+            Span::styled("any key", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", Style::new().fg(DIM)),
+        ]),
     ];
-    let area = popup(frame.area(), 56, lines.len() as u16 + 2);
+    let area = popup(frame.area(), 58, lines.len() as u16 + 4);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(bordered("Remove account")), area);
+    frame.render_widget(Paragraph::new(lines).block(dialog("Remove account")), area);
 }
 
-fn bordered(title: &str) -> Block<'_> {
+/// The login panel: where the sign-in page is, a field for the code it may
+/// hand back, and what the CLI has said.
+fn draw_login(frame: &mut Frame, login: &Login, spinner: &str) {
+    let screen = frame.area();
+    // The tallest it may be; it is drawn only as tall as what it holds.
+    let limit = popup(screen, 86, screen.height.saturating_sub(4).clamp(12, 22));
+    let inner = limit.width.saturating_sub(4) as usize;
+    let label = |text: &'static str| Line::from(Span::styled(text, Style::new().fg(DIM)));
+
+    let mut lines = Vec::new();
+    match &login.state {
+        login::State::Failed(error) => {
+            for (at, line) in wrap(error, inner.saturating_sub(2)).into_iter().enumerate() {
+                let mark = if at == 0 { "✗ " } else { "  " };
+                lines.push(Line::from(Span::styled(
+                    format!("{mark}{line}"),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+        }
+        _ => {
+            let elapsed = login.started.elapsed().as_secs();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{spinner} "), Style::new().fg(ACCENT)),
+                Span::raw("Waiting for you to sign in in your browser…"),
+                Span::styled(
+                    format!("  {}:{:02}", elapsed / 60, elapsed % 60),
+                    Style::new().fg(DIM),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+
+    lines.push(label("Sign-in page"));
+    match login.link() {
+        Some(link) => lines.push(Line::from(Span::styled(
+            truncate(link, inner),
+            Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            format!("Starting {}…", login.provider.display_name()),
+            Style::new().fg(DIM),
+        ))),
+    }
+
+    if login.is_running() && login.wants_input() {
+        lines.push(Line::raw(""));
+        lines.push(label("If the page shows a code, paste it here and press enter"));
+        // The end of what was typed, when it is longer than the field.
+        let room = inner.saturating_sub(3);
+        let typed: String = {
+            let count = login.input.chars().count();
+            login.input.chars().skip(count.saturating_sub(room)).collect()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("› ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(typed),
+            Span::styled("█", Style::new().fg(ACCENT)),
+        ]));
+    }
+
+    // What the CLI said, newest last, in whatever room is left.
+    let output = login.lines();
+    // Borders, the padding above, and a blank line below.
+    let frame_lines = 4;
+    let room = (limit.height as usize)
+        .saturating_sub(frame_lines)
+        .saturating_sub(lines.len() + 2);
+    if room > 0 && !output.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(label("Output"));
+        for line in output.iter().skip(output.len().saturating_sub(room)) {
+            lines.push(Line::from(Span::styled(
+                truncate(line, inner),
+                Style::new().fg(Color::Gray),
+            )));
+        }
+    }
+
+    let title = match &login.account {
+        Some(account) => format!("Sign in to {account} again"),
+        None => format!("Log in to a new {} account", login.provider.display_name()),
+    };
+    let area = popup(screen, limit.width, (lines.len() + frame_lines) as u16);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(dialog(&title)), area);
+}
+
+/// A dialog's frame: rounded, in the accent colour, with room inside.
+fn dialog(title: &str) -> Block<'_> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::DarkGray))
-        .title(format!(" {title} "))
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::new(1, 1, 1, 0))
 }
 
 /// Centres a box of the given size, shrinking it to fit a small terminal.
@@ -664,6 +989,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wrapping_breaks_at_spaces_and_splits_only_what_cannot_fit() {
+        assert_eq!(
+            wrap("the login exited with 1", 10),
+            ["the login", "exited", "with 1"]
+        );
+        assert_eq!(wrap("abcdefghijkl", 5), ["abcde", "fghij", "kl"]);
+        for line in wrap(
+            "просроченный токен обновления — https://example.com/very/long/path",
+            7,
+        ) {
+            assert!(line.chars().count() <= 7, "{line:?}");
+        }
+    }
+
     /// Every limit of every account is on screen at once — the point of the
     /// layout, since the worst window alone does not say whether an account is
     /// spent for an hour or for days.
@@ -693,7 +1033,7 @@ mod tests {
             "{screen}"
         );
         // Resets are on the same line as the figure they belong to.
-        assert!(screen.contains("resets 3h"), "{screen}");
+        assert!(screen.contains("resets in 3h"), "{screen}");
         // The account in use says so.
         assert!(
             screen.contains("IN USE"),
@@ -702,6 +1042,19 @@ mod tests {
         );
         // And the harness groups them.
         assert!(screen.contains("Claude Code"), "{screen}");
+    }
+
+    /// A badge is pushed against the right edge, but never past it: at any
+    /// width the status of an account is on screen.
+    #[test]
+    fn the_badge_stays_on_screen_at_every_width() {
+        let mut app = App::for_tests(crate::tui::app::sample_statuses(1));
+        for width in [60u16, 80, 110, 160] {
+            let screen = render(&mut app, width, 20);
+            assert!(screen.contains("IN USE"), "at {width}:\n{screen}");
+            let line = screen.lines().find(|line| line.contains("IN USE")).unwrap();
+            assert!(line.chars().count() <= width as usize);
+        }
     }
 
     /// With switching on the list is the queue, so the account that would be
@@ -713,15 +1066,18 @@ mod tests {
         statuses[1].usage = Some(usage(vec![window(FIVE_HOURS, None, 5.0, 3600)]));
 
         let mut app = App::for_tests(statuses);
+        let screen = render(&mut app, 110, 30);
         assert!(
-            !render(&mut app, 110, 30).contains("next"),
+            !screen.contains("next up"),
             "with switching off the order is just an order"
         );
+        assert!(screen.contains("○ manual"), "{screen}");
 
         app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
         let screen = render(&mut app, 110, 30);
-        assert!(screen.contains("next"), "{screen}");
+        assert!(screen.contains("next up"), "{screen}");
         assert!(screen.contains("in the order they will be taken"), "{screen}");
+        assert!(screen.contains("● auto at 90%"), "{screen}");
     }
 
     /// Spending a window faster than it refills is the thing a percentage
@@ -745,11 +1101,20 @@ mod tests {
     }
 
     #[test]
-    fn meters_scale_and_never_overflow() {
-        assert_eq!(meter(0.0, 10), "░░░░░░░░░░ ");
-        assert_eq!(meter(50.0, 10), "█████░░░░░ ");
-        assert_eq!(meter(100.0, 10), "██████████ ");
-        assert_eq!(meter(140.0, 10), "██████████ ");
+    fn meters_scale_to_half_a_cell_and_never_overflow() {
+        let drawn = |used| {
+            let (filled, track) = meter(used, 10);
+            format!("{filled}|{track}")
+        };
+        assert_eq!(drawn(0.0), "|━━━━━━━━━━");
+        assert_eq!(drawn(50.0), "━━━━━|━━━━━");
+        assert_eq!(drawn(55.0), "━━━━━╸|━━━━");
+        assert_eq!(drawn(100.0), "━━━━━━━━━━|");
+        assert_eq!(drawn(140.0), "━━━━━━━━━━|");
+        for used in 0..=100 {
+            let (filled, track) = meter(used as f64, BAR);
+            assert_eq!(filled.chars().count() + track.chars().count(), BAR, "{used}%");
+        }
     }
 
     #[test]
@@ -763,9 +1128,22 @@ mod tests {
     #[test]
     fn renders_in_a_very_small_terminal_without_panicking() {
         let mut app = App::for_tests(crate::tui::app::sample_statuses(3));
-        app.mode = Mode::Help;
-        for (width, height) in [(20u16, 5u16), (40, 10), (200, 60)] {
-            render(&mut app, width, height);
+        for mode in [
+            Mode::Help,
+            Mode::ChooseProvider {
+                action: ProviderAction::Add,
+                index: 1,
+            },
+            Mode::ConfirmRemove {
+                id: "claude-1".into(),
+                name: "a very long name that will not fit anywhere".into(),
+            },
+            Mode::Browse,
+        ] {
+            app.mode = mode;
+            for (width, height) in [(1u16, 1u16), (20, 5), (40, 10), (200, 60)] {
+                render(&mut app, width, height);
+            }
         }
     }
 
@@ -773,6 +1151,19 @@ mod tests {
     fn draws_guidance_when_there_are_no_accounts() {
         let screen = render(&mut App::for_tests(Vec::new()), 80, 20);
         assert!(screen.contains("No accounts yet"), "{screen}");
+    }
+
+    /// The header says which agents there are and which one is showing.
+    #[test]
+    fn the_header_has_a_tab_for_every_agent_with_its_count() {
+        let mut statuses = crate::tui::app::sample_statuses(3);
+        statuses[2].account.id = "codex-1".into();
+        statuses[2].account.provider = ProviderKind::Codex;
+        let screen = render(&mut App::for_tests(statuses), 110, 20);
+        let header = screen.lines().next().unwrap();
+        assert!(header.contains("All 3"), "{header}");
+        assert!(header.contains("Claude Code 2"), "{header}");
+        assert!(header.contains("Codex 1"), "{header}");
     }
 
     #[test]
@@ -785,11 +1176,14 @@ mod tests {
         let screen = render(&mut app, 80, 24);
         assert!(screen.contains("Remove claude-1 (dev@example.com)?"), "{screen}");
 
-        app.mode = Mode::ChooseProvider(ProviderAction::Add);
+        app.mode = Mode::ChooseProvider {
+            action: ProviderAction::Add,
+            index: 1,
+        };
         let screen = render(&mut app, 80, 24);
         assert!(
-            screen.contains("1  Claude Code") && screen.contains("2  Codex"),
-            "{screen}"
+            screen.contains("1  Claude Code") && screen.contains("▸ 2  Codex"),
+            "the cursor is on the second agent:\n{screen}"
         );
     }
 }

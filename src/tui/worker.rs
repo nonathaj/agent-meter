@@ -110,11 +110,15 @@ fn run_job(engine: &Engine, job: &Job) -> Result<String> {
         Job::Poll { force } => {
             let results = engine.poll(&[], *force)?;
             let failed = results.iter().filter(|(_, r)| r.is_err()).count();
-            Ok(match (results.len(), failed) {
-                (0, _) => "Usage is already up to date".into(),
-                (total, 0) => format!("Read usage for {total} account(s)"),
-                (total, failed) => format!("Read usage for {} of {total} account(s)", total - failed),
-            })
+            match (results.len(), failed) {
+                (0, _) => Ok("Usage is already up to date".into()),
+                (total, 0) => Ok(format!("Read usage for {total} account(s)")),
+                // Nothing worked, which is a failure however it is counted.
+                (total, failed) if failed == total => {
+                    anyhow::bail!("Could not read usage for any of {total} account(s)")
+                }
+                (total, failed) => Ok(format!("Read usage for {} of {total} account(s)", total - failed)),
+            }
         }
         Job::Switch(id) => {
             let outcome = engine.switch_to(id)?;

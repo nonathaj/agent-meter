@@ -76,6 +76,54 @@ fn update_explains_how_to_get_the_missing_release_updater() {
     assert!(stderr.contains("release installer"), "{stderr}");
 }
 
+/// Windows will not let the file a running program was started from be
+/// written, and `update` is still running while the updater installs over it.
+/// The stand-in updater is `cmd`, which, handed commands on its input, does
+/// what the installer does: writes the new executable where the old one is.
+#[cfg(windows)]
+#[test]
+fn update_can_replace_the_running_executable_on_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("agent-meter.exe");
+    std::fs::copy(assert_cmd::cargo::cargo_bin("agent-meter"), &exe).unwrap();
+    let system = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+    std::fs::copy(
+        Path::new(&system).join("System32").join("cmd.exe"),
+        dir.path().join("agent-meter-update.exe"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("new.exe"), "the new release").unwrap();
+
+    let update = |install: &str| {
+        assert_cmd::Command::new(&exe)
+            .arg("update")
+            .current_dir(dir.path())
+            .env("AGENT_METER_DIR", dir.path().join("not-a-directory"))
+            .write_stdin(format!("{install}\r\nexit %errorlevel%\r\n"))
+            .output()
+            .unwrap()
+    };
+
+    let output = update("copy /y new.exe agent-meter.exe");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(std::fs::read_to_string(&exe).unwrap(), "the new release");
+
+    // An install that fails before writing anything leaves agent-meter where
+    // it was, still able to run.
+    std::fs::copy(assert_cmd::cargo::cargo_bin("agent-meter"), &exe).unwrap();
+    let output = update("exit 5");
+    assert_eq!(output.status.code(), Some(5));
+    assert!(
+        exe.is_file(),
+        "agent-meter must be put back after a failed install"
+    );
+    Command::new(&exe).arg("--version").assert().success();
+}
+
 /// A temporary machine: an agent-meter data directory plus one home per agent CLI.
 struct Fixture {
     _dir: tempfile::TempDir,

@@ -137,18 +137,57 @@ fn update(args: &UpdateArgs) -> Result<ExitCode> {
         use std::os::unix::process::CommandExt;
         Err(command.exec()).with_context(|| format!("running {}", updater.display()))
     }
+    // Windows has no exec, and will not let the file a running program was
+    // started from be written: the updater's install failed on it every
+    // time. It does let that file be renamed, so this executable steps aside
+    // for the new one and runs on from its new name until the update is over.
     #[cfg(not(unix))]
     {
+        let aside = step_aside();
         let status = command
             .status()
-            .with_context(|| format!("running {}", updater.display()))?;
+            .with_context(|| format!("running {}", updater.display()));
+        if let Some((exe, aside)) = aside {
+            // Nothing took its place, so the install failed before writing
+            // it: agent-meter must still be there to run.
+            if !exe.exists() {
+                let _ = std::fs::rename(&aside, &exe);
+            }
+        }
         Ok(ExitCode::from(
-            status
+            status?
                 .code()
                 .and_then(|code| u8::try_from(code).ok())
                 .unwrap_or(1),
         ))
     }
+}
+
+/// Moves this executable out of the way of its replacement, returning where
+/// it was and where it went.
+///
+/// The name it moves to carries the process id, so it cannot collide with an
+/// earlier update's leftover that is still running — a `watch` started before
+/// that update, say. Leftovers that are no longer running are deleted here;
+/// the one made now cannot be until this process ends, and goes next time.
+/// Best effort throughout: if it cannot step aside, the updater runs anyway and
+/// says what went wrong.
+#[cfg(not(unix))]
+fn step_aside() -> Option<(PathBuf, PathBuf)> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{stem}.")) && name.ends_with(".old") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let aside = dir.join(format!("{stem}.{}.old", std::process::id()));
+    std::fs::rename(&exe, &aside).ok()?;
+    Some((exe, aside))
 }
 
 #[derive(Args, Debug)]

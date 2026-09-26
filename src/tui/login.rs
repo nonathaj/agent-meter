@@ -41,8 +41,12 @@ enum Event {
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
     Running,
-    /// It stored an account. The panel closes on its own when it sees this.
-    Succeeded(String),
+    /// It stored the account `id`, as `note` says. The panel closes on its
+    /// own when it sees this.
+    Succeeded {
+        id: String,
+        note: String,
+    },
     /// It failed, or was cancelled; the panel stays up so the reason can be
     /// read alongside what the CLI said.
     Failed(String),
@@ -119,10 +123,16 @@ impl Login {
             match self.events.try_recv() {
                 Ok(Event::Output(text)) => self.transcript.push(&text),
                 Ok(Event::Done(Ok(outcome))) => {
-                    self.state = State::Succeeded(match outcome {
-                        AddOutcome::Added { id } => format!("Added {id}"),
-                        AddOutcome::Updated { id } => format!("Signed in to {id} again"),
-                    });
+                    self.state = match outcome {
+                        AddOutcome::Added { id } => State::Succeeded {
+                            note: format!("Added {id}"),
+                            id,
+                        },
+                        AddOutcome::Updated { id } => State::Succeeded {
+                            note: format!("Signed in to {id} again"),
+                            id,
+                        },
+                    };
                 }
                 Ok(Event::Done(Err(error))) => self.state = State::Failed(error),
                 Err(TryRecvError::Empty) => break,

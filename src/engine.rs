@@ -394,6 +394,13 @@ impl Engine {
             // the CLI's own record of the account — describes that credential,
             // so it travels with it or not at all.
             if supersedes(&captured.credential, &account.credential) {
+                // A different credential, not the same one offered again: the
+                // polls that failed were failing with the one it replaces.
+                if captured.credential.refresh_token != account.credential.refresh_token {
+                    let mut cache = self.store.usage_cache()?;
+                    cache.clear_failure(&account.id);
+                    self.store.put_usage_cache(&cache)?;
+                }
                 account.credential = captured.credential;
                 account.needs_login = None;
                 overlay_provider_data(&mut account.provider_data, captured.provider_data);
@@ -1187,6 +1194,68 @@ mod tests {
             },
             provider_data: Map::new(),
         }
+    }
+
+    /// Signing back in to an account the provider had rejected replaces the
+    /// credential its polls failed with, so the failure — and the backoff it
+    /// built up — belongs to a credential that is gone. Kept, it went on being
+    /// shown as the account's state, and held the account out of the next
+    /// poll, until somebody forced a refresh.
+    #[test]
+    fn signing_back_in_forgets_the_failures_of_the_credential_it_replaces() {
+        let (_tmp, engine) = engine();
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r1"), None)
+            .unwrap();
+        let fail = || {
+            let mut cache = engine.store().usage_cache().unwrap();
+            cache.record_success(
+                "claude-1",
+                crate::usage::Usage {
+                    observed_at: Timestamp::now(),
+                    windows: Vec::new(),
+                    limit_reached: false,
+                },
+            );
+            for _ in 0..3 {
+                cache.record_failure(
+                    "claude-1",
+                    "invalid_grant".into(),
+                    Some(Timestamp::now() + std::time::Duration::from_secs(3600)),
+                );
+            }
+            engine.store().put_usage_cache(&cache).unwrap();
+        };
+        let entry = || {
+            engine
+                .store()
+                .usage_cache()
+                .unwrap()
+                .get("claude-1")
+                .cloned()
+                .unwrap()
+        };
+
+        // The same credential offered again is still the one that failed.
+        fail();
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r1"), None)
+            .unwrap();
+        assert_eq!(entry().error.as_deref(), Some("invalid_grant"));
+
+        // A new one is not.
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r2"), None)
+            .unwrap();
+        let entry = entry();
+        assert_eq!(entry.error, None);
+        assert_eq!(entry.failed_at, None);
+        assert_eq!(entry.retry_after, None);
+        assert_eq!(entry.failures, 0);
+        assert!(
+            entry.usage.is_some(),
+            "the last reading is still the best there is"
+        );
     }
 
     #[test]

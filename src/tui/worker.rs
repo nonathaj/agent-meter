@@ -14,6 +14,8 @@ use crate::store::Store;
 pub enum Job {
     /// Poll usage for every account.
     Poll { force: bool },
+    /// Read usage for this one account now, whether or not it is due.
+    Read(String),
     /// Sign the agent CLI in to this account.
     Switch(String),
     /// Forget this account.
@@ -31,6 +33,7 @@ impl Job {
     pub fn describe(&self) -> String {
         match self {
             Job::Poll { .. } => "Reading usage…".into(),
+            Job::Read(id) => format!("Reading usage for {id}…"),
             Job::Switch(id) => format!("Switching to {id}…"),
             Job::Remove(id) => format!("Removing {id}…"),
             Job::Import(provider) => format!("Importing from {}…", provider.display_name()),
@@ -120,6 +123,10 @@ fn run_job(engine: &Engine, job: &Job) -> Result<String> {
                 (total, failed) => Ok(format!("Read usage for {} of {total} account(s)", total - failed)),
             }
         }
+        Job::Read(id) => match engine.poll(std::slice::from_ref(id), true)?.pop() {
+            Some((_, Err(error))) => anyhow::bail!("Could not read usage for {id}: {error}"),
+            _ => Ok(format!("Read usage for {id}")),
+        },
         Job::Switch(id) => {
             let outcome = engine.switch_to(id)?;
             let mut note = match &outcome.from {

@@ -271,6 +271,19 @@ impl UsageCache {
         entry.failures = 0;
     }
 
+    /// Forgets that polling this account has been failing, keeping its last
+    /// reading. For when the credential those polls failed with is replaced:
+    /// the failures say nothing about the new one, and their backoff would
+    /// hold it out of the next poll.
+    pub fn clear_failure(&mut self, id: &str) {
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.error = None;
+            entry.failed_at = None;
+            entry.retry_after = None;
+            entry.failures = 0;
+        }
+    }
+
     /// Records a failed poll. The previous reading is kept so the UI can still
     /// show something, marked stale by its own timestamp.
     pub fn record_failure(&mut self, id: &str, error: String, retry_after: Option<Timestamp>) {

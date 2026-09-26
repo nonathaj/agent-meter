@@ -87,6 +87,8 @@ pub struct App {
     pub message: Option<Message>,
     /// Set while the worker is busy.
     pub busy: Option<String>,
+    /// Jobs asked for while the worker was busy, to run in turn after it.
+    queued: std::collections::VecDeque<Job>,
     /// Which harnesses switch automatically, as the configuration says.
     pub switching: Vec<(ProviderKind, bool)>,
     pub threshold: f64,
@@ -119,6 +121,7 @@ impl App {
             mode: Mode::Browse,
             message: None,
             busy: None,
+            queued: std::collections::VecDeque::new(),
             switching: Vec::new(),
             threshold: engine.config().watch.threshold,
             login: None,
@@ -155,6 +158,7 @@ impl App {
             mode: Mode::Browse,
             message: None,
             busy: None,
+            queued: std::collections::VecDeque::new(),
             switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
             threshold: 90.0,
             login: None,
@@ -436,6 +440,9 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
                 Err(error) => app.fail(error),
             }
             app.reload(engine)?;
+            if let Some(job) = app.queued.pop_front() {
+                submit(&mut app, &worker, job);
+            }
         }
 
         follow_login(&mut app, engine, &worker)?;
@@ -473,20 +480,29 @@ fn follow_login(app: &mut App, engine: &Engine, worker: &Worker) -> Result<()> {
         return Ok(());
     };
     login.update();
-    if let login::State::Succeeded(note) = login.state.clone() {
+    if let login::State::Succeeded { id, note } = login.state.clone() {
         app.login = None;
         app.mode = Mode::Browse;
         app.note(note);
         app.reload(engine)?;
-        // A first reading makes the new account eligible for switching. Not
-        // forced: only the account that has never been read is due.
-        submit(app, worker, Job::Poll { force: false });
+        // Read now, whatever the interval says: a first reading is what makes
+        // a new account eligible for switching, and an account signed back in
+        // to is still showing the figures from before it was signed out.
+        submit(app, worker, Job::Read(id));
     }
     Ok(())
 }
 
+/// Hands `job` to the worker, or queues it behind the one running.
+///
+/// Queued rather than dropped: a job dropped because a poll or a tick
+/// happened to be running is one the user asked for and never got, with
+/// nothing on screen to say so. The same job queued twice runs once.
 fn submit(app: &mut App, worker: &Worker, job: Job) {
     if app.busy.is_some() {
+        if !app.queued.contains(&job) {
+            app.queued.push_back(job);
+        }
         return;
     }
     if worker.submit(job.clone()) {
@@ -863,6 +879,25 @@ mod tests {
         assert_eq!(choose_provider_key(0, key(KeyCode::Char('9'))), Choice::Cancel);
         assert_eq!(choose_provider_key(0, key(KeyCode::Char('0'))), Choice::Cancel);
         assert_eq!(choose_provider_key(0, key(KeyCode::Esc)), Choice::Cancel);
+    }
+
+    /// A job asked for while another runs is one the user wanted: after a
+    /// login, the read of the account signed in to was being thrown away
+    /// whenever a poll or a tick happened to be running.
+    #[test]
+    fn a_job_asked_for_while_busy_waits_its_turn_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = Worker::spawn(Store::open(dir.path().join("data")).unwrap()).unwrap();
+        let mut app = app_with(1);
+        app.busy = Some("Checking whether to switch…".into());
+
+        submit(&mut app, &worker, Job::Read("claude-1".into()));
+        submit(&mut app, &worker, Job::Read("claude-1".into()));
+        submit(&mut app, &worker, Job::Poll { force: true });
+        assert_eq!(
+            Vec::from(app.queued.clone()),
+            [Job::Read("claude-1".into()), Job::Poll { force: true }]
+        );
     }
 
     #[test]

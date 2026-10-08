@@ -41,11 +41,13 @@ enum Event {
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
     Running,
-    /// It stored the account `id`, as `note` says. The panel closes on its
-    /// own when it sees this.
+    /// It stored the account `id`, as `note` says: `added` when it is new
+    /// here, rather than one already stored signing in again. The panel
+    /// closes on its own when it sees this.
     Succeeded {
         id: String,
         note: String,
+        added: bool,
     },
     /// It failed, or was cancelled; the panel stays up so the reason can be
     /// read alongside what the CLI said.
@@ -73,8 +75,13 @@ impl Login {
     ///
     /// `account` names the stored account this is expected to sign back in
     /// to; it is only shown, since whichever account the user actually signs
-    /// in to is the one that gets stored.
-    pub fn start(store: Store, provider: ProviderKind, account: Option<String>) -> Result<Self> {
+    /// in to is the one that gets stored. `label` names the account stored.
+    pub fn start(
+        store: Store,
+        provider: ProviderKind,
+        account: Option<String>,
+        label: Option<String>,
+    ) -> Result<Self> {
         let (tx, events) = channel();
         let stdin = Arc::new(Mutex::new(None));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -87,7 +94,7 @@ impl Login {
                 .spawn(move || {
                     let outcome = Engine::with_store(store)
                         .and_then(|engine| {
-                            engine.login(provider, None, false, |command| {
+                            engine.login(provider, label, false, |command| {
                                 run_piped(command, &tx, &stdin, &cancel)
                             })
                         })
@@ -95,7 +102,8 @@ impl Login {
                             if cancel.load(Ordering::SeqCst) {
                                 "Login cancelled. Nothing was added.".to_string()
                             } else {
-                                format!("{error:#}")
+                                // A program may be passing this on.
+                                crate::config::said_elsewhere(&error)
                             }
                         });
                     let _ = tx.send(Event::Done(outcome));
@@ -127,10 +135,12 @@ impl Login {
                         AddOutcome::Added { id } => State::Succeeded {
                             note: format!("Added {id}"),
                             id,
+                            added: true,
                         },
                         AddOutcome::Updated { id } => State::Succeeded {
                             note: format!("Signed in to {id} again"),
                             id,
+                            added: false,
                         },
                     };
                 }
@@ -182,6 +192,11 @@ impl Login {
     /// The page the CLI wants opened, once it has said which.
     pub fn link(&self) -> Option<&str> {
         self.transcript.link()
+    }
+
+    /// [`Self::link`], once the whole of it has arrived.
+    pub fn settled_link(&self) -> Option<&str> {
+        self.transcript.settled_link()
     }
 
     /// Whether the CLI has asked for something to be pasted back to it.
@@ -381,13 +396,35 @@ impl Transcript {
     /// The first web page the CLI named. Codex names its own local callback
     /// server before the sign-in page, which is plain http and not for people.
     fn link(&self) -> Option<&str> {
-        self.lines.iter().chain([&self.partial]).find_map(|line| {
-            let start = line.find("https://")?;
-            let rest = &line[start..];
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            Some(rest[..end].trim_end_matches(['.', ',', ')']))
-        })
+        self.lines
+            .iter()
+            .chain([&self.partial])
+            .find_map(|line| link_in(line).map(|(link, _)| link))
     }
+
+    /// [`Self::link`], once nothing more can be added to it: in a line that
+    /// has ended, or followed by a space. Output is taken as it arrives, so
+    /// an address can be cut off at the end of one read, and a program that
+    /// is told the link once must be told all of it.
+    fn settled_link(&self) -> Option<&str> {
+        self.lines
+            .iter()
+            .find_map(|line| link_in(line).map(|(link, _)| link))
+            .or_else(|| {
+                link_in(&self.partial)
+                    .filter(|(_, ended)| *ended)
+                    .map(|(link, _)| link)
+            })
+    }
+}
+
+/// The first web page `line` names, and whether anything follows it.
+fn link_in(line: &str) -> Option<(&str, bool)> {
+    let start = line.find("https://")?;
+    let rest = &line[start..];
+    let end = rest.find(char::is_whitespace);
+    let link = rest[..end.unwrap_or(rest.len())].trim_end_matches(['.', ',', ')']);
+    Some((link, end.is_some()))
 }
 
 /// How far into a terminal escape sequence the text read so far is.
@@ -597,6 +634,32 @@ mod tests {
             transcript.link(),
             Some("https://claude.com/cai/oauth/authorize?code=true&state=x")
         );
+    }
+
+    /// Wherever a read ends, the settled link is all of the address or
+    /// nothing yet — never the part of it that has arrived.
+    #[test]
+    fn a_settled_link_is_never_cut_short() {
+        let full = "https://claude.com/cai/oauth/authorize?code=true&state=x";
+        let chars: Vec<char> = CLAUDE.chars().collect();
+        for at in 0..=chars.len() {
+            let mut transcript = Transcript::default();
+            transcript.push(&chars[..at].iter().collect::<String>());
+            let settled = transcript.settled_link();
+            assert!(
+                settled.is_none() || settled == Some(full),
+                "split at {at}: {settled:?}"
+            );
+            transcript.push(&chars[at..].iter().collect::<String>());
+            assert_eq!(transcript.settled_link(), Some(full), "split at {at}");
+        }
+
+        // An address on an unfinished line is whole once something follows it.
+        let mut transcript = Transcript::default();
+        transcript.push("Open https://example.com/sign-in");
+        assert_eq!(transcript.settled_link(), None);
+        transcript.push(" and paste the code > ");
+        assert_eq!(transcript.settled_link(), Some("https://example.com/sign-in"));
     }
 
     /// Codex names its local callback server first; that is not the page to

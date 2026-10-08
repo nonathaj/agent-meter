@@ -480,7 +480,7 @@ fn follow_login(app: &mut App, engine: &Engine, worker: &Worker) -> Result<()> {
         return Ok(());
     };
     login.update();
-    if let login::State::Succeeded { id, note } = login.state.clone() {
+    if let login::State::Succeeded { id, note, .. } = login.state.clone() {
         app.login = None;
         app.mode = Mode::Browse;
         app.note(note);
@@ -657,7 +657,7 @@ fn browse_key(app: &mut App, engine: &Engine, worker: &Worker, key: KeyEvent) {
 /// throughout: the CLI's output is shown in the panel, not handed the
 /// terminal.
 fn start_login(app: &mut App, engine: &Engine, provider: ProviderKind, account: Option<String>) {
-    match Login::start(engine.store().clone(), provider, account) {
+    match Login::start(engine.store().clone(), provider, account, None) {
         Ok(login) => {
             app.login = Some(login);
             app.mode = Mode::Login;

@@ -6,7 +6,8 @@
 
 mod app;
 mod draw;
-mod login;
+/// Shared with `--json-io`, which reports the same login as JSON lines.
+pub(crate) mod login;
 mod worker;
 
 pub use app::run;

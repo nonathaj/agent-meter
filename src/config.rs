@@ -147,6 +147,23 @@ impl Default for WatchConfig {
     }
 }
 
+/// `error` as it may be said to someone who is not at this terminal.
+///
+/// A settings file that does not parse is named and nothing more. The parser
+/// quotes the line it stopped at, and this file can hold secrets, such as a
+/// remote's `env`.
+pub fn said_elsewhere(error: &anyhow::Error) -> String {
+    if !error.chain().any(|cause| cause.is::<toml::de::Error>()) {
+        return format!("{error:#}");
+    }
+    let said: Vec<String> = error
+        .chain()
+        .take_while(|cause| !cause.is::<toml::de::Error>())
+        .map(ToString::to_string)
+        .collect();
+    format!("{} failed; `agent-meter config show` says why", said.join(": "))
+}
+
 impl Config {
     /// Reads `config.toml` from `dir`, falling back to defaults when absent.
     pub fn load(dir: &Path) -> Result<Self> {

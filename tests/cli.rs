@@ -1795,3 +1795,1018 @@ fn limit_resets_are_listed_with_their_deadlines() {
     assert!(table.contains("LIMIT RESETS"), "{table}");
     assert!(table.contains("1, expires in 20d"), "{table}");
 }
+
+/// Five Claude accounts in each place the queue can put one: the one in use,
+/// two that could be switched to, one that is spent and one the provider
+/// signed out. Readings are taken at the returned instant.
+fn standing_fixture() -> (Fixture, jiff::Timestamp) {
+    let fixture = Fixture::new();
+    for (email, uuid, refresh) in [
+        ("spare@example.com", "uuid-1", "one"),
+        ("dev@example.com", "uuid-2", "two"),
+        ("spent@example.com", "uuid-3", "three"),
+        ("lapsed@example.com", "uuid-4", "four"),
+        ("later@example.com", "uuid-5", "five"),
+    ] {
+        fixture.sign_in_claude(email, uuid, refresh);
+        fixture.run(&["import", "claude"]);
+    }
+    fixture.run(&["use", "claude-2"]);
+
+    let record = fixture.data.join("accounts").join("claude-4.json");
+    let mut stored = read_json(&record);
+    stored["needs_login"] = json!("the provider rejected its credential: invalid_grant");
+    write_json(&record, &stored);
+
+    let now = jiff::Timestamp::now();
+    let window = |secs: u64, used: f64, resets_in: i64| json!({"window_secs": secs, "used_percent": used, "resets_at": standing_reset(now, resets_in)});
+    let reading = |windows: Vec<Value>| json!({"usage": {"observed_at": now, "windows": windows, "limit_reached": false}, "failures": 0});
+    write_json(
+        &fixture.data.join("usage.json"),
+        &json!({"entries": {
+            "claude-1": reading(vec![
+                window(18000, 10.0, 2 * HOUR + 30 * 60),
+                window(604800, 60.0, 3 * DAY + 12 * HOUR),
+            ]),
+            "claude-2": reading(vec![
+                window(18000, 50.0, HOUR),
+                window(604800, 30.0, 6 * DAY),
+                json!({"window_secs": 604800, "scope": "Opus", "used_percent": 20.0}),
+            ]),
+            "claude-3": reading(vec![
+                window(18000, 100.0, 4 * HOUR),
+                window(604800, 70.0, DAY),
+            ]),
+            "claude-5": reading(vec![
+                window(18000, 20.0, 3 * HOUR),
+                window(604800, 40.0, 5 * DAY),
+            ]),
+        }}),
+    );
+    (fixture, now)
+}
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 24 * HOUR;
+
+/// When a window of the standing fixture resets: `secs` after `now`, and fifty
+/// seconds more, so the countdowns the table prints hold still for as long as
+/// a test could take to run.
+fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
+    (now + jiff::SignedDuration::from_secs(secs + 50)).to_string()
+}
+
+/// `list --json` with only the fields it has always had.
+///
+/// Fields added later go at the end of their objects, so cutting their lines
+/// out of the printed text, with the comma that came before them, leaves the
+/// bytes an older version printed.
+fn as_originally_listed(printed: &str) -> String {
+    const ADDED: [&str; 2] = ["queue", "pace"];
+    let mut kept: Vec<&str> = Vec::new();
+    let mut lines = printed.lines();
+    while let Some(line) = lines.next() {
+        let text = line.trim_start();
+        let indent = &line[..line.len() - text.len()];
+        if !ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": "))) {
+            kept.push(line);
+            continue;
+        }
+        let before = kept.pop().unwrap();
+        kept.push(
+            before
+                .strip_suffix(',')
+                .expect("a field added later follows another"),
+        );
+        let last = if text.ends_with('{') {
+            let close = format!("{indent}}}");
+            lines.find(|inner| inner.starts_with(&close)).unwrap()
+        } else {
+            line
+        };
+        assert!(
+            !last.ends_with(','),
+            "a field added later is the last in its object: {line}"
+        );
+    }
+    format!("{}\n", kept.join("\n"))
+}
+
+/// What `list` and `watch` print is read by programs as well as people — a
+/// service wrapper matches the watcher's lines — so it stays exactly as it
+/// was, byte for byte, whatever is added beside it.
+#[test]
+fn list_and_watch_print_exactly_what_they_always_have() {
+    let (fixture, now) = standing_fixture();
+
+    let table = [
+        "     ID         PROVIDER      ACCOUNT              ORGANIZATION   PLAN   USED   WINDOWS                               RESETS IN   LIMIT RESETS                ",
+        "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+        "     claude-1   Claude Code   spare@example.com    Example Inc    -      60%    5h 10%  weekly 60%                    3d12h       ?                           ",
+        " *   claude-2   Claude Code   dev@example.com      Example Inc    -      50%    5h 50%  weekly 30%  weekly Opus 20%   1h          ?                           ",
+        "     claude-3   Claude Code   spent@example.com    Example Inc    -      100%   5h 100%  weekly 70%                   4h          ?                           ",
+        "     claude-4   Claude Code   lapsed@example.com   Example Inc    -      ?                                            -           ?              login needed ",
+        "     claude-5   Claude Code   later@example.com    Example Inc    -      40%    5h 20%  weekly 40%                    5d          ?                           ",
+        "  ! claude-4: the provider rejected its credential: invalid_grant",
+        "",
+    ]
+    .join("\n");
+    assert_eq!(fixture.run(&["list"]), table);
+
+    let expected = r#"[
+  {
+    "id": "claude-1",
+    "provider": "claude",
+    "label": null,
+    "email": "spare@example.com",
+    "plan": null,
+    "capacityMultiplier": null,
+    "organization": "Example Inc",
+    "active": false,
+    "fleetHome": null,
+    "needsLogin": null,
+    "pollIntervalSeconds": 300,
+    "usage": {
+      "observedAt": "@now",
+      "usedPercent": 60.0,
+      "exhausted": false,
+      "windows": [
+        {
+          "label": "5h",
+          "kind": "five_hour",
+          "scope": null,
+          "windowSeconds": 18000,
+          "usedPercent": 10.0,
+          "resetsAt": "@2h30m"
+        },
+        {
+          "label": "weekly",
+          "kind": "weekly",
+          "scope": null,
+          "windowSeconds": 604800,
+          "usedPercent": 60.0,
+          "resetsAt": "@3d12h"
+        }
+      ],
+      "limitResets": null
+    },
+    "error": null,
+    "errorAt": null
+  },
+  {
+    "id": "claude-2",
+    "provider": "claude",
+    "label": null,
+    "email": "dev@example.com",
+    "plan": null,
+    "capacityMultiplier": null,
+    "organization": "Example Inc",
+    "active": true,
+    "fleetHome": null,
+    "needsLogin": null,
+    "pollIntervalSeconds": 300,
+    "usage": {
+      "observedAt": "@now",
+      "usedPercent": 50.0,
+      "exhausted": false,
+      "windows": [
+        {
+          "label": "5h",
+          "kind": "five_hour",
+          "scope": null,
+          "windowSeconds": 18000,
+          "usedPercent": 50.0,
+          "resetsAt": "@1h"
+        },
+        {
+          "label": "weekly",
+          "kind": "weekly",
+          "scope": null,
+          "windowSeconds": 604800,
+          "usedPercent": 30.0,
+          "resetsAt": "@6d"
+        },
+        {
+          "label": "weekly Opus",
+          "kind": "weekly",
+          "scope": "Opus",
+          "windowSeconds": 604800,
+          "usedPercent": 20.0,
+          "resetsAt": null
+        }
+      ],
+      "limitResets": null
+    },
+    "error": null,
+    "errorAt": null
+  },
+  {
+    "id": "claude-3",
+    "provider": "claude",
+    "label": null,
+    "email": "spent@example.com",
+    "plan": null,
+    "capacityMultiplier": null,
+    "organization": "Example Inc",
+    "active": false,
+    "fleetHome": null,
+    "needsLogin": null,
+    "pollIntervalSeconds": 300,
+    "usage": {
+      "observedAt": "@now",
+      "usedPercent": 100.0,
+      "exhausted": true,
+      "windows": [
+        {
+          "label": "5h",
+          "kind": "five_hour",
+          "scope": null,
+          "windowSeconds": 18000,
+          "usedPercent": 100.0,
+          "resetsAt": "@4h"
+        },
+        {
+          "label": "weekly",
+          "kind": "weekly",
+          "scope": null,
+          "windowSeconds": 604800,
+          "usedPercent": 70.0,
+          "resetsAt": "@1d"
+        }
+      ],
+      "limitResets": null
+    },
+    "error": null,
+    "errorAt": null
+  },
+  {
+    "id": "claude-4",
+    "provider": "claude",
+    "label": null,
+    "email": "lapsed@example.com",
+    "plan": null,
+    "capacityMultiplier": null,
+    "organization": "Example Inc",
+    "active": false,
+    "fleetHome": null,
+    "needsLogin": "the provider rejected its credential: invalid_grant",
+    "pollIntervalSeconds": 300,
+    "usage": null,
+    "error": null,
+    "errorAt": null
+  },
+  {
+    "id": "claude-5",
+    "provider": "claude",
+    "label": null,
+    "email": "later@example.com",
+    "plan": null,
+    "capacityMultiplier": null,
+    "organization": "Example Inc",
+    "active": false,
+    "fleetHome": null,
+    "needsLogin": null,
+    "pollIntervalSeconds": 300,
+    "usage": {
+      "observedAt": "@now",
+      "usedPercent": 40.0,
+      "exhausted": false,
+      "windows": [
+        {
+          "label": "5h",
+          "kind": "five_hour",
+          "scope": null,
+          "windowSeconds": 18000,
+          "usedPercent": 20.0,
+          "resetsAt": "@3h"
+        },
+        {
+          "label": "weekly",
+          "kind": "weekly",
+          "scope": null,
+          "windowSeconds": 604800,
+          "usedPercent": 40.0,
+          "resetsAt": "@5d"
+        }
+      ],
+      "limitResets": null
+    },
+    "error": null,
+    "errorAt": null
+  }
+]
+"#;
+    let mut expected = expected.replace("@now", &now.to_string());
+    for (token, secs) in [
+        ("@2h30m", 2 * HOUR + 30 * 60),
+        ("@3d12h", 3 * DAY + 12 * HOUR),
+        ("@1h", HOUR),
+        ("@6d", 6 * DAY),
+        ("@4h", 4 * HOUR),
+        ("@1d", DAY),
+        ("@3h", 3 * HOUR),
+        ("@5d", 5 * DAY),
+    ] {
+        expected = expected.replace(token, &standing_reset(now, secs));
+    }
+    assert_eq!(as_originally_listed(&fixture.run(&["list", "--json"])), expected);
+
+    // Claude Code re-reads its credential, so spending a week that resets
+    // sooner costs nothing — which is what the watcher would do here.
+    assert_eq!(
+        fixture.run(&["watch", "--once", "--dry-run"]),
+        "Claude Code: would switch to claude-1 (claude-1's weekly allowance resets sooner, so \
+         spending it first wastes nothing; it is at 60% and switching interrupts nothing)\n"
+    );
+}
+
+/// Each row says where its account stands in the order the watcher would take
+/// its provider's accounts, worked out by the ranking the watcher switches on.
+#[test]
+fn each_row_says_where_its_account_stands_in_the_queue() {
+    let (fixture, _now) = standing_fixture();
+    fixture.sign_in_codex("dev@openai.example", "user-1", "one");
+    fixture.run(&["import", "codex"]);
+
+    let rows = fixture.accounts();
+    let place = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap()["queue"].clone();
+    assert_eq!(place("claude-2"), json!({"position": 1, "role": "in_use"}));
+    // Its week resets sooner than claude-5's, so it is spent first.
+    assert_eq!(place("claude-1"), json!({"position": 2, "role": "next_up"}));
+    assert_eq!(place("claude-5"), json!({"position": 3, "role": "queued"}));
+    // Spent, then signed out: neither can be switched to.
+    assert_eq!(place("claude-3"), json!({"position": 4, "role": "unusable"}));
+    assert_eq!(place("claude-4"), json!({"position": 5, "role": "unusable"}));
+    // Every provider has a queue of its own.
+    assert_eq!(place("codex-1"), json!({"position": 1, "role": "in_use"}));
+
+    let only_codex: Vec<Value> =
+        serde_json::from_str(&fixture.run(&["list", "--provider", "codex", "--json"])).unwrap();
+    assert_eq!(only_codex[0]["queue"], json!({"position": 1, "role": "in_use"}));
+}
+
+/// A weekly window says how far ahead of an even pace through the week it has
+/// been spent; one that is not ahead, or that nothing dates, says null. A
+/// five-hour window is a rate rather than a budget and says nothing of pace.
+#[test]
+fn weekly_windows_say_how_far_ahead_of_pace_they_are() {
+    let (fixture, _now) = standing_fixture();
+    let rows = fixture.accounts();
+    let windows = |id: &str| {
+        rows.iter().find(|row| row["id"] == id).unwrap()["usage"]["windows"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let ahead = |window: &Value| window["pace"]["aheadPercent"].as_f64();
+
+    // Half the week gone and 60% of it spent: ten points ahead.
+    let spare = windows("claude-1");
+    assert!(spare[0].get("pace").is_none(), "{}", spare[0]);
+    assert!((ahead(&spare[1]).unwrap() - 10.0).abs() < 0.1, "{}", spare[1]);
+
+    // A day gone and 30% spent: 30 − 100 × 1/7.
+    let in_use = windows("claude-2");
+    assert!(
+        (ahead(&in_use[1]).unwrap() - (30.0 - 100.0 / 7.0)).abs() < 0.1,
+        "{}",
+        in_use[1]
+    );
+    // A per-model week with no reset time has no clock to be ahead of.
+    assert_eq!(in_use[2]["pace"], json!({"aheadPercent": null}));
+
+    // Six days gone and 70% spent: behind, not ahead.
+    assert_eq!(windows("claude-3")[1]["pace"], json!({"aheadPercent": null}));
+}
+
+/// A watcher left running, and the lines it prints as it prints them. Lines
+/// on standard error arrive prefixed `stderr: `.
+struct Watcher {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Watcher {
+    fn start(fixture: &Fixture, args: &[&str]) -> Self {
+        let mut child = fixture
+            .cmd(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let forward = |stream: Box<dyn std::io::Read + Send>, prefix: &'static str| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                    if tx.send(format!("{prefix}{line}")).is_err() {
+                        break;
+                    }
+                }
+            });
+        };
+        forward(Box::new(child.stdout.take().unwrap()), "");
+        forward(Box::new(child.stderr.take().unwrap()), "stderr: ");
+        Self { child, lines }
+    }
+
+    /// Waits for the next line that contains `what`, and returns it.
+    ///
+    /// Far sooner than the watcher's own interval, which is a minute at the
+    /// least: a line that only comes when that runs out is a line that did not
+    /// come in time.
+    fn next(&self, what: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if line.contains(what) => return line,
+                Ok(_) => {}
+                Err(_) => panic!("the watcher never printed {what:?}"),
+            }
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Two Claude accounts with only five-hour windows, so that the threshold
+/// alone decides: the one in use at 50%, a spare at 10%.
+fn threshold_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-1", "one");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("dev@example.com", "uuid-2", "two");
+    fixture.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let reading = |used: f64| {
+        json!({"usage": {
+            "observed_at": now,
+            "windows": [{"window_secs": 18000, "used_percent": used, "resets_at": standing_reset(now, HOUR)}],
+            "limit_reached": false,
+        }, "failures": 0})
+    };
+    write_json(
+        &fixture.data.join("usage.json"),
+        &json!({"entries": {"claude-1": reading(10.0), "claude-2": reading(50.0)}}),
+    );
+    fixture
+}
+
+const WOULD_SWITCH: &str = "Claude Code: would switch to claude-1 (50% used; claude-1 is at 10%)";
+const STAYS: &str = "Claude Code: 50% used, staying put";
+
+/// `config set` reaches a watcher that is already running: the settings are
+/// read again before every check, and a change to them brings the next check
+/// forward rather than leaving it to the end of the interval.
+#[test]
+fn a_running_watcher_takes_up_changed_settings_at_its_next_check() {
+    let fixture = threshold_fixture();
+    let watcher = Watcher::start(&fixture, &["watch", "--dry-run"]);
+    watcher.next("Watching every 1m at a 90% threshold");
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+
+    fixture.run(&["config", "set", "watch.threshold", "40"]);
+    assert_eq!(watcher.next("Claude Code:"), WOULD_SWITCH);
+
+    // A threshold set for the provider still wins over the general one.
+    fixture.run(&["config", "set", "provider.claude.threshold", "95"]);
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+}
+
+/// A threshold given on the command line is this run's, and outlasts any
+/// change to the file.
+#[test]
+fn a_watchers_own_threshold_outlasts_the_file() {
+    let fixture = threshold_fixture();
+    let watcher = Watcher::start(&fixture, &["watch", "--dry-run", "--threshold", "95"]);
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+
+    fixture.run(&["config", "set", "watch.threshold", "40"]);
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+}
+
+/// A settings file edited by hand into something that does not read leaves
+/// the watcher on the last settings that did, rather than stopping it or
+/// dropping back to the defaults, and it says so once.
+#[test]
+fn a_settings_file_that_no_longer_reads_leaves_the_last_good_settings() {
+    let fixture = threshold_fixture();
+    let watcher = Watcher::start(&fixture, &["watch", "--dry-run"]);
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+    fixture.run(&["config", "set", "watch.threshold", "40"]);
+    assert_eq!(watcher.next("Claude Code:"), WOULD_SWITCH);
+
+    let config = fixture.data.join("config.toml");
+    std::fs::write(&config, "[watch]\nthreshold = \"high\"\n").unwrap();
+    let warning = watcher.next("stderr: ");
+    assert!(warning.contains("config.toml"), "{warning}");
+    assert_eq!(watcher.next("Claude Code:"), WOULD_SWITCH);
+
+    std::fs::write(&config, "[watch]\nthreshold = 95.0\n").unwrap();
+    assert_eq!(watcher.next("Claude Code:"), STAYS);
+}
+
+/// What the stand-in `claude` prints as the sign-in page.
+#[cfg(target_os = "linux")]
+const SIGN_IN_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&state=x";
+
+/// A stand-in for `claude auth login`, first on the PATH: it prints Claude
+/// Code's prompt, hyperlink and all, reads a code, and with `good-code`
+/// signs in to the account `FAKE_EMAIL` names. With `FAKE_NO_CODE` set it
+/// asks for nothing and signs in at once, as when the browser's callback
+/// reaches the CLI. It writes its process id to `FAKE_PID`.
+///
+/// Linux only: on macOS a login's credential goes to the Keychain, which a
+/// test must not touch, and Windows has no `sh`.
+#[cfg(target_os = "linux")]
+fn fake_claude(fixture: &Fixture) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = fixture._dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = r#"#!/bin/sh
+echo $$ > "$FAKE_PID"
+printf 'Opening browser to sign in…\n'
+printf "If the browser didn't open, visit: \033]8;;URL\007URL\033]8;;\007\n"
+if [ -z "$FAKE_NO_CODE" ]; then
+  printf 'Paste code here if prompted > '
+  read code
+  if [ "$code" != "good-code" ]; then
+    echo 'OAuth error: Invalid code'
+    exit 1
+  fi
+fi
+cat > "$CLAUDE_CONFIG_DIR/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "sk-ant-oat01-$FAKE_REFRESH", "refreshToken": "sk-ant-ort01-$FAKE_REFRESH",
+ "expiresAt": 1900000000000, "scopes": ["user:inference", "user:profile"], "subscriptionType": "max"}}
+JSON
+cat > "$CLAUDE_CONFIG_DIR/.claude.json" <<JSON
+{"hasCompletedOnboarding": true, "oauthAccount": {"accountUuid": "$FAKE_UUID", "emailAddress": "$FAKE_EMAIL",
+ "organizationUuid": "org-1", "organizationName": "Example Inc"}}
+JSON
+echo 'Login successful.'
+"#
+    .replace("URL", SIGN_IN_URL);
+    let path = bin.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Points `command` at the stand-in `claude`, signing in to `email`, and
+/// returns where the stand-in will write its process id.
+#[cfg(target_os = "linux")]
+fn with_fake_claude(fixture: &Fixture, command: &mut Command, email: &str) -> PathBuf {
+    let bin = fake_claude(fixture);
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let pid_file = fixture._dir.path().join("claude.pid");
+    command
+        .env("PATH", path)
+        .env("FAKE_PID", &pid_file)
+        .env("FAKE_EMAIL", email)
+        .env("FAKE_UUID", format!("uuid-{email}"))
+        .env("FAKE_REFRESH", email.replace(['@', '.'], "-"));
+    pid_file
+}
+
+/// A login driven the way a program drives one: JSON lines in and out.
+#[cfg(target_os = "linux")]
+struct ProgramLogin {
+    child: std::process::Child,
+    events: std::sync::mpsc::Receiver<Value>,
+    stdout_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pid_file: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ProgramLogin {
+    /// Runs `agent-meter <args>` with the stand-in `claude` signing in to
+    /// `email`.
+    fn start(fixture: &Fixture, args: &[&str], email: &str) -> Self {
+        Self::start_with(fixture, args, email, |_| {})
+    }
+
+    /// [`Self::start`], with `configure` given the command last.
+    fn start_with(
+        fixture: &Fixture,
+        args: &[&str],
+        email: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Self {
+        let mut command = fixture.cmd(args);
+        let pid_file = with_fake_claude(fixture, &mut command, email);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, events) = std::sync::mpsc::channel();
+        let stdout_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = stdout_lines.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                seen.lock().unwrap().push(line.clone());
+                let event: Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| panic!("stdout carries JSON lines only, not {line:?}"));
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            events,
+            stdout_lines,
+            pid_file,
+        }
+    }
+
+    fn next(&self) -> Value {
+        self.events
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the login said nothing more")
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write;
+        let stdin = self.child.stdin.as_mut().unwrap();
+        stdin.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Waits for it to exit, and returns how it did, everything it printed
+    /// on stdout, and its stderr.
+    fn finish(mut self) -> (std::process::ExitStatus, Vec<String>, String) {
+        use std::io::Read;
+        drop(self.child.stdin.take());
+        let mut stderr = String::new();
+        self.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let status = self.child.wait().unwrap();
+        // Whatever is left on stdout has been read once the pipe closes.
+        while self
+            .events
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+        {}
+        let stdout = self.stdout_lines.lock().unwrap().clone();
+        (status, stdout, stderr)
+    }
+}
+
+/// Every throwaway login directory has been removed.
+#[cfg(target_os = "linux")]
+fn no_login_left_behind(fixture: &Fixture) {
+    let logins = fixture.data.join("logins");
+    let left: Vec<_> = std::fs::read_dir(&logins)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+/// A program signs an account in by reading JSON lines and writing them: it
+/// is told the sign-in page, told when a code is wanted, hands the code back,
+/// and is told which account that stored. Nothing else is on stdout, and the
+/// code is printed nowhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_program_can_drive_a_login_over_json_lines() {
+    let fixture = Fixture::new();
+    let mut login = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    assert_eq!(login.next(), json!({"event": "url", "url": SIGN_IN_URL}));
+    assert_eq!(login.next(), json!({"event": "need_code"}));
+
+    // Lines that are not a code are passed over, never to the CLI.
+    login.send("good-code");
+    login.send(r#"{"code": "good-code\nsecond line"}"#);
+    login.send(r#"{"code": "good-code"}"#);
+    assert_eq!(
+        login.next(),
+        json!({"event": "done", "account": "claude-1", "added": true})
+    );
+    let (status, stdout, stderr) = login.finish();
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout.len(), 3, "{stdout:?}");
+    assert!(!stderr.contains("good-code"), "{stderr}");
+    no_login_left_behind(&fixture);
+    assert_eq!(fixture.accounts()[0]["email"], "new@example.com");
+
+    // Signing the same account in again updates it.
+    let mut again = ProgramLogin::start(&fixture, &["login", "claude-1", "--json-io"], "new@example.com");
+    assert_eq!(again.next()["event"], "url");
+    assert_eq!(again.next()["event"], "need_code");
+    again.send(r#"{"code": "good-code"}"#);
+    assert_eq!(
+        again.next(),
+        json!({"event": "done", "account": "claude-1", "added": false})
+    );
+    assert!(again.finish().0.success());
+
+    // Whoever actually signs in is the account stored. The caller, who asked
+    // for claude-1, is the one to see that this is a different account.
+    let mut other = ProgramLogin::start(&fixture, &["login", "claude-1", "--json-io"], "other@example.com");
+    other.next();
+    other.next();
+    other.send(r#"{"code": "good-code"}"#);
+    assert_eq!(
+        other.next(),
+        json!({"event": "done", "account": "claude-2", "added": true})
+    );
+    assert!(other.finish().0.success());
+    no_login_left_behind(&fixture);
+}
+
+/// A login that fails ends with one error line and stores nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_login_ends_with_an_error_and_stores_nothing() {
+    let fixture = Fixture::new();
+    let mut login = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    login.next();
+    login.next();
+    login.send(r#"{"code": "wrong-code"}"#);
+    let error = login.next();
+    assert_eq!(error["event"], "error", "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains("Nothing was added"),
+        "{error}"
+    );
+    let (status, stdout, _) = login.finish();
+    assert!(!status.success());
+    assert_eq!(stdout.len(), 3, "{stdout:?}");
+    assert!(fixture.accounts().is_empty());
+    no_login_left_behind(&fixture);
+
+    // An account that does not exist cannot be signed in to again, and a
+    // program is told so in the same way.
+    let missing = ProgramLogin::start(&fixture, &["login", "nobody", "--json-io"], "new@example.com");
+    let error = missing.next();
+    assert_eq!(error["event"], "error", "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains("no account matches"),
+        "{error}"
+    );
+    let (status, stdout, _) = missing.finish();
+    assert!(!status.success());
+    assert_eq!(stdout.len(), 1, "{stdout:?}");
+}
+
+/// SIGTERM is how a program gives up on a login. It stops the CLI, removes
+/// the throwaway directory with whatever credential was in it, and says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminated_login_stops_the_cli_and_leaves_nothing_behind() {
+    let fixture = Fixture::new();
+    let login = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    login.next();
+    login.next();
+    let cli: u32 = std::fs::read_to_string(&login.pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    Command::new("kill")
+        .args(["-TERM", &login.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert_eq!(
+        login.next(),
+        json!({"event": "error", "message": "Login cancelled. Nothing was added."})
+    );
+    let (status, _, _) = login.finish();
+    assert!(!status.success());
+    assert!(
+        !Path::new(&format!("/proc/{cli}")).exists(),
+        "the CLI must not outlive the login"
+    );
+    assert!(fixture.accounts().is_empty());
+    no_login_left_behind(&fixture);
+}
+
+/// `login <account>` is also an ordinary command, for a person at a terminal:
+/// the CLI has the terminal, and the code goes to it directly.
+#[cfg(target_os = "linux")]
+#[test]
+fn login_signs_a_stored_account_in_again_at_a_terminal() {
+    let fixture = Fixture::new();
+    let at_terminal = |email: &str| {
+        let mut command = fixture.cmd(&["login", "claude-1"]);
+        with_fake_claude(&fixture, &mut command, email);
+        let output = assert_cmd::Command::from_std(command)
+            .write_stdin("good-code\n")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stdout}{stderr}");
+        (stdout, stderr)
+    };
+
+    let mut first = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    first.next();
+    first.next();
+    first.send(r#"{"code": "good-code"}"#);
+    first.next();
+    assert!(first.finish().0.success());
+
+    let (stdout, stderr) = at_terminal("new@example.com");
+    assert!(
+        stdout.contains("Signing in to claude-1 (new@example.com) again"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Updated claude-1"), "{stdout}");
+    assert!(!stderr.contains("rather than"), "{stderr}");
+
+    // Signing in to some other account stores that one, and says so.
+    let (stdout, stderr) = at_terminal("other@example.com");
+    assert!(stdout.contains("Added claude-2"), "{stdout}");
+    assert!(
+        stderr.contains("That signed in to claude-2 rather than claude-1"),
+        "{stderr}"
+    );
+    no_login_left_behind(&fixture);
+}
+
+/// The process id the stand-in `claude` of `login` wrote.
+#[cfg(target_os = "linux")]
+fn fake_claude_pid(login: &ProgramLogin) -> u32 {
+    std::fs::read_to_string(&login.pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Once a code has been asked for, stdin closing before one is sent means
+/// none ever can be: the program driving the login has gone. The login is
+/// given up there and then, as on SIGTERM, rather than left holding a live
+/// credential until the CLI's own timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn closing_stdin_while_a_code_is_wanted_gives_the_login_up() {
+    let fixture = Fixture::new();
+    let given_up = json!({"event": "error", "message": "stdin closed while a code was needed"});
+
+    let mut login = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    assert_eq!(login.next()["event"], "url");
+    assert_eq!(login.next()["event"], "need_code");
+    drop(login.child.stdin.take());
+    assert_eq!(login.next(), given_up);
+    let cli = fake_claude_pid(&login);
+    let (status, stdout, _) = login.finish();
+    assert!(!status.success());
+    assert_eq!(stdout.len(), 3, "{stdout:?}");
+    assert!(
+        !Path::new(&format!("/proc/{cli}")).exists(),
+        "the CLI must not outlive the login"
+    );
+    no_login_left_behind(&fixture);
+
+    // Closed from the start, it is given up as soon as a code is asked for.
+    let closed = ProgramLogin::start_with(
+        &fixture,
+        &["add", "claude", "--json-io"],
+        "new@example.com",
+        |c| {
+            c.stdin(std::process::Stdio::null());
+        },
+    );
+    assert_eq!(closed.next()["event"], "url");
+    assert_eq!(closed.next()["event"], "need_code");
+    assert_eq!(closed.next(), given_up);
+    assert!(!closed.finish().0.success());
+    assert!(fixture.accounts().is_empty());
+    no_login_left_behind(&fixture);
+
+    // A code sent before stdin closes is all the login needs.
+    let mut sent = ProgramLogin::start(&fixture, &["add", "claude", "--json-io"], "new@example.com");
+    sent.next();
+    sent.next();
+    sent.send(r#"{"code": "good-code"}"#);
+    drop(sent.child.stdin.take());
+    assert_eq!(
+        sent.next(),
+        json!({"event": "done", "account": "claude-1", "added": true})
+    );
+    assert!(sent.finish().0.success());
+}
+
+/// A login the browser's callback finishes asks for no code, so it needs
+/// nothing on stdin and is not given up when there is nothing there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_login_that_asks_for_no_code_needs_no_stdin() {
+    let fixture = Fixture::new();
+    let login = ProgramLogin::start_with(
+        &fixture,
+        &["add", "claude", "--json-io"],
+        "new@example.com",
+        |c| {
+            c.stdin(std::process::Stdio::null()).env("FAKE_NO_CODE", "1");
+        },
+    );
+    assert_eq!(login.next()["event"], "url");
+    assert_eq!(
+        login.next(),
+        json!({"event": "done", "account": "claude-1", "added": true})
+    );
+    assert!(login.finish().0.success());
+    no_login_left_behind(&fixture);
+}
+
+/// A login a program drives ends with an `error` line even when it fails
+/// before it starts, so the program always has one last line to read.
+#[test]
+fn a_json_login_that_cannot_start_still_ends_with_an_error_line() {
+    let fixture = Fixture::new();
+    let blocked = fixture._dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "not an account store").unwrap();
+    for args in [
+        &["add", "claude", "--json-io"][..],
+        &["login", "claude-1", "--json-io"],
+    ] {
+        let output = fixture
+            .cmd(args)
+            .env("AGENT_METER_DIR", &blocked)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "{args:?}: {stdout}");
+        let event: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event["event"], "error", "{event}");
+        assert!(
+            event["message"].as_str().unwrap().contains("not-a-directory"),
+            "{event}"
+        );
+    }
+
+    // Without --json-io it is an ordinary error, on stderr.
+    let output = fixture
+        .cmd(&["add", "claude"])
+        .env("AGENT_METER_DIR", &blocked)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("not-a-directory")
+    );
+}
+
+/// A settings file that does not parse is named in the `error` line, but the
+/// line the parser stopped at is not repeated there: the file can hold
+/// secrets, and whoever reads the program's output may be somewhere else.
+#[test]
+fn a_json_login_never_repeats_a_settings_file_that_does_not_parse() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(&fixture.data).unwrap();
+    for broken in [
+        "[remote.box]\nenv = { TOKEN = \"not-to-be-repeated\" \n",
+        "[remote.box]\nenv = { TOKEN = 987654321 }\n",
+    ] {
+        std::fs::write(fixture.data.join("config.toml"), broken).unwrap();
+        for args in [
+            &["add", "claude", "--json-io"][..],
+            &["login", "claude-1", "--json-io"],
+        ] {
+            let output = fixture
+                .cmd(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 1, "{args:?}: {stdout}");
+            let event: Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(event["event"], "error", "{event}");
+            let message = event["message"].as_str().unwrap();
+            assert!(message.contains("config.toml"), "{message}");
+            assert!(message.contains("agent-meter config show"), "{message}");
+            for quoted in ["TOKEN", "not-to-be-repeated", "987654321"] {
+                assert!(!stdout.contains(quoted), "{args:?} repeated {quoted}: {stdout}");
+            }
+        }
+    }
+}

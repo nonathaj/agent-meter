@@ -61,6 +61,15 @@ builds every platform and publishes the release with its installers. After
 changing `dist-workspace.toml`, run `dist generate` rather than editing
 `.github/workflows/release.yml` by hand.
 
+### Builds of main
+
+Every push to `main` is built for `aarch64-unknown-linux-musl` and
+`x86_64-unknown-linux-musl` by `.github/workflows/linux-builds.yml`, and kept as
+that run's artifacts, each binary with a `.sha256` beside it. These are not
+releases: nothing is tagged, and `agent-meter update` installs releases only,
+so on a machine running a build of main it would put the latest release in its
+place.
+
 ## Getting started
 
 ```console
@@ -170,7 +179,8 @@ next machine that still has it. Remove it on each.
 | --- | --- |
 | `agent-meter list` | Every account with its usage. `--poll` refreshes only readings due under provider intervals/backoff; `--refresh` forces polling; `--json` prints machine-readable output. |
 | `agent-meter update` | Install the newest release with the bundled updater; `--tag`, `--version`, `--prerelease`. |
-| `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. |
+| `agent-meter add <provider>` | Logs in to a new account without disturbing a running agent. `--json-io` lets another program drive the login. |
+| `agent-meter login <account>` | Signs a stored account in again, as the terminal UI's `l` does. `--json-io` likewise. |
 | `agent-meter import [provider]` | Stores the account a CLI is already signed in to, or everything another tool holds with `--from cswap` / `--from gemctl`. |
 | `agent-meter export --to <tool>` | Writes these accounts into cswap's or gemctl's store, keeping the accounts they already hold. |
 | `agent-meter sync [machine]` | Keeps another machine's accounts in step with this one, over ssh. `--push`, `--pull`, `--dry-run`. |
@@ -261,9 +271,54 @@ each with a `title`, `left`, `expiresAt` and the window kinds it `refills`.
 holding none (`available: 0`). `grants` is `null` where the provider counted
 its resets without describing them. Resets past their deadline are left out.
 
+Each account also carries `queue`: its `position` in its provider's switching
+order, counted from 1, and its `role` there — `in_use`, `next_up` (where a
+switch would go), `queued`, or `unusable` (spent, without a recent reading, or
+needing a login). It is the ranking `watch` switches on, in the order the
+terminal UI lists accounts. Weekly windows carry `pace.aheadPercent`: how many
+points more of the week is spent than an even pace through it would have spent,
+`usedPercent − 100 × elapsed / windowSeconds`, or `null` when the window is not
+ahead or nothing dates it. Five-hour windows are a rate rather than a budget and
+carry no `pace`. New fields are only ever added at the end of an object.
+
 A successful command can contain failed account polls: inspect `error`,
 `needsLogin` and `usage.observedAt`. Missing or old usage is unknown, not zero
 consumption. Tokens, API keys and refresh credentials are never included.
+
+## Logins another program drives
+
+`agent-meter add <provider> --json-io` and `agent-meter login <account> --json-io`
+run the same login as the terminal UI's panel, for a program to drive on behalf
+of a person who is somewhere else. Stdout carries one JSON object per line and
+nothing else:
+
+| Line | When |
+| --- | --- |
+| `{"event":"url","url":"https://…"}` | The CLI has named its sign-in page, all of it. |
+| `{"event":"need_code"}` | The CLI is asking for the code the sign-in page hands back. |
+| `{"event":"done","account":"claude-3","added":true}` | An account was stored. `added` is false when it was one already stored, signing in again. |
+| `{"event":"error","message":"…"}` | Nothing was stored, and why. |
+
+Once the arguments have been parsed, `done` or `error` is always the last
+line, even for a failure before the login starts, and the exit status is 0
+after `done` and 1 after `error`. Arguments that do not parse get the usual
+usage message on stderr and exit status 2. Send the code on stdin as a line of its own,
+`{"code":"…"}`. A line that is not one, or a code holding a line break, is
+passed over with a note on stderr that does not repeat it. `login` stores
+whichever account is actually signed in to, so compare `done`'s `account` with
+the one asked for. A settings file that does not parse is named in the
+`error` line without the line it stopped at, since that file can hold secrets.
+
+Send SIGTERM to give up: the CLI is stopped, its throwaway configuration
+directory and any credential in it are removed, and the last line is an
+`error`. Closing stdin after `need_code`, without having sent a code, gives up
+the same way, with `stdin closed while a code was needed`: no code can come
+after that. Closing it before `need_code`, or after sending the code, does not,
+since a login the browser's callback finishes never asks. Nothing is stored
+unless the login finishes. `--device-code` cannot be
+combined with `--json-io`, since that code is for a person to read off the
+screen. The CLI's own output is not passed on; only the sign-in link is taken
+from it, so check its host before showing it to anyone.
 
 ## Pin accounts to fleet conversations
 
@@ -377,6 +432,13 @@ agent-meter config set provider.codex.enabled false
 | `watch.cooldown-secs` | `300` | Minimum gap between automatic switches. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
+
+A running `watch` reads these again before every check, and a change to the file
+brings that check forward, so a setting changed with `config set` takes effect
+within a second, with no restart. A `--threshold` or `--interval` given to
+`watch` itself holds for that run whatever the file says. A file edited by hand
+into something that does not read leaves the watcher on the settings it last
+read, and it says so once.
 
 ### How often anything is actually read
 

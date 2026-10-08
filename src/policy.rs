@@ -391,6 +391,36 @@ fn worth_taking(current: &Usage, best: &Usage, rules: &Rules, now: Timestamp) ->
 /// accounts that could be switched to, then those that could not: spent, or
 /// with no reading, or needing a login.
 pub fn queue<'a>(candidates: &'a [Candidate<'a>], rules: &Rules, now: Timestamp) -> Vec<&'a str> {
+    queue_roles(candidates, rules, now)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// What an account is in the order [`queue`] puts them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The account the CLI is signed in to.
+    InUse,
+    /// The account a switch would go to.
+    NextUp,
+    /// One that could be switched to, after the one next up.
+    Queued,
+    /// One that could not be switched to now: spent, without a recent
+    /// reading, or needing a login.
+    Unusable,
+}
+
+/// [`queue`], with what each account is in it.
+///
+/// Next up is the first account a switch could go to, whether or not
+/// anything is in use: with nothing signed in there is no switch to make, but
+/// the order still says which account would be taken first.
+pub fn queue_roles<'a>(
+    candidates: &'a [Candidate<'a>],
+    rules: &Rules,
+    now: Timestamp,
+) -> Vec<(&'a str, Role)> {
     let active = candidates.iter().find(|c| c.active);
     let mut usable: Vec<(&Candidate<'_>, &Usage)> = candidates
         .iter()
@@ -404,13 +434,19 @@ pub fn queue<'a>(candidates: &'a [Candidate<'a>], rules: &Rules, now: Timestamp)
         |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
     rank(&mut usable, rules, now, &remaining);
 
-    let ranked: Vec<&str> = active
-        .map(|c| c.id)
+    let ranked: Vec<(&str, Role)> = active
+        .map(|c| (c.id, Role::InUse))
         .into_iter()
-        .chain(usable.iter().map(|(c, _)| c.id))
+        .chain(usable.iter().enumerate().map(|(index, (c, _))| {
+            let role = if index == 0 { Role::NextUp } else { Role::Queued };
+            (c.id, role)
+        }))
         .collect();
     // Whatever the ranking had no place for still belongs on screen, after it.
-    let rest = candidates.iter().map(|c| c.id).filter(|id| !ranked.contains(id));
+    let rest = candidates
+        .iter()
+        .filter(|c| !ranked.iter().any(|(id, _)| *id == c.id))
+        .map(|c| (c.id, Role::Unusable));
     ranked.iter().copied().chain(rest).collect()
 }
 
@@ -1193,6 +1229,66 @@ mod tests {
         // It must not be offered as the roomiest thing available.
         let order = queue(&candidates, &Rules::default(), later);
         assert_eq!(order, ["claude-1", "claude-2"]);
+    }
+
+    /// Each account's role is read off the same ranking the switch is chosen
+    /// from: the one in use, the one a switch would go to, the rest that
+    /// could be taken in their order, and then those that could not.
+    #[test]
+    fn the_queue_names_each_accounts_role_in_it() {
+        let (busy, roomy, roomier, spent, old) = (
+            usage(95.0),
+            usage(30.0),
+            usage(10.0),
+            usage(100.0),
+            usage_aged(5.0, 2 * 3600),
+        );
+        let signed_out = Candidate {
+            usable: false,
+            ..candidate("claude-6", Some(&roomier), false)
+        };
+        let candidates = [
+            candidate("claude-1", Some(&spent), false),
+            candidate("claude-2", Some(&roomy), false),
+            candidate("claude-3", Some(&busy), true),
+            candidate("claude-4", Some(&roomier), false),
+            candidate("claude-5", Some(&old), false),
+            signed_out,
+            candidate("claude-7", None, false),
+        ];
+        let roles = queue_roles(&candidates, &Rules::default(), now());
+        assert_eq!(
+            roles,
+            [
+                ("claude-3", Role::InUse),
+                ("claude-4", Role::NextUp),
+                ("claude-2", Role::Queued),
+                ("claude-1", Role::Unusable),
+                ("claude-5", Role::Unusable),
+                ("claude-6", Role::Unusable),
+                ("claude-7", Role::Unusable),
+            ]
+        );
+        let decision = decide(&candidates, &Rules::default(), now());
+        assert!(
+            matches!(&decision, Decision::Switch { to, .. } if to == "claude-4"),
+            "next up is where the switch goes: {decision:?}"
+        );
+        assert_eq!(
+            queue(&candidates, &Rules::default(), now()),
+            roles.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+
+        // With nothing in use there is still an account a switch would start
+        // from, and it is next up.
+        let idle = [
+            candidate("claude-1", Some(&roomy), false),
+            candidate("claude-2", Some(&roomier), false),
+        ];
+        assert_eq!(
+            queue_roles(&idle, &Rules::default(), now()),
+            [("claude-2", Role::NextUp), ("claude-1", Role::Queued)]
+        );
     }
 
     #[test]

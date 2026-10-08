@@ -18,6 +18,7 @@ pub mod fleet;
 pub mod foreign;
 pub mod fsutil;
 pub mod http;
+pub mod json_io;
 pub mod jwt;
 pub mod lock;
 pub mod paths;

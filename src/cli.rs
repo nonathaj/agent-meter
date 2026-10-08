@@ -12,12 +12,14 @@ use comfy_table::{Cell, Color, ContentArrangement, LineStyle, Table, TableStyle}
 use jiff::Timestamp;
 use serde_json::json;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::account::ProviderKind;
 use crate::engine::{AddOutcome, Engine, Status, SwitchOutcome, TickOutcome};
 use crate::foreign::Source;
-use crate::policy::{Blocked, Decision, Reason, Stay};
+use crate::policy::{Blocked, Decision, Reason, Role, Stay};
+use crate::usage::WindowKind;
 
 /// Exit code used when a switch was wanted but every account is used up.
 const EXIT_BLOCKED: u8 = 3;
@@ -60,6 +62,13 @@ enum Command {
     /// CLI you have open keeps the credentials it is using.
     Add(AddArgs),
 
+    /// Sign in to a stored account again
+    ///
+    /// For an account the provider has signed out. As with `add`, the login
+    /// runs in a throwaway configuration directory, and whichever account is
+    /// actually signed in to is the one stored.
+    Login(LoginArgs),
+
     /// Store the account an agent CLI is already signed in to
     Import(ImportArgs),
 
@@ -81,6 +90,11 @@ enum Command {
     Remove(RemoveArgs),
 
     /// Watch usage and switch accounts as limits approach
+    ///
+    /// Settings are read again before every check, so `agent-meter config set`
+    /// reaches a watcher that is already running, and a change to them brings
+    /// the next check forward. A threshold or interval given here holds for
+    /// this run whatever the file says.
     Watch(WatchArgs),
 
     /// Open the terminal UI
@@ -310,7 +324,26 @@ struct AddArgs {
     /// Use the device-code flow, for machines with no browser (Codex only)
     #[arg(long)]
     device_code: bool,
+    #[arg(long, conflicts_with = "device_code", help = JSON_IO_HELP, long_help = JSON_IO_LONG_HELP)]
+    json_io: bool,
 }
+
+#[derive(Args, Debug)]
+struct LoginArgs {
+    /// Account id, email or label
+    account: String,
+    #[arg(long, help = JSON_IO_HELP, long_help = JSON_IO_LONG_HELP)]
+    json_io: bool,
+}
+
+const JSON_IO_HELP: &str = "Let another program drive the login, in JSON lines";
+const JSON_IO_LONG_HELP: &str = "Let another program drive the login, in JSON lines\n\n\
+    Stdout carries one object per line and nothing else: {\"event\":\"url\",\"url\":…} for the \
+    sign-in page, {\"event\":\"need_code\"} when the page's code is wanted, then \
+    {\"event\":\"done\",\"account\":…,\"added\":bool} or {\"event\":\"error\",\"message\":…} as the \
+    last line. Codes are read from stdin as {\"code\":…} lines. SIGTERM cancels, as does stdin \
+    closing after a code is asked for and before one is sent. Nothing is stored unless the login \
+    finishes.";
 
 #[derive(Args, Debug)]
 struct ImportArgs {
@@ -481,7 +514,15 @@ fn run() -> Result<ExitCode> {
     if let Command::Update(args) = &command {
         return update(args);
     }
-    let engine = Engine::open()?;
+    let engine = match Engine::open() {
+        Ok(engine) => engine,
+        // A program driving a login reads stdout for how it ended, so even a
+        // failure before the login starts is reported there.
+        Err(error) if drives_login_in_json(&command) => {
+            return Ok(finish_program_login(&Err(crate::config::said_elsewhere(&error))));
+        }
+        Err(error) => return Err(error),
+    };
 
     match command {
         Command::Update(_) => unreachable!("handled before opening the account store"),
@@ -489,6 +530,7 @@ fn run() -> Result<ExitCode> {
         Command::Run(args) => run_pinned(&engine, &args),
         Command::List(args) => list(&engine, &args),
         Command::Add(args) => add(&engine, &args),
+        Command::Login(args) => login(&engine, &args),
         Command::Import(args) => import(&engine, &args),
         Command::Export(args) => export(&engine, &args),
         Command::Sync(args) => sync(&engine, &args),
@@ -529,9 +571,22 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
 
     if args.json {
         let now = Timestamp::now();
+        let places: HashMap<String, (usize, Role)> = ProviderKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                engine
+                    .queue(&statuses, kind)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (id, role))| (id, (index + 1, role)))
+            })
+            .collect();
         let rows: Vec<_> = statuses
             .iter()
-            .map(|s| status_json(s, now, engine.poll_interval(s.account.provider).as_secs()))
+            .map(|s| {
+                let interval = engine.poll_interval(s.account.provider).as_secs();
+                status_json(s, now, interval, places.get(&s.account.id).copied())
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(ExitCode::SUCCESS);
@@ -547,7 +602,17 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn status_json(status: &Status, now: Timestamp, poll_interval: u64) -> serde_json::Value {
+/// One account as `list --json` prints it.
+///
+/// `place` is its position in its provider's queue, counted from 1, and what
+/// it is there. Fields are only ever added at the end of an object, so a
+/// reader written against an older version sees what it always saw.
+fn status_json(
+    status: &Status,
+    now: Timestamp,
+    poll_interval: u64,
+    place: Option<(usize, Role)>,
+) -> serde_json::Value {
     json!({
         "id": status.account.id,
         "provider": status.account.provider,
@@ -564,18 +629,26 @@ fn status_json(status: &Status, now: Timestamp, poll_interval: u64) -> serde_jso
             "observedAt": usage.observed_at,
             "usedPercent": usage.used_at(now),
             "exhausted": usage.is_exhausted_at(now),
-            "windows": usage.windows.iter().map(|w| json!({
-                "label": w.label(),
-                "kind": match w.kind() {
-                    crate::usage::WindowKind::FiveHour => "five_hour",
-                    crate::usage::WindowKind::Weekly => "weekly",
-                    crate::usage::WindowKind::Other => "other",
-                },
-                "scope": w.scope,
-                "windowSeconds": w.window_secs,
-                "usedPercent": w.used_at(now),
-                "resetsAt": w.resets_at,
-            })).collect::<Vec<_>>(),
+            "windows": usage.windows.iter().map(|w| {
+                let mut window = json!({
+                    "label": w.label(),
+                    "kind": match w.kind() {
+                        WindowKind::FiveHour => "five_hour",
+                        WindowKind::Weekly => "weekly",
+                        WindowKind::Other => "other",
+                    },
+                    "scope": w.scope,
+                    "windowSeconds": w.window_secs,
+                    "usedPercent": w.used_at(now),
+                    "resetsAt": w.resets_at,
+                });
+                // Only a budget can be overspent. A five-hour window is a
+                // rate, and being ahead of its clock is ordinary.
+                if w.kind() == WindowKind::Weekly {
+                    window["pace"] = json!({"aheadPercent": w.ahead_of_pace(now)});
+                }
+                window
+            }).collect::<Vec<_>>(),
             "limitResets": usage.resets.as_ref().map(|resets| json!({
                 "available": resets.left_at(now),
                 "nextExpiresAt": resets.next_expiry_at(now),
@@ -589,6 +662,15 @@ fn status_json(status: &Status, now: Timestamp, poll_interval: u64) -> serde_jso
         })),
         "error": status.error,
         "errorAt": status.error_at,
+        "queue": place.map(|(position, role)| json!({
+            "position": position,
+            "role": match role {
+                Role::InUse => "in_use",
+                Role::NextUp => "next_up",
+                Role::Queued => "queued",
+                Role::Unusable => "unusable",
+            },
+        })),
     })
 }
 
@@ -742,6 +824,9 @@ fn used_cell(used: Option<f64>, exhausted: bool) -> Cell {
 }
 
 fn add(engine: &Engine, args: &AddArgs) -> Result<ExitCode> {
+    if args.json_io {
+        return Ok(login_for_program(engine, args.provider, None, args.label.clone()));
+    }
     println!(
         "Logging in to a new {} account in a temporary configuration directory.",
         args.provider.display_name()
@@ -757,6 +842,107 @@ fn add(engine: &Engine, args: &AddArgs) -> Result<ExitCode> {
             .context("starting the login. Is the CLI installed and on PATH?")
     })?;
     report_added(engine, &[outcome])
+}
+
+fn login(engine: &Engine, args: &LoginArgs) -> Result<ExitCode> {
+    let account = match engine.resolve(&args.account) {
+        Ok(account) => account,
+        Err(error) if args.json_io => return Ok(finish_program_login(&Err(format!("{error:#}")))),
+        Err(error) => return Err(error),
+    };
+    if args.json_io {
+        return Ok(login_for_program(
+            engine,
+            account.provider,
+            Some(account.id.clone()),
+            None,
+        ));
+    }
+
+    println!(
+        "Signing in to {} ({}) again in a temporary configuration directory.",
+        account.id,
+        account.display_name()
+    );
+    println!(
+        "Any {} you already have running keeps its own login.\n",
+        account.provider.display_name()
+    );
+    let outcome = engine.login(account.provider, None, false, |command| {
+        command
+            .status()
+            .context("starting the login. Is the CLI installed and on PATH?")
+    })?;
+    if outcome.id() != account.id {
+        eprintln!(
+            "That signed in to {} rather than {}, so {} is as it was.",
+            outcome.id(),
+            account.id,
+            account.id
+        );
+    }
+    report_added(engine, &[outcome])
+}
+
+/// Runs a login for a program at the other end of stdin and stdout.
+fn login_for_program(
+    engine: &Engine,
+    provider: ProviderKind,
+    account: Option<String>,
+    label: Option<String>,
+) -> ExitCode {
+    // SIGTERM is how the program gives up on a login. Left to its default it
+    // would end this process on the spot, leaving the CLI running and its
+    // throwaway directory, credential and all, behind.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    if let Err(error) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        return finish_program_login(&Err(format!("installing the interrupt handler: {error}")));
+    }
+
+    let outcome = crate::json_io::run(
+        engine.store().clone(),
+        provider,
+        account,
+        label,
+        io::BufReader::new(io::stdin()),
+        &mut io::stdout(),
+        &stop,
+    );
+    // A first reading is what makes an account eligible for switching, so
+    // one is taken before the login is reported finished. Not getting one
+    // does not undo the login.
+    if let Ok(added) = &outcome {
+        match engine.poll(&[added.id().to_string()], true) {
+            Ok(results) => {
+                for (id, result) in results {
+                    if let Err(error) = result {
+                        eprintln!("Could not read usage for {id} yet: {error}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("Could not read usage for {} yet: {error:#}", added.id()),
+        }
+    }
+    finish_program_login(&outcome)
+}
+
+/// Whether `command` is a login another program drives over JSON lines.
+fn drives_login_in_json(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Add(AddArgs { json_io: true, .. }) | Command::Login(LoginArgs { json_io: true, .. })
+    )
+}
+
+/// Writes a program-driven login's last line, and the exit code to go with it.
+fn finish_program_login(outcome: &Result<AddOutcome, String>) -> ExitCode {
+    let _ = crate::json_io::emit(&mut io::stdout(), &crate::json_io::Event::finish(outcome));
+    if outcome.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn import(engine: &Engine, args: &ImportArgs) -> Result<ExitCode> {
@@ -1132,9 +1318,9 @@ fn confirm(prompt: &str) -> Result<bool> {
 }
 
 fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
-    let mut engine = Engine::with_store(engine.store().clone())?;
-    engine.override_watch(args.threshold, args.interval)?;
-    let interval = Duration::from_secs(engine.config().watch.poll_secs);
+    let store = engine.store().clone();
+    let mut settings_read = settings_file(&store);
+    let mut engine = watch_engine(&store, args)?;
 
     if args.once {
         let outcomes = tick_and_share(&engine, args.dry_run)?;
@@ -1148,10 +1334,12 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
 
     println!(
         "Watching every {} at a {:.0}% threshold. Press Ctrl-C to stop.",
-        crate::timefmt::duration(interval.as_secs()),
+        crate::timefmt::duration(engine.config().watch.poll_secs),
         engine.config().watch.threshold
     );
+    let mut unreadable: Option<String> = None;
     while running.load(Ordering::SeqCst) {
+        let interval = Duration::from_secs(engine.config().watch.poll_secs);
         let sleep_for = match tick_and_share(&engine, args.dry_run) {
             Ok(outcomes) => wait_after(&outcomes, &engine, interval),
             Err(error) => {
@@ -1161,15 +1349,63 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
                 interval
             }
         };
-        // Wake often enough to notice Ctrl-C promptly.
+        // Wake often enough to notice Ctrl-C promptly, and a change to the
+        // settings at once: whoever made it is waiting to see it take effect,
+        // and with every account spent the wait can run to hours.
         let mut waited = Duration::ZERO;
-        while running.load(Ordering::SeqCst) && waited < sleep_for {
+        while running.load(Ordering::SeqCst) && waited < sleep_for && settings_file(&store) == settings_read {
             std::thread::sleep(Duration::from_millis(200));
             waited += Duration::from_millis(200);
+        }
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Read again before every check, so `config set` reaches a watcher
+        // that is already running. Taken before the read, so a change landing
+        // in between is still seen as a change next time round.
+        settings_read = settings_file(&store);
+        match watch_engine(&store, args) {
+            Ok(fresh) => {
+                engine = fresh;
+                unreadable = None;
+            }
+            // A file edited by hand into something that does not read must
+            // neither stop the watcher nor drop it back to the defaults. The
+            // reason stays out of the log, which may be shared: the parser
+            // quotes the offending line, and this file can hold secrets.
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if unreadable.as_deref() != Some(reason.as_str()) {
+                    eprintln!(
+                        "{} {} could not be read, so the settings read before it stay in force; \
+                         `agent-meter config show` says why",
+                        Timestamp::now(),
+                        crate::config::Config::path(store.dir()).display()
+                    );
+                }
+                unreadable = Some(reason);
+            }
         }
     }
     println!("Stopped.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The engine a watcher runs on: the settings file as it stands, with the
+/// command line's overrides on top, since those were given for this run.
+fn watch_engine(store: &crate::store::Store, args: &WatchArgs) -> Result<Engine> {
+    let mut engine = Engine::with_store(store.clone())?;
+    engine.override_watch(args.threshold, args.interval)?;
+    Ok(engine)
+}
+
+/// The settings file's contents, to tell when it has changed. `None` when
+/// there is no file, or it cannot be read.
+fn settings_file(store: &crate::store::Store) -> Option<Vec<u8>> {
+    crate::fsutil::read_optional(&crate::config::Config::path(store.dir()))
+        .ok()
+        .flatten()
 }
 
 /// One check, and then whatever it changed goes to the other machines.
@@ -1362,6 +1598,17 @@ mod tests {
             panic!("expected watch");
         };
         assert_eq!(args.threshold, Some(80.0));
+
+        let Some(Command::Login(args)) =
+            Cli::parse_from(["agent-meter", "login", "claude-1", "--json-io"]).command
+        else {
+            panic!("expected login");
+        };
+        assert_eq!(args.account, "claude-1");
+        assert!(args.json_io);
+        // A device code is read off the screen by a person, and the JSON lines
+        // have no place to carry one.
+        assert!(Cli::try_parse_from(["agent-meter", "add", "codex", "--device-code", "--json-io"]).is_err());
     }
 
     #[test]

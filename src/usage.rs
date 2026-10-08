@@ -79,6 +79,24 @@ impl Window {
             _ => self.used_percent.max(0.0),
         }
     }
+
+    /// How many points more of this window are spent than an even pace
+    /// through it would have spent by `now`: used less the share of the
+    /// window that has gone by.
+    ///
+    /// `None` when it is not ahead, and when nothing dates the window — no
+    /// reset time, or one further off than the window is long — since then
+    /// there is no clock to be ahead of.
+    pub fn ahead_of_pace(&self, now: Timestamp) -> Option<f64> {
+        let resets_at = self.resets_at?;
+        let remaining = (resets_at.as_second() - now.as_second()).max(0) as f64;
+        if self.window_secs == 0 || remaining > self.window_secs as f64 {
+            return None;
+        }
+        let elapsed = 100.0 * (1.0 - remaining / self.window_secs as f64);
+        let ahead = self.used_at(now) - elapsed;
+        (ahead > 0.0).then_some(ahead)
+    }
 }
 
 /// A usage snapshot for one account.
@@ -400,6 +418,32 @@ mod tests {
         let json = serde_json::to_string(&usage).unwrap();
         assert!(json.contains(r#""refills":["five_hour","weekly"]"#), "{json}");
         assert_eq!(serde_json::from_str::<Usage>(&json).unwrap(), usage);
+    }
+
+    /// Half a week gone with 60% of it spent is ten points ahead of an even
+    /// pace; anything not ahead, or with nothing to date the window, says
+    /// nothing at all.
+    #[test]
+    fn pace_is_measured_against_the_clock_of_the_window() {
+        let now = ts(1_000_000);
+        let half_gone = |used| window(ONE_WEEK, used, 1_000_000 + ONE_WEEK as i64 / 2);
+        assert_eq!(half_gone(60.0).ahead_of_pace(now), Some(10.0));
+        assert_eq!(half_gone(50.0).ahead_of_pace(now), None, "on pace is not ahead");
+        assert_eq!(half_gone(40.0).ahead_of_pace(now), None);
+
+        let undated = Window {
+            resets_at: None,
+            ..half_gone(90.0)
+        };
+        assert_eq!(undated.ahead_of_pace(now), None);
+        // A reset further off than the window is long dates nothing.
+        assert_eq!(
+            window(ONE_WEEK, 90.0, 1_000_000 + 2 * ONE_WEEK as i64).ahead_of_pace(now),
+            None
+        );
+        assert_eq!(window(0, 90.0, 1_000_100).ahead_of_pace(now), None);
+        // A window that has turned over is empty, and so on no pace at all.
+        assert_eq!(window(ONE_WEEK, 90.0, 999_000).ahead_of_pace(now), None);
     }
 
     #[test]

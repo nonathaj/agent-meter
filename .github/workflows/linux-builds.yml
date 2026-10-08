@@ -1,0 +1,65 @@
+name: Linux builds
+
+# Every push to main is built for Linux on both architectures and kept as
+# this run's artifacts, for machines that run main rather than a release.
+# Nothing is tagged or released, so the release workflow and
+# `agent-meter update` never see these builds.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-musl, x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # ring compiles C and assembly for the target, so the build needs a C
+      # cross-compiler as well as Rust's target. Zig is one for every target
+      # in a single download, with no container to run.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+      - name: Name the binary and its checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir out
+          name="agent-meter-$TARGET"
+          cp "target/$TARGET/release/agent-meter" "out/$name"
+          cd out
+          sha256sum "$name" > "$name.sha256"
+          cat "$name.sha256"
+          file "$name"
+      # The runner can run its own architecture's binary, so that one is
+      # seen to start.
+      - name: Run it
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: out/agent-meter-x86_64-unknown-linux-musl --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent-meter-${{ matrix.target }}
+          path: out/
+          if-no-files-found: error

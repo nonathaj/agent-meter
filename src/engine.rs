@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::account::{Account, Captured, Credential, Match, ProviderKind, SCHEMA_VERSION, same_identity};
 use crate::config::Config;
 use crate::http;
-use crate::policy::{self, Candidate, Decision, Disruption, Reason, Rules};
+use crate::policy::{self, Candidate, Decision, Disruption, Reason, Role, Rules};
 use crate::provider::{self, Provider};
 use crate::remote::Report;
 use crate::store::{Store, SwitchRecord, UsageCache};
@@ -170,11 +170,16 @@ impl Engine {
     /// The same ranking the watcher switches on, so a list showing this order
     /// is showing what will happen rather than an arrangement of its own.
     pub fn switch_order(&self, statuses: &[Status], kind: ProviderKind) -> Vec<String> {
+        self.queue(statuses, kind).into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// [`Self::switch_order`], with what each account is in that order.
+    pub fn queue(&self, statuses: &[Status], kind: ProviderKind) -> Vec<(String, Role)> {
         let mine: Vec<&Status> = statuses.iter().filter(|s| s.account.provider == kind).collect();
         let candidates: Vec<Candidate<'_>> = mine.iter().map(|s| self.candidate(s)).collect();
-        policy::queue(&candidates, &self.rules_for(kind), Timestamp::now())
+        policy::queue_roles(&candidates, &self.rules_for(kind), Timestamp::now())
             .into_iter()
-            .map(ToString::to_string)
+            .map(|(id, role)| (id.to_string(), role))
             .collect()
     }
 

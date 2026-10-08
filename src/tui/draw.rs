@@ -548,14 +548,7 @@ fn ahead_of_pace(window: &Window, now: Timestamp) -> Option<f64> {
     if window.kind() != crate::usage::WindowKind::Weekly {
         return None;
     }
-    let resets_at = window.resets_at?;
-    let remaining = (resets_at.as_second() - now.as_second()).max(0) as f64;
-    if window.window_secs == 0 || remaining > window.window_secs as f64 {
-        return None;
-    }
-    let elapsed = 100.0 * (1.0 - remaining / window.window_secs as f64);
-    let over = window.used_at(now) - elapsed;
-    (over > PACE_SLACK).then_some(over)
+    window.ahead_of_pace(now).filter(|over| *over > PACE_SLACK)
 }
 
 /// Why an account has no figures: what it means in `colour`, then the

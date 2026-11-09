@@ -2216,6 +2216,7 @@ impl Watcher {
     /// Far sooner than the watcher's own interval, which is a minute at the
     /// least: a line that only comes when that runs out is a line that did not
     /// come in time.
+    #[track_caller]
     fn next(&self, what: &str) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
@@ -2227,6 +2228,40 @@ impl Watcher {
             }
         }
     }
+
+    /// Waits for the next line on standard error that contains `error` and
+    /// the next line on standard output that contains `output`, and returns
+    /// both.
+    ///
+    /// The two streams are read on two threads, so a line on one can arrive
+    /// before a line the watcher printed earlier on the other. Waiting for
+    /// one and then the other would throw away the second when it came first.
+    #[track_caller]
+    fn next_of_each(&self, error: &str, output: &str) -> (String, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (mut from_error, mut from_output): (Option<String>, Option<String>) = (None, None);
+        loop {
+            if let (Some(e), Some(o)) = (&from_error, &from_output) {
+                return (e.clone(), o.clone());
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => match line.strip_prefix("stderr: ") {
+                    Some(rest) if rest.contains(error) => {
+                        from_error.get_or_insert(line);
+                    }
+                    None if line.contains(output) => {
+                        from_output.get_or_insert(line);
+                    }
+                    _ => {}
+                },
+                Err(_) => {
+                    let missing = if from_error.is_none() { error } else { output };
+                    panic!("the watcher never printed {missing:?}")
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Watcher {
@@ -2234,6 +2269,24 @@ impl Drop for Watcher {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Replaces `path` with `contents` in one step, as an editor saving the file
+/// would. Written in place, the file is empty for an instant, and a watcher
+/// that read it then would see no settings at all.
+///
+/// The rename is retried for a moment: on Windows a virus scanner looking at
+/// the new file can briefly refuse it, as `fsutil` allows for.
+fn replace_file(path: &Path, contents: &str) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, contents).unwrap();
+    for _ in 0..50 {
+        if std::fs::rename(&staged, path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::rename(&staged, path).unwrap();
 }
 
 /// Two Claude accounts with only five-hour windows, so that the threshold
@@ -2304,12 +2357,12 @@ fn a_settings_file_that_no_longer_reads_leaves_the_last_good_settings() {
     assert_eq!(watcher.next("Claude Code:"), WOULD_SWITCH);
 
     let config = fixture.data.join("config.toml");
-    std::fs::write(&config, "[watch]\nthreshold = \"high\"\n").unwrap();
-    let warning = watcher.next("stderr: ");
-    assert!(warning.contains("config.toml"), "{warning}");
-    assert_eq!(watcher.next("Claude Code:"), WOULD_SWITCH);
+    replace_file(&config, "[watch]\nthreshold = \"high\"\n");
+    let (warning, check) = watcher.next_of_each("config.toml", "Claude Code:");
+    assert!(warning.contains("could not be read"), "{warning}");
+    assert_eq!(check, WOULD_SWITCH);
 
-    std::fs::write(&config, "[watch]\nthreshold = 95.0\n").unwrap();
+    replace_file(&config, "[watch]\nthreshold = 95.0\n");
     assert_eq!(watcher.next("Claude Code:"), STAYS);
 }
 

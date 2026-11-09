@@ -1352,8 +1352,18 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         // Wake often enough to notice Ctrl-C promptly, and a change to the
         // settings at once: whoever made it is waiting to see it take effect,
         // and with every account spent the wait can run to hours.
+        //
+        // A change counts once the file reads the same twice in a row. A file
+        // saved in place is cut to nothing before it is written, and caught in
+        // that instant it would read as no settings at all: the defaults.
         let mut waited = Duration::ZERO;
-        while running.load(Ordering::SeqCst) && waited < sleep_for && settings_file(&store) == settings_read {
+        let mut last_seen = settings_read.clone();
+        while running.load(Ordering::SeqCst) && waited < sleep_for {
+            let seen = settings_file(&store);
+            if seen != settings_read && seen == last_seen {
+                break;
+            }
+            last_seen = seen;
             std::thread::sleep(Duration::from_millis(200));
             waited += Duration::from_millis(200);
         }

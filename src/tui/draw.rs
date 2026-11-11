@@ -729,16 +729,26 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    // Built until it fills the width and no further: a bar that runs off the
-    // edge hides the keys at its end, which are still keys somebody needs.
-    let mut spans = vec![Span::raw(" ")];
-    let mut used = 1usize;
-    for (key, what) in keys {
+    // Fitted to the width, since a bar that runs off the edge hides whatever
+    // is at its end. What gives way in a narrow window is the middle: the bar
+    // ends with the way out and, while browsing, the way to the full list of
+    // keys, and those are needed most when the least is on screen.
+    let ending = if matches!(app.mode, Mode::Browse) { 2 } else { 1 };
+    let ending = keys.len().saturating_sub(ending);
+    let mut room = (area.width as usize).saturating_sub(1);
+    let mut fits = vec![false; keys.len()];
+    for index in (ending..keys.len()).rev().chain(0..ending) {
+        let (key, what) = &keys[index];
         let width = key.chars().count() + what.chars().count() + 4;
-        if used + width > area.width as usize {
+        if width > room {
             break;
         }
-        used += width;
+        room -= width;
+        fits[index] = true;
+    }
+
+    let mut spans = vec![Span::raw(" ")];
+    for ((key, what), _) in keys.into_iter().zip(fits).filter(|(_, fits)| *fits) {
         spans.push(Span::styled(
             key.to_string(),
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1436,6 +1446,46 @@ mod tests {
         assert!(
             lines[lines.len() - 2].contains("enter use"),
             "the keys are just above it: {screen}"
+        );
+    }
+
+    /// A window too narrow for every key still says how to see them all and
+    /// how to leave: the keys that give way are the ones in the middle.
+    #[test]
+    fn a_narrow_footer_keeps_the_keys_that_lead_to_the_rest() {
+        // Tall enough that the login panel, which grows to show the whole of
+        // its link, stays clear of the footer.
+        let footer = |app: &mut App, width| {
+            let screen = render(app, width, 40);
+            let lines: Vec<&str> = screen.lines().collect();
+            lines[lines.len() - 2].trim().to_string()
+        };
+        let mut app = App::for_tests(crate::tui::app::sample_statuses(2));
+
+        let wide = footer(&mut app, 200);
+        assert_eq!(
+            wide,
+            "enter use   l sign in   w Claude Code auto   tab agents   r refresh   a add   i import   \
+             d remove   ? keys   q quit"
+        );
+        // Keys go from the middle, last first, and the order of the rest holds.
+        assert_eq!(
+            footer(&mut app, 80),
+            "enter use   l sign in   w Claude Code auto   tab agents   ? keys   q quit"
+        );
+        assert_eq!(footer(&mut app, 40), "enter use   ? keys   q quit");
+        assert_eq!(footer(&mut app, 20), "? keys   q quit");
+        assert_eq!(footer(&mut app, 12), "q quit");
+
+        // Anywhere else, the last key is the way back out.
+        let mut app = signing_in();
+        assert_eq!(
+            footer(&mut app, 80),
+            "enter submit code   ctrl+o open link   c copy link   esc cancel"
+        );
+        assert_eq!(
+            footer(&mut app, 60),
+            "enter submit code   ctrl+o open link   esc cancel"
         );
     }
 

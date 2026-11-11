@@ -29,3 +29,9 @@ install-updater = true
 create-release = true
 # On a pull request, only check that a release could be planned.
 pr-run-mode = "plan"
+
+# dist 0.32 builds Apple Silicon on macos-14, a runner GitHub no longer
+# offers, and one cancelled build stops the whole release. dist 0.34 makes
+# macos-15 its default; this can go once `cargo-dist-version` is there.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"

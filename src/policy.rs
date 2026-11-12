@@ -549,6 +549,7 @@ mod tests {
             }],
             limit_reached: false,
             resets: None,
+            counted: Vec::new(),
         }
     }
 
@@ -591,6 +592,7 @@ mod tests {
             ],
             limit_reached: false,
             resets: None,
+            counted: Vec::new(),
         }
     }
 
@@ -615,6 +617,7 @@ mod tests {
             ],
             limit_reached: false,
             resets: None,
+            counted: Vec::new(),
         }
     }
 
@@ -1207,6 +1210,82 @@ mod tests {
         assert_eq!(reading.worst_at(now), 100.0, "worth showing");
         assert_eq!(reading.used_at(now), 20.0, "not worth refusing the account for");
         assert!(!reading.is_exhausted_at(now));
+    }
+
+    /// A model named in the settings is the one the work is done in, so its
+    /// limit is the account's: nearing it is a reason to leave, and an account
+    /// that has spent it is nowhere to go.
+    #[test]
+    fn a_counted_models_limit_is_the_accounts_own() {
+        let now = now();
+        let week = Timestamp::from_second(NOW + 5 * 86_400).ok();
+        let with_fable = |fable: f64| {
+            let mut reading = metered(10.0, 3600, 20.0, 5);
+            reading.windows.push(Window {
+                window_secs: ONE_WEEK,
+                scope: Some("Fable".into()),
+                used_percent: fable,
+                resets_at: week,
+            });
+            reading
+        };
+        let rules = Rules::default();
+
+        // Left uncounted, the model's limit moves nothing.
+        let (busy, spent, roomy) = (with_fable(95.0), with_fable(100.0), with_fable(30.0));
+        let candidates = [
+            candidate("claude-1", Some(&busy), true),
+            candidate("claude-2", Some(&spent), false),
+            candidate("claude-3", Some(&roomy), false),
+        ];
+        assert_eq!(
+            decide(&candidates, &rules, now),
+            Decision::Stay(Stay::BelowThreshold { used: 20.0 })
+        );
+
+        // Counted, however the settings happen to case its name.
+        let counted = ["fable".to_string()];
+        let (busy, spent, roomy) = (
+            busy.counting(&counted),
+            spent.counting(&counted),
+            roomy.counting(&counted),
+        );
+        assert_eq!(busy.used_at(now), 95.0);
+        assert!(spent.is_exhausted_at(now));
+        assert_eq!(spent.next_relief(now), week);
+        let candidates = [
+            candidate("claude-1", Some(&busy), true),
+            candidate("claude-2", Some(&spent), false),
+            candidate("claude-3", Some(&roomy), false),
+        ];
+        assert_eq!(
+            decide(&candidates, &rules, now),
+            Decision::Switch {
+                to: "claude-3".into(),
+                reason: Reason::ThresholdCrossed {
+                    used: 95.0,
+                    target_used: 30.0
+                },
+            }
+        );
+        assert_eq!(
+            queue_roles(&candidates, &rules, now),
+            [
+                ("claude-1", Role::InUse),
+                ("claude-3", Role::NextUp),
+                ("claude-2", Role::Unusable),
+            ]
+        );
+
+        // With only the spent one to go to, there is nowhere to go until its
+        // model's week turns over.
+        assert_eq!(
+            decide(&candidates[..2], &rules, now),
+            Decision::Blocked(Blocked::AllExhausted {
+                relief_at: week,
+                relief_account: Some("claude-2".into()),
+            })
+        );
     }
 
     /// A reading whose every window has turned over states no usage, which is

@@ -238,7 +238,16 @@ that corrects itself.
 
 Every operation is on a key: `enter` to switch, `r` to refresh, `tab` to filter
 by harness, `a` to add, `l` to sign in to the selected account again, `i` to
-import, `d` to remove, `w` to switch automatically, `?` for the rest.
+import, `d` to remove, `w` to switch automatically, `s` for the settings, `?`
+for the rest.
+
+`s` lists every [setting](#settings) with what it is set to: those every agent
+shares, then each agent's own — whether it switches, a threshold for it alone,
+and a line for each model its accounts are metered on, to count that model's
+limit as the account's. `↑` `↓` move, `←` `→` step a number, `space` turns a
+choice over, and `del` gives an agent's own threshold back. Each change is
+written to the settings file as it is made, so a running `agent-meter watch`
+takes it up at its next check.
 
 Logging in never leaves the interface. `a` and `l` run the agent CLI's own
 login in the background and show it in a panel: the sign-in page opens in your
@@ -263,7 +272,9 @@ Each account includes `id`, `provider`, `active`, `needsLogin`,
 `kind` (`five_hour`, `weekly`, `other`), nullable model `scope`, `windowSeconds`,
 `usedPercent`, `resetsAt`, and a human-readable `label`. Use `kind` and `scope`
 for ingestion rather than parsing the display label. A scoped model limit is
-not an account-wide limit.
+not an account-wide limit, and is left out of the account's `usedPercent` and
+`exhausted` unless `provider.<name>.models` names its model. Each window says
+which it is in `counted`: `true` for a limit the account is judged on.
 
 Usage also carries `limitResets`: `available`, `nextExpiresAt`, and `grants`,
 each with a `title`, `left`, `expiresAt` and the window kinds it `refills`.
@@ -363,6 +374,25 @@ limits count: `weekly Opus` at 100% costs one model, while `weekly` at 100%
 stops the account, so a spent per-model window never makes an account look
 unusable.
 
+### The model you work in
+
+That is the wrong answer for the one model you do your work in: to you, an
+account that has spent its `weekly Fable` is spent. Name the model and its
+limit is judged as one of the account's own, in every way they are:
+
+```console
+agent-meter config set provider.claude.models Fable
+```
+
+An account nearing that limit is left as the threshold says, one that has spent
+it is not switched to, and it frees up when that model's week turns over. Name
+several with commas between them, as the provider writes them in the `WINDOWS`
+column (`weekly Fable` is `Fable`; capitals do not matter), and none at all to
+go back to counting no model: `agent-meter config set provider.claude.models ""`.
+
+This arrived in 0.1.9, and an older `agent-meter` refuses a settings file that
+names a model. Where several installs read one file, update them all first.
+
 ### The five-hour window gates; the week ranks
 
 The two limits are not the same kind of thing, and ranking on whichever happens
@@ -430,8 +460,13 @@ agent-meter config set provider.codex.enabled false
 | `watch.poll-secs` | `60` | Seconds between checks. Each provider is still polled no faster than it allows. |
 | `watch.margin` | `5` | Extra headroom needed to switch when every account is busy. |
 | `watch.cooldown-secs` | `300` | Minimum gap between automatic switches. |
+| `watch.wait-for-reset` | `true` | With every account spent, wait for the first to come back rather than exit. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
+| `provider.<name>.models` | — | Models whose own limits count as the account's, such as `Fable`. See [The model you work in](#the-model-you-work-in). |
+
+All of them are in the terminal UI as well: `s` opens a panel that lists each
+with what it is set to and what it does, and changes the same file.
 
 A running `watch` reads these again before every check, and a change to the file
 brings that check forward, so a setting changed with `config set` takes effect

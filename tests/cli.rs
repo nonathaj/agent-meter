@@ -1862,22 +1862,23 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 2] = ["queue", "pace"];
-    let mut kept: Vec<&str> = Vec::new();
-    let mut lines = printed.lines();
-    while let Some(line) = lines.next() {
+    const ADDED: [&str; 3] = ["queue", "pace", "counted"];
+    let added = |line: &str| {
         let text = line.trim_start();
-        let indent = &line[..line.len() - text.len()];
-        if !ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": "))) {
+        ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": ")))
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut lines = printed.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !added(line) {
             kept.push(line);
             continue;
         }
+        let text = line.trim_start();
+        let indent = &line[..line.len() - text.len()];
+        // The first of a run of them takes the comma before it along.
         let before = kept.pop().unwrap();
-        kept.push(
-            before
-                .strip_suffix(',')
-                .expect("a field added later follows another"),
-        );
+        kept.push(before.strip_suffix(',').unwrap_or(before));
         let last = if text.ends_with('{') {
             let close = format!("{indent}}}");
             lines.find(|inner| inner.starts_with(&close)).unwrap()
@@ -1885,8 +1886,8 @@ fn as_originally_listed(printed: &str) -> String {
             line
         };
         assert!(
-            !last.ends_with(','),
-            "a field added later is the last in its object: {line}"
+            !last.ends_with(',') || lines.peek().is_some_and(|next| added(next)),
+            "only fields added later follow a field added later: {line}"
         );
     }
     format!("{}\n", kept.join("\n"))
@@ -2331,6 +2332,90 @@ fn a_running_watcher_takes_up_changed_settings_at_its_next_check() {
     // A threshold set for the provider still wins over the general one.
     fixture.run(&["config", "set", "provider.claude.threshold", "95"]);
     assert_eq!(watcher.next("Claude Code:"), STAYS);
+}
+
+/// Two Claude accounts whose own limits are comfortable, each with a week of
+/// Fable beside them: the one in use at `in_use` percent of it, the spare at
+/// `spare`. Both weeks turn over together, so neither is the sooner to expire.
+fn fable_fixture(in_use: f64, spare: f64) -> Fixture {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-1", "one");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("dev@example.com", "uuid-2", "two");
+    fixture.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let reading = |five_hour: f64, fable: f64| {
+        json!({"usage": {
+            "observed_at": now,
+            "windows": [
+                {"window_secs": 18000, "used_percent": five_hour, "resets_at": standing_reset(now, HOUR)},
+                {"window_secs": 604_800, "scope": "Fable", "used_percent": fable,
+                 "resets_at": standing_reset(now, 3 * DAY)},
+            ],
+            "limit_reached": false,
+        }, "failures": 0})
+    };
+    write_json(
+        &fixture.data.join("usage.json"),
+        &json!({"entries": {"claude-1": reading(10.0, spare), "claude-2": reading(50.0, in_use)}}),
+    );
+    fixture
+}
+
+/// A model's own limit stops that model only, so it moves nothing — until the
+/// settings say the work is done in that model. Then it is the account's:
+/// nearing it is what the watcher leaves an account for.
+#[test]
+fn a_models_limit_switches_accounts_once_its_model_is_counted() {
+    let fixture = fable_fixture(95.0, 20.0);
+    let check = || fixture.run(&["watch", "--once", "--dry-run"]);
+    let listed = |id: &str| {
+        let rows = fixture.accounts();
+        rows.into_iter().find(|row| row["id"] == id).unwrap()
+    };
+
+    assert_eq!(check(), "Claude Code: 50% used, staying put\n");
+    let in_use = listed("claude-2");
+    assert_eq!(in_use["usage"]["usedPercent"], json!(50.0));
+    assert_eq!(in_use["usage"]["windows"][0]["counted"], json!(true));
+    assert_eq!(in_use["usage"]["windows"][1]["counted"], json!(false));
+
+    // Named however it is typed.
+    fixture.run(&["config", "set", "provider.claude.models", "fable"]);
+    assert_eq!(
+        check(),
+        "Claude Code: would switch to claude-1 (95% used; claude-1 is at 20%)\n"
+    );
+    let in_use = listed("claude-2");
+    assert_eq!(in_use["usage"]["usedPercent"], json!(95.0));
+    assert_eq!(in_use["usage"]["windows"][1]["counted"], json!(true));
+    assert_eq!(listed("claude-1")["queue"]["role"], json!("next_up"));
+    assert!(
+        fixture.run(&["config", "show"]).contains("models = [\"fable\"]"),
+        "the setting is in the file"
+    );
+
+    // It is Claude's setting, and Codex's is its own.
+    fixture.run(&["config", "set", "provider.claude.models", ""]);
+    fixture.run(&["config", "set", "provider.codex.models", "Fable"]);
+    assert_eq!(check(), "Claude Code: 50% used, staying put\n");
+}
+
+/// An account that has spent a counted model's week is spent, to somebody
+/// working in that model: it is not somewhere to switch to.
+#[test]
+fn an_account_that_has_spent_a_counted_model_is_not_switched_to() {
+    let fixture = fable_fixture(95.0, 100.0);
+    fixture.run(&["config", "set", "provider.claude.models", "Fable"]);
+
+    let rows = fixture.accounts();
+    let spare = rows.iter().find(|row| row["id"] == "claude-1").unwrap();
+    assert_eq!(spare["usage"]["exhausted"], json!(true));
+    assert_eq!(spare["queue"]["role"], json!("unusable"));
+    fixture
+        .cmd(&["watch", "--once", "--dry-run"])
+        .assert()
+        .stdout(contains("every account is out of quota; claude-1 frees up in 3d"));
 }
 
 /// A threshold given on the command line is this run's, and outlasts any

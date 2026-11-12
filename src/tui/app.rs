@@ -12,8 +12,10 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 
 use super::login::{self, Login};
+use super::settings::{self, Setting, Step};
 use super::worker::{Job, Worker};
 use crate::account::ProviderKind;
+use crate::config::Config;
 use crate::engine::{Engine, Status};
 
 /// How often to redraw while idle. Short enough that countdowns tick visibly.
@@ -35,6 +37,10 @@ pub enum Mode {
     Help,
     /// Following a login, which `App::login` holds.
     Login,
+    /// Changing the settings, with `index` the one the cursor is on.
+    /// `changed` once any of them has been, so that closing the panel can
+    /// have the watcher act on them.
+    Settings { index: usize, changed: bool },
 }
 
 /// An action that needs a provider before it can run.
@@ -91,7 +97,8 @@ pub struct App {
     queued: std::collections::VecDeque<Job>,
     /// Which harnesses switch automatically, as the configuration says.
     pub switching: Vec<(ProviderKind, bool)>,
-    pub threshold: f64,
+    /// The settings as they stood when the store was last read.
+    pub config: Config,
     /// The login under way, while the login panel is up.
     pub login: Option<Login>,
     /// When the interface started, which the spinners count from.
@@ -123,7 +130,7 @@ impl App {
             busy: None,
             queued: std::collections::VecDeque::new(),
             switching: Vec::new(),
-            threshold: engine.config().watch.threshold,
+            config: engine.config().clone(),
             login: None,
             epoch: Instant::now(),
             should_quit: false,
@@ -160,7 +167,7 @@ impl App {
             busy: None,
             queued: std::collections::VecDeque::new(),
             switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
-            threshold: 90.0,
+            config: Config::default(),
             login: None,
             epoch: Instant::now(),
             should_quit: false,
@@ -171,21 +178,28 @@ impl App {
         app
     }
 
-    /// Re-reads accounts, cached usage and the settings from the store.
+    /// Re-reads accounts and cached usage from the store, and takes up the
+    /// settings `engine` was opened with.
     ///
-    /// The settings are re-read rather than remembered, because `w` writes them
-    /// and the watcher reads them: holding a copy here would let the screen and
-    /// the thing doing the switching disagree.
+    /// The settings are the engine's rather than a copy read here, because the
+    /// engine is what judges the accounts: how full each is, and the order
+    /// they are taken in. Read separately, the screen could show one set of
+    /// settings and an order worked out from another. The event loop opens the
+    /// engine again whenever they may have changed.
     pub fn reload(&mut self, engine: &Engine) -> Result<()> {
         self.statuses = engine.status()?;
-        if let Ok(config) = engine.store().config() {
-            self.threshold = config.watch.threshold;
-            self.switching = ProviderKind::ALL
-                .map(|kind| (kind, config.is_switching_on(kind)))
-                .to_vec();
-        }
+        self.config = engine.config().clone();
+        self.switching = ProviderKind::ALL
+            .map(|kind| (kind, self.config.is_switching_on(kind)))
+            .to_vec();
+        self.tick_interval = Duration::from_secs(self.config.watch.poll_secs);
         self.rebuild(Some(engine));
         Ok(())
+    }
+
+    /// The settings the panel lists, in the order it lists them.
+    pub fn settings(&self) -> Vec<Setting> {
+        settings::list(&self.config, &self.statuses)
     }
 
     /// Whether this harness switches accounts on its own.
@@ -423,7 +437,21 @@ fn release_screen() -> Result<()> {
     ratatui::try_restore().context("restoring the terminal")
 }
 
+/// Opens `engine` again, so that it judges by the settings as they now stand.
+///
+/// A settings file that no longer reads leaves it on the settings it last
+/// read, as it leaves the watcher.
+fn reopen(engine: &mut Engine) {
+    if let Ok(fresh) = Engine::with_store(engine.store().clone()) {
+        *engine = fresh;
+    }
+}
+
 fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+    // One of its own, opened again whenever the settings may have changed:
+    // by a key here, or by `agent-meter config set` somewhere else.
+    let mut engine = Engine::with_store(engine.store().clone())?;
+    let engine = &mut engine;
     let mut app = App::new(engine)?;
     let worker = Worker::spawn(engine.store().clone())?;
     // Start with fresh numbers, but respect the poll interval so opening the
@@ -439,6 +467,7 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
                 Ok(note) => app.note(note),
                 Err(error) => app.fail(error),
             }
+            reopen(engine);
             app.reload(engine)?;
             if let Some(job) = app.queued.pop_front() {
                 submit(&mut app, &worker, job);
@@ -514,7 +543,7 @@ fn submit(app: &mut App, worker: &Worker, job: Job) {
 
 fn handle_key(
     app: &mut App,
-    engine: &Engine,
+    engine: &mut Engine,
     worker: &Worker,
     terminal: &mut ratatui::DefaultTerminal,
     key: KeyEvent,
@@ -557,9 +586,105 @@ fn handle_key(
             }
         },
         Mode::Login => login_key(app, key),
+        Mode::Settings { index, changed } => settings_panel_key(app, engine, index, changed, key)?,
         Mode::Browse => browse_key(app, engine, worker, key),
     }
     Ok(())
+}
+
+/// Keys while the settings panel is up, its cursor on the setting at `index`.
+fn settings_panel_key(
+    app: &mut App,
+    engine: &mut Engine,
+    index: usize,
+    changed: bool,
+    key: KeyEvent,
+) -> Result<()> {
+    match settings_key(key) {
+        SettingsKey::Move(by) => {
+            let last = app.settings().len().saturating_sub(1) as isize;
+            let index = (index as isize).saturating_add(by).clamp(0, last) as usize;
+            app.mode = Mode::Settings { index, changed };
+        }
+        SettingsKey::Change(step) => {
+            let Some(setting) = app.settings().get(index).cloned() else {
+                return Ok(());
+            };
+            match change_setting(engine, &setting, step) {
+                Ok(false) => {}
+                Ok(true) => {
+                    reopen(engine);
+                    app.reload(engine)?;
+                    // The list is drawn from the settings and the readings,
+                    // and the setting changed keeps its place in it whatever
+                    // else moved.
+                    let index = app
+                        .settings()
+                        .iter()
+                        .position(|listed| *listed == setting)
+                        .unwrap_or(index);
+                    app.mode = Mode::Settings { index, changed: true };
+                    app.message = None;
+                }
+                Err(error) => app.fail(format!("{error:#}")),
+            }
+        }
+        SettingsKey::Close => {
+            app.mode = Mode::Browse;
+            if changed {
+                // Whoever changed them is waiting to see what they do, and
+                // would otherwise wait out the rest of the interval. Not after
+                // every step, or a threshold on its way from 90 to 60 would
+                // be acted on at every mark in between.
+                app.next_tick = Instant::now();
+                app.note("Settings saved");
+            }
+        }
+        SettingsKey::Nothing => {}
+    }
+    Ok(())
+}
+
+/// What a key does in the settings panel.
+#[derive(Debug, PartialEq)]
+enum SettingsKey {
+    Move(isize),
+    Change(Step),
+    Close,
+    Nothing,
+}
+
+fn settings_key(key: KeyEvent) -> SettingsKey {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => SettingsKey::Move(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => SettingsKey::Move(1),
+        KeyCode::Home | KeyCode::Char('g') => SettingsKey::Move(isize::MIN),
+        KeyCode::End | KeyCode::Char('G') => SettingsKey::Move(isize::MAX),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => SettingsKey::Change(Step::Down),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=') => {
+            SettingsKey::Change(Step::Up)
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => SettingsKey::Change(Step::Toggle),
+        KeyCode::Backspace | KeyCode::Delete => SettingsKey::Change(Step::Clear),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => SettingsKey::Close,
+        _ => SettingsKey::Nothing,
+    }
+}
+
+/// Applies `step` to `setting` in the settings file, and says whether that
+/// changed it.
+///
+/// The file is read again for every change rather than written from the copy
+/// on screen, so that a setting changed somewhere else while the panel was
+/// open is not put back by a key pressed here.
+fn change_setting(engine: &Engine, setting: &Setting, step: Step) -> Result<bool> {
+    let store = engine.store();
+    let mut config = store.config()?;
+    if !setting.change(&mut config, step) {
+        return Ok(false);
+    }
+    config.save(store.dir())?;
+    Ok(true)
 }
 
 /// What a key does in the provider chooser.
@@ -599,6 +724,12 @@ fn browse_key(app: &mut App, engine: &Engine, worker: &Worker, key: KeyEvent) {
         KeyCode::Char('r') => submit(app, worker, Job::Poll { force: true }),
         KeyCode::Char('p') | KeyCode::Tab => app.cycle_filter(Some(engine)),
         KeyCode::Char('?') | KeyCode::F(1) => app.mode = Mode::Help,
+        KeyCode::Char('s') => {
+            app.mode = Mode::Settings {
+                index: 0,
+                changed: false,
+            }
+        }
         KeyCode::Char('a') => {
             app.mode = Mode::ChooseProvider {
                 action: ProviderAction::Add,
@@ -979,6 +1110,142 @@ mod tests {
             Vec::from(app.queued.clone()),
             [Job::Read("claude-1".into()), Job::Poll { force: true }]
         );
+    }
+
+    #[test]
+    fn the_settings_panel_has_a_key_for_every_way_to_change_a_setting() {
+        let key = |code| settings_key(KeyEvent::new(code, KeyModifiers::NONE));
+        for (code, does) in [
+            (KeyCode::Up, SettingsKey::Move(-1)),
+            (KeyCode::Char('j'), SettingsKey::Move(1)),
+            (KeyCode::Left, SettingsKey::Change(Step::Down)),
+            (KeyCode::Char('+'), SettingsKey::Change(Step::Up)),
+            (KeyCode::Char(' '), SettingsKey::Change(Step::Toggle)),
+            (KeyCode::Enter, SettingsKey::Change(Step::Toggle)),
+            (KeyCode::Delete, SettingsKey::Change(Step::Clear)),
+            (KeyCode::Esc, SettingsKey::Close),
+            // The key that opened it closes it.
+            (KeyCode::Char('s'), SettingsKey::Close),
+            (KeyCode::Char('x'), SettingsKey::Nothing),
+        ] {
+            assert_eq!(key(code), does, "{code:?}");
+        }
+    }
+
+    /// The panel as somebody uses it: `s` opens it, the arrows move through
+    /// it and change what the cursor is on, and closing it says they are
+    /// saved and has them acted on.
+    #[test]
+    fn the_settings_panel_is_opened_changed_and_closed_from_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let mut engine = Engine::with_store(store.clone()).unwrap();
+        let worker = Worker::spawn(store.clone()).unwrap();
+        let mut app = app_with(0);
+        app.reload(&engine).unwrap();
+        app.next_tick = Instant::now() + Duration::from_secs(3600);
+        let press = |app: &mut App, engine: &mut Engine, code| {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            match app.mode.clone() {
+                Mode::Settings { index, changed } => {
+                    settings_panel_key(app, engine, index, changed, key).unwrap();
+                }
+                _ => browse_key(app, engine, &worker, key),
+            }
+        };
+
+        press(&mut app, &mut engine, KeyCode::Char('s'));
+        assert_eq!(
+            app.mode,
+            Mode::Settings {
+                index: 0,
+                changed: false
+            }
+        );
+        // Looking is not changing: closing it again says nothing.
+        press(&mut app, &mut engine, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.message, None);
+        assert!(app.next_tick > Instant::now());
+
+        press(&mut app, &mut engine, KeyCode::Char('s'));
+        press(&mut app, &mut engine, KeyCode::Left);
+        press(&mut app, &mut engine, KeyCode::Left);
+        assert_eq!(store.config().unwrap().watch.threshold, 88.0);
+        assert_eq!(app.config.watch.threshold, 88.0, "and it is what is on screen");
+        // The cursor stops at either end of the list.
+        press(&mut app, &mut engine, KeyCode::Up);
+        press(&mut app, &mut engine, KeyCode::End);
+        press(&mut app, &mut engine, KeyCode::Down);
+        assert_eq!(
+            app.mode,
+            Mode::Settings {
+                index: 4,
+                changed: true
+            }
+        );
+        // A key that means nothing to the setting it is on changes nothing.
+        press(&mut app, &mut engine, KeyCode::Delete);
+        press(&mut app, &mut engine, KeyCode::Char(' '));
+        let written = store.config().unwrap();
+        assert!(!written.watch.wait_for_reset);
+        assert_eq!(written.watch.threshold, 88.0);
+
+        press(&mut app, &mut engine, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.message.as_ref().unwrap().text, "Settings saved");
+        assert!(app.next_tick <= Instant::now(), "a check is due at once");
+    }
+
+    /// A key in the panel changes the settings file, and the interface then
+    /// judges by what it says: the watcher reads the same file, so the two
+    /// cannot disagree.
+    #[test]
+    fn a_setting_changed_in_the_panel_is_written_and_taken_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::with_store(Store::open(dir.path().join("data")).unwrap()).unwrap();
+        let mut app = app_with(1);
+        app.reload(&engine).unwrap();
+        let claude = ProviderKind::Claude;
+        let fable = Setting::Model(claude, "Fable".into());
+
+        assert!(change_setting(&engine, &fable, Step::Toggle).unwrap());
+        assert!(change_setting(&engine, &Setting::Threshold, Step::Down).unwrap());
+        assert!(change_setting(&engine, &Setting::Poll, Step::Up).unwrap());
+        let written = engine.store().config().unwrap();
+        assert_eq!(written.models_for(claude), ["Fable"]);
+        assert_eq!(written.watch.threshold, 89.0);
+
+        // Nothing here has taken it up until the engine is opened again.
+        assert_eq!(app.config.watch.threshold, 90.0);
+        reopen(&mut engine);
+        app.reload(&engine).unwrap();
+        assert_eq!(app.config, written);
+        assert_eq!(engine.rules_for(claude).threshold, 89.0);
+        assert_eq!(app.tick_interval, Duration::from_secs(120));
+
+        // A step that changes nothing writes nothing.
+        assert!(!change_setting(&engine, &Setting::Poll, Step::Clear).unwrap());
+
+        // A setting changed elsewhere while the panel is open is kept: each
+        // key changes the file as it stands, not a copy from when it opened.
+        let mut elsewhere = engine.store().config().unwrap();
+        elsewhere.set("watch.margin", "12").unwrap();
+        elsewhere.save(engine.store().dir()).unwrap();
+        assert!(change_setting(&engine, &Setting::Threshold, Step::Down).unwrap());
+        let written = engine.store().config().unwrap();
+        assert_eq!((written.watch.margin, written.watch.threshold), (12.0, 88.0));
+
+        // A file that no longer reads is not written over, and the engine
+        // stays on the settings it last read.
+        std::fs::write(
+            Config::path(engine.store().dir()),
+            "[watch]\nthreshold = \"high\"\n",
+        )
+        .unwrap();
+        assert!(change_setting(&engine, &Setting::Threshold, Step::Down).is_err());
+        reopen(&mut engine);
+        assert_eq!(engine.rules_for(claude).threshold, 89.0);
     }
 
     #[test]

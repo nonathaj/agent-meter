@@ -54,7 +54,8 @@ impl Window {
     ///
     /// The difference is what a limit costs: `weekly` at 100% stops the account,
     /// while `weekly Opus` at 100% only stops one model and leaves the account
-    /// able to do most of its work.
+    /// able to do most of its work — unless that model is the one the work is
+    /// done in, which is for [`Usage::counts`] to say.
     pub fn is_account_wide(&self) -> bool {
         self.scope.is_none()
     }
@@ -111,6 +112,14 @@ pub struct Usage {
     /// not say. Not saying is not the same as holding none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets: Option<Resets>,
+    /// The models whose own limits are judged as the account's: the ones the
+    /// settings say the work is done in.
+    ///
+    /// Not something a provider says, so it is no part of a stored reading.
+    /// It is put on a reading as it is read back, by [`Usage::counting`], so
+    /// that everything asking how full an account is gets the same answer.
+    #[serde(skip)]
+    pub counted: Vec<String>,
 }
 
 /// Limit resets: grants a provider hands out now and then which, when spent,
@@ -200,17 +209,37 @@ impl Resets {
 }
 
 impl Usage {
-    /// The account's own limits, ignoring the per-model ones.
-    ///
-    /// Every judgment is made on these. A per-model window at 100% stops one
-    /// model; the account can still do most of its work, and counting it would
-    /// refuse an account that is largely free — or send the watcher fleeing an
-    /// account that is fine.
-    fn account_windows(&self) -> impl Iterator<Item = &Window> {
-        self.windows.iter().filter(|w| w.is_account_wide())
+    /// This reading, with the limits of `models` judged as the account's own.
+    pub fn counting(mut self, models: &[String]) -> Self {
+        self.counted = models.to_vec();
+        self
     }
 
-    /// The account-wide window closest to its limit as of `now`.
+    /// Whether `window` is one the account is judged on.
+    ///
+    /// The account's own limits always are. A per-model window at 100% stops
+    /// one model; the account can still do most of its work, and counting it
+    /// would refuse an account that is largely free — or send the watcher
+    /// fleeing an account that is fine. So a model's limit counts only where
+    /// the settings name that model: to somebody working in it, an account
+    /// that has spent it is spent.
+    pub fn counts(&self, window: &Window) -> bool {
+        match &window.scope {
+            None => true,
+            Some(scope) => self
+                .counted
+                .iter()
+                .any(|model| model.trim().eq_ignore_ascii_case(scope.trim())),
+        }
+    }
+
+    /// The limits the account is judged on. Every judgment is made on these.
+    fn account_windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.iter().filter(|w| self.counts(w))
+    }
+
+    /// The window the account is judged on that is closest to its limit as of
+    /// `now`.
     pub fn binding_window(&self, now: Timestamp) -> Option<&Window> {
         self.account_windows().max_by(|a, b| {
             a.used_at(now)
@@ -224,7 +253,7 @@ impl Usage {
         self.binding_window(now).map_or(0.0, |w| w.used_at(now))
     }
 
-    /// The worst figure across every window, per-model ones included.
+    /// The worst figure across every window, every per-model one included.
     ///
     /// For showing rather than deciding: "something here is capped" is true and
     /// worth saying, even where it does not change what the account is good
@@ -243,15 +272,20 @@ impl Usage {
     /// The tie-break between accounts that recover at about the same time:
     /// having spent the same short window, the one with more of its long window
     /// left is the one with more to give afterwards.
+    ///
+    /// Where several windows are that long — a week, and a model's week that
+    /// counts — it is the tightest of them that says what is left.
     pub fn slowest_headroom_at(&self, now: Timestamp) -> Option<f64> {
+        let longest = self.account_windows().map(|w| w.window_secs).max()?;
         self.account_windows()
-            .max_by_key(|w| w.window_secs)
+            .filter(|w| w.window_secs.abs_diff(longest) <= WINDOW_TOLERANCE)
             .map(|w| (100.0 - w.used_at(now)).max(0.0))
+            .min_by(f64::total_cmp)
     }
 
     /// Whether the account can do no work at all right now.
     ///
-    /// Only account-wide windows count.
+    /// Only the windows the account is judged on count.
     pub fn is_exhausted_at(&self, now: Timestamp) -> bool {
         let spent = self.account_windows().any(|w| w.used_at(now) >= 100.0);
         if spent {
@@ -277,7 +311,7 @@ impl Usage {
             .min()
     }
 
-    /// When the account's own window of `kind` resets.
+    /// When the soonest window of `kind` the account is judged on resets.
     pub fn resets_at(&self, kind: WindowKind) -> Option<Timestamp> {
         self.account_windows()
             .filter(|w| w.kind() == kind)
@@ -333,6 +367,7 @@ mod tests {
             windows: vec![window(FIVE_HOURS, 40.0, 1000), window(ONE_WEEK, 70.0, 5000)],
             limit_reached: false,
             resets: None,
+            counted: Vec::new(),
         };
         assert_eq!(u.binding_window(ts(10)).unwrap().window_secs, ONE_WEEK);
         assert_eq!(u.headroom_at(ts(10)), 30.0);
@@ -346,6 +381,7 @@ mod tests {
             windows: vec![window(FIVE_HOURS, 100.0, 1000)],
             limit_reached: true,
             resets: None,
+            counted: Vec::new(),
         };
         assert!(u.is_exhausted_at(ts(999)));
         assert_eq!(u.next_relief(ts(999)), Some(ts(1000)));
@@ -444,6 +480,56 @@ mod tests {
         assert_eq!(window(0, 90.0, 1_000_100).ahead_of_pace(now), None);
         // A window that has turned over is empty, and so on no pace at all.
         assert_eq!(window(ONE_WEEK, 90.0, 999_000).ahead_of_pace(now), None);
+    }
+
+    /// A model's limit is judged only where its model is counted, and then in
+    /// every way the account's own limits are.
+    #[test]
+    fn a_models_limit_is_judged_only_where_it_is_counted() {
+        let now = ts(10);
+        let scoped = |scope: &str, used, reset| Window {
+            scope: Some(scope.into()),
+            ..window(ONE_WEEK, used, reset)
+        };
+        let reading = Usage {
+            observed_at: ts(0),
+            windows: vec![
+                window(FIVE_HOURS, 40.0, 1000),
+                // A provider's week is not always a week to the second.
+                window(ONE_WEEK + 60, 30.0, 5000),
+                scoped("Fable", 100.0, 4000),
+                scoped("Opus", 55.0, 6000),
+            ],
+            limit_reached: false,
+            resets: None,
+            counted: Vec::new(),
+        };
+        assert_eq!(reading.used_at(now), 40.0);
+        assert_eq!(reading.worst_at(now), 100.0);
+        assert_eq!(reading.slowest_headroom_at(now), Some(70.0));
+        assert_eq!(reading.resets_at(WindowKind::Weekly), Some(ts(5000)));
+        assert!(!reading.is_exhausted_at(now));
+
+        let opus = reading.clone().counting(&[" opus ".to_string()]);
+        assert_eq!(opus.used_at(now), 55.0);
+        assert_eq!(opus.binding_window(now).unwrap().scope.as_deref(), Some("Opus"));
+        // Of the two weeks it is now judged on, the tighter says what is left.
+        assert_eq!(opus.slowest_headroom_at(now), Some(45.0));
+        assert!(!opus.is_exhausted_at(now));
+
+        let fable = reading.clone().counting(&["Fable".to_string()]);
+        assert_eq!(fable.used_at(now), 100.0);
+        assert!(fable.is_exhausted_at(now));
+        assert_eq!(fable.next_relief(now), Some(ts(4000)));
+        assert_eq!(fable.recovers_at(now, 90.0), Some(ts(4000)));
+        assert_eq!(fable.resets_at(WindowKind::Weekly), Some(ts(4000)));
+        // Once its week has turned over it holds the account no longer.
+        assert!(!fable.is_exhausted_at(ts(4000)));
+
+        // Which models count is a setting, not part of what was read.
+        let stored = serde_json::to_string(&fable).unwrap();
+        assert!(!stored.contains("counted"), "{stored}");
+        assert_eq!(serde_json::from_str::<Usage>(&stored).unwrap(), reading);
     }
 
     #[test]

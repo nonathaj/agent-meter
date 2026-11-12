@@ -356,6 +356,7 @@ fn parse_usage(response: &Value, observed_at: Timestamp) -> Usage {
         windows,
         limit_reached,
         resets: parse_reset_count(response),
+        counted: Vec::new(),
     }
 }
 

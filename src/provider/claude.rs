@@ -653,6 +653,7 @@ fn parse_usage(response: &Value, observed_at: Timestamp) -> Usage {
         windows,
         limit_reached: false,
         resets: parse_resets(response.get("cedar_ember")),
+        counted: Vec::new(),
     }
 }
 

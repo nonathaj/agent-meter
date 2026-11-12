@@ -532,6 +532,7 @@ mod tests {
                 windows: vec![],
                 limit_reached: false,
                 resets: None,
+                counted: Vec::new(),
             },
         );
         store.put_usage_cache(&cache).unwrap();

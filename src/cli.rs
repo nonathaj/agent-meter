@@ -647,6 +647,9 @@ fn status_json(
                 if w.kind() == WindowKind::Weekly {
                     window["pace"] = json!({"aheadPercent": w.ahead_of_pace(now)});
                 }
+                // Whether the account is judged on this limit: its own always,
+                // a model's only where the settings count that model.
+                window["counted"] = json!(usage.counts(w));
                 window
             }).collect::<Vec<_>>(),
             "limitResets": usage.resets.as_ref().map(|resets| json!({

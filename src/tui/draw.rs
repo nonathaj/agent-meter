@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
 use super::app::{App, Mode, ProviderAction, Row};
 use super::login::{self, Login};
+use super::settings::Kind;
 use crate::account::ProviderKind;
 use crate::engine::Status;
 use crate::timefmt;
@@ -86,6 +87,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_login(frame, login, spinner(app));
             }
         }
+        Mode::Settings { index, .. } => draw_settings(frame, app, index, header.union(body)),
         Mode::Browse => {}
     }
 }
@@ -226,7 +228,7 @@ fn provider_heading(kind: ProviderKind, app: &App, width: usize) -> Line<'static
     // both would be a lie about whichever is off.
     let status = if app.switching_on(kind) {
         Span::styled(
-            format!(" ● auto at {:.0}% ", app.threshold),
+            format!(" ● auto at {:.0}% ", app.config.threshold_for(kind)),
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         )
     } else {
@@ -706,6 +708,23 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 ("esc", "cancel".into()),
             ],
         },
+        Mode::Settings { index, .. } => {
+            // Named for the setting the cursor is on, since a number is
+            // stepped and a choice is turned over.
+            let settings = app.settings();
+            let setting = settings.get(*index);
+            let mut keys = vec![("↑↓", "select".to_string())];
+            match setting.map(|setting| setting.kind()) {
+                Some(Kind::Number) => keys.push(("←→", "change".into())),
+                Some(Kind::Choice) => keys.push(("space", "change".into())),
+                None => {}
+            }
+            if setting.is_some_and(|setting| setting.can_clear(&app.config)) {
+                keys.push(("del", "as every agent".into()));
+            }
+            keys.push(("esc", "close".into()));
+            keys
+        }
         Mode::Browse => {
             // Named for the harness the selection is in, since that is what the
             // key will act on.
@@ -718,6 +737,7 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 ("enter", "use".into()),
                 ("l", "sign in".into()),
                 ("w", switching),
+                ("s", "settings".into()),
                 ("tab", "agents".into()),
                 ("r", "refresh".into()),
                 ("a", "add".into()),
@@ -787,6 +807,7 @@ fn draw_help(frame: &mut Frame) {
         row("i", "import the account a CLI is signed in to"),
         row("d", "forget the selected account"),
         row("w", "switch automatically as limits approach"),
+        row("s", "change the settings"),
         row("tab  p", "show one agent at a time, or all"),
         row("r", "read usage now"),
         row("q  esc", "quit"),
@@ -803,6 +824,111 @@ fn draw_help(frame: &mut Frame) {
     let area = popup(frame.area(), 64, lines.len() as u16 + 4);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(dialog("Keys")), area);
+}
+
+/// How wide the settings panel is, and the column its values start at.
+const SETTINGS_WIDTH: u16 = 72;
+const SETTINGS_LABEL: usize = 34;
+
+/// The settings panel: every setting and what it is set to, under the agent
+/// it belongs to, and below them what the one the cursor is on does.
+///
+/// Drawn within `area`, the part of the screen above the footer, since the
+/// footer holds the keys that change what is in it.
+fn draw_settings(frame: &mut Frame, app: &App, index: usize, area: Rect) {
+    let settings = app.settings();
+    let index = index.min(settings.len().saturating_sub(1));
+    let limit = popup(area, SETTINGS_WIDTH, area.height);
+    let inner = limit.width.saturating_sub(4) as usize;
+
+    // The values are what the lines are for, so in a narrow window it is the
+    // labels that give way: all by the same amount, so the values stay in a
+    // column, and only so far that some of each label is left.
+    let room = inner.saturating_sub(2);
+    let widest = settings
+        .iter()
+        .map(|setting| setting.value(&app.config).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label = SETTINGS_LABEL.min(room.saturating_sub(widest)).max(room.min(10));
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The line the cursor is on, to keep in view.
+    let mut cursor = 0;
+    let mut section = None;
+    for (at, setting) in settings.iter().enumerate() {
+        if section != Some(setting.provider()) {
+            if section.is_some() {
+                lines.push(Line::raw(""));
+            }
+            section = Some(setting.provider());
+            let title = setting
+                .provider()
+                .map_or("Every agent", |kind| kind.display_name());
+            lines.push(Line::from(Span::styled(
+                title,
+                Style::new().add_modifier(Modifier::BOLD),
+            )));
+        }
+        let selected = at == index;
+        if selected {
+            cursor = lines.len();
+        }
+        let value = truncate(&setting.value(&app.config), room.saturating_sub(label));
+        let (marker, style) = if selected {
+            ("▸ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            ("  ", Style::new())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(
+                format!("{:<label$}", truncate(&setting.label(), label.saturating_sub(1))),
+                if selected {
+                    style
+                } else {
+                    Style::new().fg(Color::Gray)
+                },
+            ),
+            Span::styled(value, style),
+        ]));
+    }
+
+    // What the setting under the cursor does, in a space as tall as the
+    // longest of them needs, so the panel holds still while the cursor moves
+    // through settings that take more and fewer words.
+    let explained = settings
+        .iter()
+        .map(|setting| wrap(&setting.explanation(), inner).len())
+        .max()
+        .unwrap_or(0);
+    let mut explanation: Vec<Line<'static>> = settings
+        .get(index)
+        .map(|setting| wrap(&setting.explanation(), inner))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::new().fg(DIM))))
+        .collect();
+    // Borders, the padding above, and the blank line between the two parts.
+    let frame_lines = 4;
+    // In a window too short for that and a few settings besides, the settings
+    // are worth more than the stillness.
+    let spare = (limit.height as usize).saturating_sub(frame_lines + explained);
+    let explained = if spare < 5 { explanation.len() } else { explained };
+    explanation.resize(explained, Line::raw(""));
+
+    let room = (limit.height as usize)
+        .saturating_sub(frame_lines + explained)
+        .max(1);
+    // A list taller than the window scrolls just enough to show the cursor.
+    let first = (cursor + 1).saturating_sub(room);
+    let mut shown: Vec<Line<'static>> = lines.into_iter().skip(first).take(room).collect();
+    shown.push(Line::raw(""));
+    shown.extend(explanation);
+
+    let panel = popup(area, limit.width, (shown.len() + frame_lines - 1) as u16);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(Paragraph::new(shown).block(dialog("Settings")), panel);
 }
 
 fn draw_provider_chooser(frame: &mut Frame, action: ProviderAction, index: usize) {
@@ -1090,6 +1216,7 @@ mod tests {
             windows,
             limit_reached: false,
             resets: None,
+            counted: Vec::new(),
         }
     }
 
@@ -1419,6 +1546,10 @@ mod tests {
                 id: "claude-1".into(),
                 name: "a very long name that will not fit anywhere".into(),
             },
+            Mode::Settings {
+                index: 6,
+                changed: false,
+            },
             Mode::Browse,
         ] {
             app.mode = mode;
@@ -1465,13 +1596,13 @@ mod tests {
         let wide = footer(&mut app, 200);
         assert_eq!(
             wide,
-            "enter use   l sign in   w Claude Code auto   tab agents   r refresh   a add   i import   \
-             d remove   ? keys   q quit"
+            "enter use   l sign in   w Claude Code auto   s settings   tab agents   r refresh   a add   \
+             i import   d remove   ? keys   q quit"
         );
         // Keys go from the middle, last first, and the order of the rest holds.
         assert_eq!(
             footer(&mut app, 80),
-            "enter use   l sign in   w Claude Code auto   tab agents   ? keys   q quit"
+            "enter use   l sign in   w Claude Code auto   s settings   ? keys   q quit"
         );
         assert_eq!(footer(&mut app, 40), "enter use   ? keys   q quit");
         assert_eq!(footer(&mut app, 20), "? keys   q quit");
@@ -1487,6 +1618,136 @@ mod tests {
             footer(&mut app, 60),
             "enter submit code   ctrl+o open link   esc cancel"
         );
+    }
+
+    /// Two Claude accounts metered on Fable and one Codex account, with the
+    /// settings panel open on the setting at `index`.
+    fn in_settings(index: usize) -> App {
+        let mut statuses = crate::tui::app::sample_statuses(3);
+        for status in &mut statuses[..2] {
+            status.usage = Some(usage(vec![
+                window(ONE_WEEK, None, 20.0, 86_400),
+                window(ONE_WEEK, Some("Fable"), 95.0, 86_400),
+            ]));
+        }
+        statuses[2].account.id = "codex-1".into();
+        statuses[2].account.provider = ProviderKind::Codex;
+        let mut app = App::for_tests(statuses);
+        app.mode = Mode::Settings {
+            index,
+            changed: false,
+        };
+        app
+    }
+
+    /// The panel shows every setting with what it is set to, under the agent
+    /// it belongs to, and says what the one the cursor is on does.
+    #[test]
+    fn the_settings_panel_lists_every_setting_with_its_value() {
+        let fable = 7;
+        let mut app = in_settings(fable);
+        let screen = render(&mut app, 100, 40);
+        let line = |text: &str| {
+            screen
+                .lines()
+                .find(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("no line with {text:?}:\n{screen}"))
+                // Between the panel's borders, clear of the list behind it.
+                .split('│')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let row = |label: &str, value: &str| format!("{label:<34}{value}");
+        assert!(screen.contains("╭ Settings "), "{screen}");
+        for heading in ["Every agent", "Claude Code", "Codex"] {
+            assert!(
+                screen.lines().any(|l| l.contains(&format!("│ {heading} "))),
+                "{heading}:\n{screen}"
+            );
+        }
+        assert_eq!(line("Check every"), row("Check every", "1m"));
+        assert_eq!(
+            line("Once all are past it"),
+            row("Once all are past it, switch for", "5 points more room")
+        );
+        assert_eq!(
+            line("With every account spent"),
+            row("With every account spent, watch", "waits for a reset")
+        );
+        // The cursor is on the model's line, and its explanation is below.
+        assert_eq!(
+            line("Count the Fable limit"),
+            format!("▸ {}", row("Count the Fable limit", "no"))
+        );
+        assert!(
+            screen.contains("A model's own limit stops that model and nothing else"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("↑↓ select   space change   esc close"),
+            "{screen}"
+        );
+
+        app.config.count_model(ProviderKind::Claude, "Fable", true);
+        let screen = render(&mut app, 100, 40);
+        assert!(
+            screen.contains(&format!("▸ {}", row("Count the Fable limit", "yes"))),
+            "{screen}"
+        );
+
+        // A number is stepped rather than turned over, and an agent's own
+        // threshold can be given back.
+        let own_threshold = 6;
+        let mut app = in_settings(own_threshold);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("90% used, as every agent"), "{screen}");
+        assert!(screen.contains("↑↓ select   ←→ change   esc close"), "{screen}");
+        app.config.provider.entry(ProviderKind::Claude).threshold = Some(80.0);
+        let screen = render(&mut app, 100, 40);
+        assert!(
+            screen.contains(&format!("▸ {}", row("Switch at", "80% used"))),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("↑↓ select   ←→ change   del as every agent   esc close"),
+            "{screen}"
+        );
+        // The heading says the mark that agent is held to, not the shared one.
+        app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
+        app.mode = Mode::Browse;
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("● auto at 80%"), "{screen}");
+        assert!(
+            screen.contains("● auto at 90%"),
+            "Codex keeps the shared one: {screen}"
+        );
+    }
+
+    /// In a window too short for all of it the list scrolls to keep the
+    /// cursor in view, the footer stays clear, and the value outlasts the
+    /// label in one too narrow for both.
+    #[test]
+    fn the_settings_panel_fits_a_small_window() {
+        let last = 9;
+        let mut app = in_settings(last);
+        let screen = render(&mut app, 80, 16);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(screen.contains("▸ Switch at"), "{screen}");
+        assert!(screen.contains("A mark for Codex alone"), "{screen}");
+        assert!(!screen.contains("Every agent"), "scrolled off the top: {screen}");
+        assert!(
+            lines[lines.len() - 4].contains('╯'),
+            "it ends above the footer: {screen}"
+        );
+        assert_eq!(lines[lines.len() - 2].trim(), "↑↓ select   ←→ change   esc close");
+
+        let screen = render(&mut app, 44, 16);
+        assert!(screen.contains("90% used, as every agent"), "{screen}");
+        for line in screen.lines() {
+            assert!(line.chars().count() <= 44, "{line:?}");
+        }
     }
 
     #[test]

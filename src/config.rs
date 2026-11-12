@@ -123,6 +123,15 @@ impl Overrides {
             ProviderKind::Codex => self.codex.as_ref(),
         }
     }
+
+    /// The overrides for `provider`, to change: made if there were none.
+    pub fn entry(&mut self, provider: ProviderKind) -> &mut ProviderConfig {
+        match provider {
+            ProviderKind::Claude => &mut self.claude,
+            ProviderKind::Codex => &mut self.codex,
+        }
+        .get_or_insert_with(ProviderConfig::default)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -133,6 +142,14 @@ pub struct ProviderConfig {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f64>,
+    /// The models you work in, as the provider names them: `Fable`, `Opus`.
+    ///
+    /// A model's own limit stops that model and nothing else, so it is left
+    /// out of every judgment — unless the model is named here. Then its limit
+    /// is one of the account's: an account near it is left as the threshold
+    /// says, and one that has spent it is not switched to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 impl Default for WatchConfig {
@@ -199,6 +216,14 @@ impl Config {
                 check_threshold(threshold)?;
             }
         }
+        for provider in ProviderKind::ALL {
+            for model in self.models_for(provider) {
+                // A name is drawn on screen and matched against the provider's.
+                if model.trim().is_empty() || model.chars().any(char::is_control) {
+                    bail!("provider.{provider}.models holds {model:?}, which is not a model's name");
+                }
+            }
+        }
         if !(0.0..=50.0).contains(&self.watch.margin) {
             bail!("watch.margin must be between 0 and 50, got {}", self.watch.margin);
         }
@@ -229,6 +254,32 @@ impl Config {
             .get(provider)
             .and_then(|p| p.threshold)
             .unwrap_or(self.watch.threshold)
+    }
+
+    /// The provider's own threshold, where one is set for it alone.
+    pub fn own_threshold(&self, provider: ProviderKind) -> Option<f64> {
+        self.provider.get(provider).and_then(|p| p.threshold)
+    }
+
+    /// The models whose own limits are judged as an account's on `provider`.
+    pub fn models_for(&self, provider: ProviderKind) -> &[String] {
+        self.provider.get(provider).map_or(&[], |p| &p.models)
+    }
+
+    /// Whether `model`'s own limit is judged as an account's on `provider`.
+    pub fn counts_model(&self, provider: ProviderKind, model: &str) -> bool {
+        self.models_for(provider)
+            .iter()
+            .any(|counted| counted.trim().eq_ignore_ascii_case(model.trim()))
+    }
+
+    /// Counts `model`'s own limit on `provider`, or stops counting it.
+    pub fn count_model(&mut self, provider: ProviderKind, model: &str, count: bool) {
+        let models = &mut self.provider.entry(provider).models;
+        models.retain(|counted| !counted.trim().eq_ignore_ascii_case(model.trim()));
+        if count {
+            models.push(model.trim().to_string());
+        }
     }
 
     /// Whether the watcher should manage `provider`.
@@ -291,14 +342,16 @@ impl Config {
             ["provider", name, field] => {
                 let provider =
                     ProviderKind::parse(name).with_context(|| format!("unknown provider {name:?}"))?;
-                let slot = match provider {
-                    ProviderKind::Claude => &mut self.provider.claude,
-                    ProviderKind::Codex => &mut self.provider.codex,
-                };
-                let entry = slot.get_or_insert_with(ProviderConfig::default);
                 match *field {
-                    "threshold" => entry.threshold = Some(parse(key)?),
-                    "enabled" => entry.enabled = Some(parse_bool(key)?),
+                    "threshold" => self.provider.entry(provider).threshold = Some(parse(key)?),
+                    "enabled" => self.provider.entry(provider).enabled = Some(parse_bool(key)?),
+                    // Names separated by commas; none at all counts no model.
+                    "models" => {
+                        self.provider.entry(provider).models.clear();
+                        for model in value.split(',').filter(|model| !model.trim().is_empty()) {
+                            self.count_model(provider, model, true);
+                        }
+                    }
                     _ => bail!("unknown setting {key:?}"),
                 }
             }
@@ -306,6 +359,7 @@ impl Config {
                 "unknown setting {key:?}. Known keys: watch.threshold, watch.poll-secs, \
                  watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
                  provider.<claude|codex>.threshold, provider.<claude|codex>.enabled, \
+                 provider.<claude|codex>.models, \
                  remote.<name>.<ssh|command|auto>"
             ),
         }
@@ -333,6 +387,7 @@ mod tests {
         config.provider.codex = Some(ProviderConfig {
             enabled: Some(false),
             threshold: Some(95.0),
+            models: vec!["Fable".into()],
         });
         config.save(dir.path()).unwrap();
         assert_eq!(Config::load(dir.path()).unwrap(), config);
@@ -380,6 +435,39 @@ mod tests {
                 "{key}={value} should be rejected"
             );
         }
+    }
+
+    /// The models whose limits count are named in a list, set from the command
+    /// line as names between commas, and matched however they are cased.
+    #[test]
+    fn the_models_that_count_are_set_by_name() {
+        let mut config = Config::default();
+        assert!(config.models_for(ProviderKind::Claude).is_empty());
+
+        config.set("provider.claude.models", "Fable, opus,fable").unwrap();
+        assert_eq!(config.models_for(ProviderKind::Claude), ["opus", "fable"]);
+        assert!(config.counts_model(ProviderKind::Claude, "Fable"));
+        assert!(config.counts_model(ProviderKind::Claude, "Opus"));
+        assert!(!config.counts_model(ProviderKind::Claude, "Sonnet"));
+        assert!(
+            !config.counts_model(ProviderKind::Codex, "Fable"),
+            "each provider has its own"
+        );
+
+        config.count_model(ProviderKind::Claude, "Opus", false);
+        assert_eq!(config.models_for(ProviderKind::Claude), ["fable"]);
+        config.set("provider.claude.models", "").unwrap();
+        assert!(config.models_for(ProviderKind::Claude).is_empty());
+
+        let read: Config = toml::from_str("[provider.claude]\nmodels = [\"Fable\"]").unwrap();
+        assert_eq!(read.models_for(ProviderKind::Claude), ["Fable"]);
+        // Written only when there are some, so a file that never named one
+        // keeps the shape it had.
+        assert!(!toml::to_string_pretty(&config).unwrap().contains("models"));
+
+        let dir = tempfile::tempdir().unwrap();
+        config.provider.entry(ProviderKind::Claude).models = vec!["  ".into()];
+        assert!(config.save(dir.path()).is_err());
     }
 
     #[test]

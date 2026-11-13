@@ -1862,7 +1862,7 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 3] = ["queue", "pace", "counted"];
+    const ADDED: [&str; 4] = ["queue", "pace", "counted", "copyOf"];
     let added = |line: &str| {
         let text = line.trim_start();
         ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": ")))
@@ -2416,6 +2416,38 @@ fn an_account_that_has_spent_a_models_limit_is_not_switched_to() {
         .cmd(&["watch", "--once", "--dry-run"])
         .assert()
         .stdout(contains("every account is out of quota; claude-1 frees up in 3d"));
+}
+
+/// A login stored twice — left over from before adding merged it, or put
+/// there by hand — is said to be, with how to be rid of the copy. The one
+/// stored first is the one to keep.
+#[test]
+fn a_login_stored_twice_is_pointed_out() {
+    let fixture = fable_fixture(50.0, 20.0);
+    let accounts = fixture.data.join("accounts");
+    let mut copy = read_json(&accounts.join("claude-2.json"));
+    copy["id"] = json!("claude-3");
+    copy["added_at"] = json!(jiff::Timestamp::now());
+    write_json(&accounts.join("claude-3.json"), &copy);
+
+    let rows = fixture.accounts();
+    let copy_of = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap()["copyOf"].clone();
+    assert_eq!(copy_of("claude-3"), json!("claude-2"));
+    assert_eq!(copy_of("claude-2"), Value::Null);
+    assert_eq!(copy_of("claude-1"), Value::Null);
+
+    let listed = fixture.run(&["list"]);
+    assert!(listed.contains("stored twice"), "{listed}");
+    assert!(
+        listed.contains(
+            "  ! claude-3: the same login as claude-2, stored twice; `agent-meter remove claude-3` \
+             forgets this copy\n"
+        ),
+        "{listed}"
+    );
+
+    fixture.run(&["remove", "claude-3", "--yes"]);
+    assert!(!fixture.run(&["list"]).contains("stored twice"));
 }
 
 /// 0.1.9 counted only the models its settings named. A file it wrote still

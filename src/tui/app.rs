@@ -929,6 +929,7 @@ pub(crate) fn sample_statuses(count: usize) -> Vec<Status> {
             usage: None,
             error: None,
             error_at: None,
+            copy_of: None,
         })
         .collect()
 }

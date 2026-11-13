@@ -49,6 +49,9 @@ pub struct Status {
     /// Why the last usage poll failed, if it did, and when.
     pub error: Option<String>,
     pub error_at: Option<Timestamp>,
+    /// The account stored first that this one is the same login as, where it
+    /// is one stored twice. See [`crate::account::copy_of`].
+    pub copy_of: Option<String>,
 }
 
 impl Status {
@@ -149,9 +152,14 @@ impl Engine {
         // Re-read: syncing may have rewritten credentials.
         let accounts = self.store.accounts()?;
         let cache = self.store.usage_cache()?;
+        let copies: Vec<Option<String>> = accounts
+            .iter()
+            .map(|account| crate::account::copy_of(account, &accounts).map(|first| first.id.clone()))
+            .collect();
         Ok(accounts
             .into_iter()
-            .map(|account| {
+            .zip(copies)
+            .map(|(account, copy_of)| {
                 let entry = cache.get(&account.id);
                 Status {
                     active: active_ids.contains(&account.id),
@@ -164,6 +172,7 @@ impl Engine {
                         .map(|usage| usage.ignoring(self.config.ignored_models_for(account.provider))),
                     error: entry.and_then(|e| e.error.clone()),
                     error_at: entry.and_then(|e| e.failed_at),
+                    copy_of,
                     account,
                 }
             })

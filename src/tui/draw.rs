@@ -320,8 +320,22 @@ fn spans_width(spans: &[Span]) -> usize {
 }
 
 /// What is drawn under an account's name: every limit it has, or why it has
-/// none to show.
+/// none to show — and, last, that it is a login stored twice.
 fn body(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
+    let mut lines = limits(status, now, width);
+    if let Some(first) = &status.copy_of {
+        lines.push(note(
+            "! stored twice",
+            &format!("the same login as {first} · press d to forget this copy"),
+            Color::Yellow,
+            width,
+        ));
+    }
+    lines
+}
+
+/// Every limit an account has, or why it has none to show.
+fn limits(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
     match (&status.account.needs_login, &status.error, &status.usage) {
         (Some(reason), _, _) => vec![note(
             "✗ signed out — press l to sign in again",
@@ -355,14 +369,15 @@ fn body(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
 /// Guessing got both wrong, which scrolled to a line other than the one the
 /// selection was on. A test holds this and `body` together.
 pub(super) fn body_height(status: &Status) -> usize {
-    match (&status.account.needs_login, &status.error, &status.usage) {
+    let limits = match (&status.account.needs_login, &status.error, &status.usage) {
         (Some(_), _, _) => 1,
         (None, Some(_), None) => 1,
         (None, error, Some(usage)) => {
             usage.windows.len() + usize::from(holds_resets(usage)) + usize::from(error.is_some())
         }
         (None, None, None) => 1,
-    }
+    };
+    limits + usize::from(status.copy_of.is_some())
 }
 
 /// What this account is, in a badge: in use, next, or spent.
@@ -1257,7 +1272,31 @@ mod tests {
         extra[1].usage = Some(lapsed);
         extra[1].error = Some(long.into());
         statuses.extend(extra);
+        // A login stored twice, with a reading and without one.
+        let mut copies = crate::tui::app::sample_statuses(2);
+        for (copy, n) in copies.iter_mut().zip(1..) {
+            copy.account.id = format!("claude-copy-{n}");
+            copy.copy_of = Some("claude-1".into());
+        }
+        copies[0].usage = Some(limits());
+        statuses.extend(copies);
         statuses
+    }
+
+    /// A login stored twice says so under its limits, and how to be rid of it.
+    #[test]
+    fn a_login_stored_twice_says_so() {
+        let mut status = crate::tui::app::sample_statuses(1).remove(0);
+        status.usage = Some(usage(vec![window(FIVE_HOURS, None, 10.0, 3600)]));
+        status.copy_of = Some("claude-2".into());
+        let lines: Vec<String> = body(&status, Timestamp::now(), 110)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            lines.last().unwrap().trim_end(),
+            "    ! stored twice · the same login as claude-2 · press d to forget this copy"
+        );
     }
 
     fn reset(expires_in: Option<i64>) -> Resets {

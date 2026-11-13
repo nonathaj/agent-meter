@@ -648,7 +648,7 @@ fn status_json(
                     window["pace"] = json!({"aheadPercent": w.ahead_of_pace(now)});
                 }
                 // Whether the account is judged on this limit: its own always,
-                // a model's only where the settings count that model.
+                // a model's unless the settings ignore that model.
                 window["counted"] = json!(usage.counts(w));
                 window
             }).collect::<Vec<_>>(),
@@ -674,6 +674,7 @@ fn status_json(
                 Role::Unusable => "unusable",
             },
         })),
+        "copyOf": status.copy_of,
     })
 }
 
@@ -751,6 +752,18 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
             (None, None, None) => ("", None),
         };
         notes.extend(detail);
+        // Said whatever else is wrong: the copy is the reason for some of it,
+        // and forgetting it is the fix.
+        let flag = match &status.copy_of {
+            Some(first) => {
+                notes.push(format!(
+                    "{}: the same login as {first}, stored twice; `agent-meter remove {}` forgets this copy",
+                    account.id, account.id
+                ));
+                if flag.is_empty() { "stored twice" } else { flag }
+            }
+            None => flag,
+        };
 
         table.add_row([
             Cell::new(if status.active { "*" } else { "" }).fg(Color::Green),

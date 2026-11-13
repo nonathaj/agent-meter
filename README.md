@@ -290,7 +290,10 @@ terminal UI lists accounts. Weekly windows carry `pace.aheadPercent`: how many
 points more of the week is spent than an even pace through it would have spent,
 `usedPercent − 100 × elapsed / windowSeconds`, or `null` when the window is not
 ahead or nothing dates it. Five-hour windows are a rate rather than a budget and
-carry no `pace`. New fields are only ever added at the end of an object.
+carry no `pace`. `copyOf` names the account stored first where this one is the
+same login stored a second time, and is `null` otherwise; `list` and the
+terminal UI point such a copy out, and `agent-meter remove` forgets it. New
+fields are only ever added at the end of an object.
 
 A successful command can contain failed account polls: inspect `error`,
 `needsLogin` and `usage.observedAt`. Missing or old usage is unknown, not zero

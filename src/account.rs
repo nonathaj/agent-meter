@@ -199,6 +199,26 @@ pub fn same_identity(a: &Identity, b: &Identity) -> Match {
     }
 }
 
+/// The account stored before `account` that is the same login, if one is.
+///
+/// Adding an account merges it into one already held, so a store should never
+/// hold a login twice; one that does is a leftover worth saying so about. The
+/// copy is no second account: switching between the two changes nothing, each
+/// check reads the one login twice, and the two halves of one rotating refresh
+/// token sign each other out. The one stored first is the one to keep, so it
+/// is never the copy.
+pub fn copy_of<'a>(account: &Account, accounts: &'a [Account]) -> Option<&'a Account> {
+    accounts
+        .iter()
+        .filter(|other| other.id != account.id && other.provider == account.provider)
+        .filter(|other| (other.added_at, &other.id) < (account.added_at, &account.id))
+        .filter(|other| {
+            other.credential.refresh_token == account.credential.refresh_token
+                || same_identity(&other.identity, &account.identity) == Match::Same
+        })
+        .min_by(|a, b| (a.added_at, &a.id).cmp(&(b.added_at, &b.id)))
+}
+
 /// OAuth tokens for an account.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
@@ -364,6 +384,64 @@ mod tests {
             same_identity(&person(None), &person(Some("team-org"))),
             Match::Unknown,
             "an unstated organisation cannot confirm a match, only fail to deny one"
+        );
+    }
+
+    /// A login stored twice is a copy of the one stored first, however it is
+    /// told: the same credential, or the same person in the same organisation.
+    /// Two seats under one address are two accounts, and so no copy.
+    #[test]
+    fn a_login_stored_twice_is_a_copy_of_the_first() {
+        let stored = |id: &str, provider, org: &str, token: &str, at: i64| Account {
+            schema_version: SCHEMA_VERSION,
+            id: id.into(),
+            provider,
+            label: None,
+            identity: Identity {
+                user_id: Some("same-person".into()),
+                email: Some("dev@example.com".into()),
+                workspace_id: Some(org.into()),
+                ..Default::default()
+            },
+            credential: Credential {
+                access_token: format!("access-{token}"),
+                refresh_token: token.into(),
+                id_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
+            },
+            provider_data: serde_json::Map::new(),
+            added_at: Timestamp::from_second(at).unwrap(),
+            entitlement_checked_at: None,
+            needs_login: None,
+        };
+        let claude = ProviderKind::Claude;
+        let accounts = [
+            stored("claude-4", claude, "personal", "t2", 128),
+            stored("claude-2", claude, "personal", "t1", 100),
+            stored("claude-3", claude, "team", "t3", 110),
+            stored("codex-1", ProviderKind::Codex, "personal", "t1", 50),
+        ];
+        let copy = |id: &str| {
+            let account = accounts.iter().find(|a| a.id == id).unwrap();
+            copy_of(account, &accounts).map(|a| a.id.as_str())
+        };
+        assert_eq!(
+            copy("claude-4"),
+            Some("claude-2"),
+            "stored later, so it is the copy"
+        );
+        assert_eq!(copy("claude-2"), None, "the first is the one to keep");
+        assert_eq!(copy("claude-3"), None, "another seat under the address");
+        assert_eq!(copy("codex-1"), None, "another provider's account");
+
+        // A credential held twice is one login whatever the identities say.
+        let mut unnamed = stored("claude-5", claude, "personal", "t3", 200);
+        unnamed.identity = Identity::default();
+        let accounts = [accounts[2].clone(), unnamed.clone()];
+        assert_eq!(
+            copy_of(&unnamed, &accounts).map(|a| a.id.as_str()),
+            Some("claude-3")
         );
     }
 

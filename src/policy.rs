@@ -184,7 +184,7 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
             .filter(|(_, usage)| usage.used_at(now) < rules.threshold)
             .filter(
                 |(_, usage)| match (usage.resets_at(WindowKind::Weekly), active_week) {
-                    (Some(candidate), Some(active)) => candidate < active,
+                    (Some(candidate), Some(active)) => to_the_minute(candidate) < to_the_minute(active),
                     // An account with no weekly window has nothing perishable to
                     // spend, and one whose current week is unknown is not a reason
                     // to move off it.
@@ -348,7 +348,11 @@ fn rank(
 /// Where two recover at about the same time, the one with more left in its
 /// slowest window has more to give afterwards.
 fn free_order(a: &Usage, b: &Usage, rules: &Rules, now: Timestamp) -> std::cmp::Ordering {
-    let frees = |usage: &Usage| usage.recovers_at(now, rules.threshold).unwrap_or(Timestamp::MAX);
+    let frees = |usage: &Usage| {
+        usage
+            .recovers_at(now, rules.threshold)
+            .map_or(i64::MAX, to_the_minute)
+    };
     let slowest = |usage: &Usage| usage.slowest_headroom_at(now).unwrap_or(0.0);
     frees(a)
         .cmp(&frees(b))
@@ -471,12 +475,24 @@ fn recovery_order(
 ) -> std::cmp::Ordering {
     // An account that states no window of a kind has nothing expiring, so it
     // sorts last rather than first.
-    let reset = |usage: &Usage, kind| usage.resets_at(kind).unwrap_or(Timestamp::MAX);
+    let reset = |usage: &Usage, kind| usage.resets_at(kind).map_or(i64::MAX, to_the_minute);
     reset(a.1, WindowKind::Weekly)
         .cmp(&reset(b.1, WindowKind::Weekly))
         .then_with(|| reset(a.1, WindowKind::FiveHour).cmp(&reset(b.1, WindowKind::FiveHour)))
         .then_with(|| remaining(b.0, b.1).total_cmp(&remaining(a.0, a.1)))
         .then_with(|| a.0.id.cmp(b.0.id))
+}
+
+/// `at` to the nearest minute, as finely as two resets are told apart.
+///
+/// A provider states the same reset a little differently each time it is
+/// asked: Claude puts the end of a week on the hour, give or take a second, and
+/// where in that second depends on the moment of the reading. Compared to the
+/// microsecond, two accounts whose weeks end together look as if one ends
+/// first, and which one it is changes with every reading — a switch to spend
+/// the sooner week first, made for nothing, and liable to be made back.
+fn to_the_minute(at: Timestamp) -> i64 {
+    (at.as_second() + 30).div_euclid(60)
 }
 
 /// The account of those given whose allowance expires soonest.
@@ -1020,6 +1036,72 @@ mod tests {
                 "only a sooner week may move a free switch: {decision:?}"
             );
         }
+    }
+
+    /// The same reset, read at another moment, is a few hundred milliseconds
+    /// off either side of the hour. Two weeks that end together end together:
+    /// neither is a reason to switch, nor decides which account is next.
+    #[test]
+    fn weeks_that_end_together_are_not_told_apart_by_how_they_were_read() {
+        let three_days = Timestamp::from_second(NOW + 3 * 86_400).unwrap();
+        let ending = |weekly: f64, off_by_ms: i64| {
+            let mut usage = metered(20.0, 3600, weekly, 3);
+            usage.windows[1].resets_at = Some(three_days + jiff::SignedDuration::from_millis(off_by_ms));
+            usage
+        };
+        // As Claude stated two accounts' weeks: 14:00:00.801 and 14:00:00.421.
+        let (mine, other) = (ending(46.0, 801), ending(46.0, 421));
+        assert_eq!(
+            decide(
+                &[
+                    candidate("claude-2", Some(&mine), true),
+                    candidate("claude-4", Some(&other), false),
+                ],
+                &seamless(),
+                now(),
+            ),
+            Decision::Stay(Stay::BelowThreshold { used: 46.0 })
+        );
+
+        // And on the other side of the hour: 13:59:59.716.
+        let early_but_fuller = ending(60.0, -284);
+        let roomier = ending(10.0, 900);
+        let candidates = [
+            candidate("claude-1", Some(&mine), true),
+            candidate("claude-2", Some(&early_but_fuller), false),
+            candidate("claude-3", Some(&roomier), false),
+        ];
+        assert_eq!(
+            decide(&candidates, &seamless(), now()),
+            Decision::Stay(Stay::BelowThreshold { used: 46.0 })
+        );
+        assert_eq!(
+            queue_roles(&candidates, &seamless(), now()),
+            [
+                ("claude-1", Role::InUse),
+                ("claude-3", Role::NextUp),
+                ("claude-2", Role::Queued),
+            ],
+            "the one with more left goes first"
+        );
+
+        // A week that really does end sooner, by as little as a minute, still
+        // moves it.
+        let sooner = ending(46.0, -60_000);
+        assert!(matches!(
+            decide(
+                &[
+                    candidate("claude-1", Some(&mine), true),
+                    candidate("claude-2", Some(&sooner), false),
+                ],
+                &seamless(),
+                now(),
+            ),
+            Decision::Switch {
+                reason: Reason::WeekExpiresSooner { .. },
+                ..
+            }
+        ));
     }
 
     /// Past the threshold there is no room to allocate and a switch is only

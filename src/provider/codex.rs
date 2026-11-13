@@ -356,7 +356,7 @@ fn parse_usage(response: &Value, observed_at: Timestamp) -> Usage {
         windows,
         limit_reached,
         resets: parse_reset_count(response),
-        counted: Vec::new(),
+        ignored: Vec::new(),
     }
 }
 
@@ -624,11 +624,13 @@ mod tests {
         assert_eq!(usage.windows[0].window_secs, FIVE_HOURS);
         assert_eq!(usage.windows[1].window_secs, ONE_WEEK);
         assert_eq!(usage.windows[2].label(), "5h GPT-5.3-Codex-Spark");
-        // The 42% belongs to one model. It is worth showing — something here
-        // is capped — but the account itself is only 8% spent, and judging it
-        // by the model's figure would refuse an account that is nearly free.
+        // The 42% belongs to one model, and like every limit it counts.
         assert_eq!(usage.worst_at(now), 42.0, "shown");
-        assert_eq!(usage.used_at(now), 8.0, "judged");
+        assert_eq!(usage.used_at(now), 42.0, "judged");
+        // Where no work is done in that model, the account is only 8% spent.
+        let usage = usage.ignoring(&["GPT-5.3-Codex-Spark".to_string()]);
+        assert_eq!(usage.worst_at(now), 42.0, "still shown");
+        assert_eq!(usage.used_at(now), 8.0, "no longer judged");
         assert!(!usage.limit_reached);
 
         assert_eq!(parse_usage_identity(&response).email.unwrap(), "dev@example.com");

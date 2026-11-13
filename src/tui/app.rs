@@ -1213,7 +1213,7 @@ mod tests {
         assert!(change_setting(&engine, &Setting::Threshold, Step::Down).unwrap());
         assert!(change_setting(&engine, &Setting::Poll, Step::Up).unwrap());
         let written = engine.store().config().unwrap();
-        assert_eq!(written.models_for(claude), ["Fable"]);
+        assert_eq!(written.ignored_models_for(claude), ["Fable"]);
         assert_eq!(written.watch.threshold, 89.0);
 
         // Nothing here has taken it up until the engine is opened again.

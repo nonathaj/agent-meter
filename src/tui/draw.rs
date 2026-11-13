@@ -1216,7 +1216,7 @@ mod tests {
             windows,
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -1679,10 +1679,10 @@ mod tests {
         // The cursor is on the model's line, and its explanation is below.
         assert_eq!(
             line("Count the Fable limit"),
-            format!("▸ {}", row("Count the Fable limit", "no"))
+            format!("▸ {}", row("Count the Fable limit", "yes"))
         );
         assert!(
-            screen.contains("A model's own limit stops that model and nothing else"),
+            screen.contains("Every limit counts, a model's own included"),
             "{screen}"
         );
         assert!(
@@ -1690,10 +1690,10 @@ mod tests {
             "{screen}"
         );
 
-        app.config.count_model(ProviderKind::Claude, "Fable", true);
+        app.config.count_model(ProviderKind::Claude, "Fable", false);
         let screen = render(&mut app, 100, 40);
         assert!(
-            screen.contains(&format!("▸ {}", row("Count the Fable limit", "yes"))),
+            screen.contains(&format!("▸ {}", row("Count the Fable limit", "no"))),
             "{screen}"
         );
 

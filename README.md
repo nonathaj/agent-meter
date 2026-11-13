@@ -243,8 +243,8 @@ for the rest.
 
 `s` lists every [setting](#settings) with what it is set to: those every agent
 shares, then each agent's own — whether it switches, a threshold for it alone,
-and a line for each model its accounts are metered on, to count that model's
-limit as the account's. `↑` `↓` move, `←` `→` step a number, `space` turns a
+and a line for each model its accounts are metered on, to leave out that
+model's limit where you never use it. `↑` `↓` move, `←` `→` step a number, `space` turns a
 choice over, and `del` gives an agent's own threshold back. Each change is
 written to the settings file as it is made, so a running `agent-meter watch`
 takes it up at its next check.
@@ -271,10 +271,10 @@ Each account includes `id`, `provider`, `active`, `needsLogin`,
 `observedAt`, `usedPercent`, `exhausted`, and `windows`. Each window carries
 `kind` (`five_hour`, `weekly`, `other`), nullable model `scope`, `windowSeconds`,
 `usedPercent`, `resetsAt`, and a human-readable `label`. Use `kind` and `scope`
-for ingestion rather than parsing the display label. A scoped model limit is
-not an account-wide limit, and is left out of the account's `usedPercent` and
-`exhausted` unless `provider.<name>.models` names its model. Each window says
-which it is in `counted`: `true` for a limit the account is judged on.
+for ingestion rather than parsing the display label. A scoped model limit counts
+toward the account's `usedPercent` and `exhausted` like any other, unless
+`provider.<name>.ignored-models` names its model. Each window says which it is
+in `counted`: `true` for a limit the account is judged on.
 
 Usage also carries `limitResets`: `available`, `nextExpiresAt`, and `grants`,
 each with a `title`, `left`, `expiresAt` and the window kinds it `refills`.
@@ -369,29 +369,32 @@ On each check, for each provider:
    up first, rather than churning.
 
 An account is compared on its *tightest* window, so one at 20% of its five-hour
-limit but 98% of its weekly one counts as 98% full. But only the account's own
-limits count: `weekly Opus` at 100% costs one model, while `weekly` at 100%
-stops the account, so a spent per-model window never makes an account look
-unusable.
+limit but 98% of its weekly one counts as 98% full. That includes the limits a
+provider sets on one model, such as Claude's `weekly Fable` or Codex's
+`5h GPT-5.3-Codex-Spark`: an account nearing one is left as the threshold says,
+one that has spent it is not switched to, and it frees up when that model's
+window turns over.
 
-### The model you work in
+### Models you never use
 
-That is the wrong answer for the one model you do your work in: to you, an
-account that has spent its `weekly Fable` is spent. Name the model and its
-limit is judged as one of the account's own, in every way they are:
+A model's own limit stops that model and nothing else, so if you never work in
+it, its limit is no reason to leave an account. Name it and it is left out:
 
 ```console
-agent-meter config set provider.claude.models Fable
+agent-meter config set provider.codex.ignored-models GPT-5.3-Codex-Spark
 ```
 
-An account nearing that limit is left as the threshold says, one that has spent
-it is not switched to, and it frees up when that model's week turns over. Name
-several with commas between them, as the provider writes them in the `WINDOWS`
-column (`weekly Fable` is `Fable`; capitals do not matter), and none at all to
-go back to counting no model: `agent-meter config set provider.claude.models ""`.
+Name several with commas between them, as the provider writes them in the
+`WINDOWS` column (`weekly Fable` is `Fable`; capitals do not matter), and none
+at all to count every model again:
+`agent-meter config set provider.codex.ignored-models ""`. The terminal UI's
+settings panel has a line for each model your accounts are metered on.
 
-This arrived in 0.1.9, and an older `agent-meter` refuses a settings file that
-names a model. Where several installs read one file, update them all first.
+Before 0.1.10 a model's limit counted only where `provider.<name>.models` named
+it. A settings file that names models that way still reads, and is written
+again without it, since every model counts now. An `agent-meter` older than
+0.1.10 refuses a file with `ignored-models` in it, so where several installs
+read one file, update them all first.
 
 ### The five-hour window gates; the week ranks
 
@@ -463,7 +466,7 @@ agent-meter config set provider.codex.enabled false
 | `watch.wait-for-reset` | `true` | With every account spent, wait for the first to come back rather than exit. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
-| `provider.<name>.models` | — | Models whose own limits count as the account's, such as `Fable`. See [The model you work in](#the-model-you-work-in). |
+| `provider.<name>.ignored-models` | — | Models whose own limits are left out of judging an account, such as `GPT-5.3-Codex-Spark`. See [Models you never use](#models-you-never-use). |
 
 All of them are in the terminal UI as well: `s` opens a panel that lists each
 with what it is set to and what it does, and changes the same file.

@@ -2362,51 +2362,51 @@ fn fable_fixture(in_use: f64, spare: f64) -> Fixture {
     fixture
 }
 
-/// A model's own limit stops that model only, so it moves nothing — until the
-/// settings say the work is done in that model. Then it is the account's:
-/// nearing it is what the watcher leaves an account for.
+/// Every limit counts, a model's own included: nearing a model's week is what
+/// the watcher leaves an account for — until the settings say no work is done
+/// in that model. Then it stops that model only, and moves nothing.
 #[test]
-fn a_models_limit_switches_accounts_once_its_model_is_counted() {
+fn a_models_limit_switches_accounts_unless_its_model_is_ignored() {
     let fixture = fable_fixture(95.0, 20.0);
     let check = || fixture.run(&["watch", "--once", "--dry-run"]);
     let listed = |id: &str| {
         let rows = fixture.accounts();
         rows.into_iter().find(|row| row["id"] == id).unwrap()
     };
+    const SWITCHES: &str = "Claude Code: would switch to claude-1 (95% used; claude-1 is at 20%)\n";
+    const STAYS: &str = "Claude Code: 50% used, staying put\n";
 
-    assert_eq!(check(), "Claude Code: 50% used, staying put\n");
-    let in_use = listed("claude-2");
-    assert_eq!(in_use["usage"]["usedPercent"], json!(50.0));
-    assert_eq!(in_use["usage"]["windows"][0]["counted"], json!(true));
-    assert_eq!(in_use["usage"]["windows"][1]["counted"], json!(false));
-
-    // Named however it is typed.
-    fixture.run(&["config", "set", "provider.claude.models", "fable"]);
-    assert_eq!(
-        check(),
-        "Claude Code: would switch to claude-1 (95% used; claude-1 is at 20%)\n"
-    );
+    assert_eq!(check(), SWITCHES);
     let in_use = listed("claude-2");
     assert_eq!(in_use["usage"]["usedPercent"], json!(95.0));
+    assert_eq!(in_use["usage"]["windows"][0]["counted"], json!(true));
     assert_eq!(in_use["usage"]["windows"][1]["counted"], json!(true));
     assert_eq!(listed("claude-1")["queue"]["role"], json!("next_up"));
+
+    // Named however it is typed.
+    fixture.run(&["config", "set", "provider.claude.ignored-models", "fable"]);
+    assert_eq!(check(), STAYS);
+    let in_use = listed("claude-2");
+    assert_eq!(in_use["usage"]["usedPercent"], json!(50.0));
+    assert_eq!(in_use["usage"]["windows"][1]["counted"], json!(false));
     assert!(
-        fixture.run(&["config", "show"]).contains("models = [\"fable\"]"),
+        fixture
+            .run(&["config", "show"])
+            .contains("ignored-models = [\"fable\"]"),
         "the setting is in the file"
     );
 
     // It is Claude's setting, and Codex's is its own.
-    fixture.run(&["config", "set", "provider.claude.models", ""]);
-    fixture.run(&["config", "set", "provider.codex.models", "Fable"]);
-    assert_eq!(check(), "Claude Code: 50% used, staying put\n");
+    fixture.run(&["config", "set", "provider.claude.ignored-models", ""]);
+    fixture.run(&["config", "set", "provider.codex.ignored-models", "Fable"]);
+    assert_eq!(check(), SWITCHES);
 }
 
-/// An account that has spent a counted model's week is spent, to somebody
-/// working in that model: it is not somewhere to switch to.
+/// An account that has spent a model's week is spent, to somebody working in
+/// that model: it is not somewhere to switch to.
 #[test]
-fn an_account_that_has_spent_a_counted_model_is_not_switched_to() {
+fn an_account_that_has_spent_a_models_limit_is_not_switched_to() {
     let fixture = fable_fixture(95.0, 100.0);
-    fixture.run(&["config", "set", "provider.claude.models", "Fable"]);
 
     let rows = fixture.accounts();
     let spare = rows.iter().find(|row| row["id"] == "claude-1").unwrap();
@@ -2416,6 +2416,31 @@ fn an_account_that_has_spent_a_counted_model_is_not_switched_to() {
         .cmd(&["watch", "--once", "--dry-run"])
         .assert()
         .stdout(contains("every account is out of quota; claude-1 frees up in 3d"));
+}
+
+/// 0.1.9 counted only the models its settings named. A file it wrote still
+/// reads, and counts every model as everything now does; `config set` says
+/// what took the old key's place.
+#[test]
+fn settings_that_named_the_models_to_count_still_read() {
+    let fixture = fable_fixture(95.0, 20.0);
+    let config = fixture.data.join("config.toml");
+    std::fs::write(&config, "[provider.claude]\nmodels = [\"Fable\"]\n").unwrap();
+
+    assert_eq!(
+        fixture.run(&["watch", "--once", "--dry-run"]),
+        "Claude Code: would switch to claude-1 (95% used; claude-1 is at 20%)\n"
+    );
+    fixture
+        .cmd(&["config", "set", "provider.claude.models", "Fable"])
+        .assert()
+        .failure()
+        .stderr(contains("provider.claude.ignored-models"));
+
+    // The next change writes the file again, without the old key.
+    fixture.run(&["config", "set", "watch.threshold", "85"]);
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(!written.contains("models"), "{written}");
 }
 
 /// A threshold given on the command line is this run's, and outlasts any

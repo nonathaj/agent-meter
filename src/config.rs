@@ -142,14 +142,23 @@ pub struct ProviderConfig {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f64>,
-    /// The models you work in, as the provider names them: `Fable`, `Opus`.
+    /// The models you do no work in, as the provider names them: `Fable`,
+    /// `Opus`.
     ///
-    /// A model's own limit stops that model and nothing else, so it is left
-    /// out of every judgment — unless the model is named here. Then its limit
-    /// is one of the account's: an account near it is left as the threshold
-    /// says, and one that has spent it is not switched to.
+    /// Every limit counts, a model's own included: an account near one is left
+    /// as the threshold says, and one that has spent it is not switched to. A
+    /// model's limit stops that model and nothing else, though, so where it is
+    /// one you never use, naming it here leaves its limit out of every
+    /// judgment.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub models: Vec<String>,
+    pub ignored_models: Vec<String>,
+    /// What 0.1.9 called the models whose limits counted, when no others did.
+    ///
+    /// Every model's limit counts now, which takes in whatever this named, so
+    /// it is read and nothing more: a file that has it still loads, and is
+    /// written again without it.
+    #[serde(rename = "models", skip_serializing)]
+    pub counted_in_0_1_9: serde::de::IgnoredAny,
 }
 
 impl Default for WatchConfig {
@@ -217,10 +226,13 @@ impl Config {
             }
         }
         for provider in ProviderKind::ALL {
-            for model in self.models_for(provider) {
+            for model in self.ignored_models_for(provider) {
                 // A name is drawn on screen and matched against the provider's.
                 if model.trim().is_empty() || model.chars().any(char::is_control) {
-                    bail!("provider.{provider}.models holds {model:?}, which is not a model's name");
+                    bail!(
+                        "provider.{provider}.ignored-models holds {model:?}, which is not a \
+                         model's name"
+                    );
                 }
             }
         }
@@ -261,24 +273,26 @@ impl Config {
         self.provider.get(provider).and_then(|p| p.threshold)
     }
 
-    /// The models whose own limits are judged as an account's on `provider`.
-    pub fn models_for(&self, provider: ProviderKind) -> &[String] {
-        self.provider.get(provider).map_or(&[], |p| &p.models)
+    /// The models whose own limits are left out of judging accounts on
+    /// `provider`.
+    pub fn ignored_models_for(&self, provider: ProviderKind) -> &[String] {
+        self.provider.get(provider).map_or(&[], |p| &p.ignored_models)
     }
 
     /// Whether `model`'s own limit is judged as an account's on `provider`.
     pub fn counts_model(&self, provider: ProviderKind, model: &str) -> bool {
-        self.models_for(provider)
+        !self
+            .ignored_models_for(provider)
             .iter()
-            .any(|counted| counted.trim().eq_ignore_ascii_case(model.trim()))
+            .any(|ignored| ignored.trim().eq_ignore_ascii_case(model.trim()))
     }
 
     /// Counts `model`'s own limit on `provider`, or stops counting it.
     pub fn count_model(&mut self, provider: ProviderKind, model: &str, count: bool) {
-        let models = &mut self.provider.entry(provider).models;
-        models.retain(|counted| !counted.trim().eq_ignore_ascii_case(model.trim()));
-        if count {
-            models.push(model.trim().to_string());
+        let ignored = &mut self.provider.entry(provider).ignored_models;
+        ignored.retain(|name| !name.trim().eq_ignore_ascii_case(model.trim()));
+        if !count {
+            ignored.push(model.trim().to_string());
         }
     }
 
@@ -345,13 +359,17 @@ impl Config {
                 match *field {
                     "threshold" => self.provider.entry(provider).threshold = Some(parse(key)?),
                     "enabled" => self.provider.entry(provider).enabled = Some(parse_bool(key)?),
-                    // Names separated by commas; none at all counts no model.
-                    "models" => {
-                        self.provider.entry(provider).models.clear();
+                    // Names separated by commas; none at all counts every model.
+                    "ignored-models" => {
+                        self.provider.entry(provider).ignored_models.clear();
                         for model in value.split(',').filter(|model| !model.trim().is_empty()) {
-                            self.count_model(provider, model, true);
+                            self.count_model(provider, model, false);
                         }
                     }
+                    "models" => bail!(
+                        "{key} is gone: every model's limit counts now. To leave one out, \
+                         name it in provider.{provider}.ignored-models"
+                    ),
                     _ => bail!("unknown setting {key:?}"),
                 }
             }
@@ -359,7 +377,7 @@ impl Config {
                 "unknown setting {key:?}. Known keys: watch.threshold, watch.poll-secs, \
                  watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
                  provider.<claude|codex>.threshold, provider.<claude|codex>.enabled, \
-                 provider.<claude|codex>.models, \
+                 provider.<claude|codex>.ignored-models, \
                  remote.<name>.<ssh|command|auto>"
             ),
         }
@@ -387,7 +405,8 @@ mod tests {
         config.provider.codex = Some(ProviderConfig {
             enabled: Some(false),
             threshold: Some(95.0),
-            models: vec!["Fable".into()],
+            ignored_models: vec!["Fable".into()],
+            ..ProviderConfig::default()
         });
         config.save(dir.path()).unwrap();
         assert_eq!(Config::load(dir.path()).unwrap(), config);
@@ -437,37 +456,66 @@ mod tests {
         }
     }
 
-    /// The models whose limits count are named in a list, set from the command
-    /// line as names between commas, and matched however they are cased.
+    /// Every model's limit counts until it is named as ignored: in a list, set
+    /// from the command line as names between commas, and matched however
+    /// they are cased.
     #[test]
-    fn the_models_that_count_are_set_by_name() {
+    fn the_models_that_do_not_count_are_set_by_name() {
         let mut config = Config::default();
-        assert!(config.models_for(ProviderKind::Claude).is_empty());
-
-        config.set("provider.claude.models", "Fable, opus,fable").unwrap();
-        assert_eq!(config.models_for(ProviderKind::Claude), ["opus", "fable"]);
+        assert!(config.ignored_models_for(ProviderKind::Claude).is_empty());
         assert!(config.counts_model(ProviderKind::Claude, "Fable"));
-        assert!(config.counts_model(ProviderKind::Claude, "Opus"));
-        assert!(!config.counts_model(ProviderKind::Claude, "Sonnet"));
+
+        config
+            .set("provider.claude.ignored-models", "Fable, opus,fable")
+            .unwrap();
+        assert_eq!(config.ignored_models_for(ProviderKind::Claude), ["opus", "fable"]);
+        assert!(!config.counts_model(ProviderKind::Claude, "Fable"));
+        assert!(!config.counts_model(ProviderKind::Claude, "Opus"));
+        assert!(config.counts_model(ProviderKind::Claude, "Sonnet"));
         assert!(
-            !config.counts_model(ProviderKind::Codex, "Fable"),
+            config.counts_model(ProviderKind::Codex, "Fable"),
             "each provider has its own"
         );
 
-        config.count_model(ProviderKind::Claude, "Opus", false);
-        assert_eq!(config.models_for(ProviderKind::Claude), ["fable"]);
-        config.set("provider.claude.models", "").unwrap();
-        assert!(config.models_for(ProviderKind::Claude).is_empty());
+        config.count_model(ProviderKind::Claude, "Opus", true);
+        assert_eq!(config.ignored_models_for(ProviderKind::Claude), ["fable"]);
+        config.set("provider.claude.ignored-models", "").unwrap();
+        assert!(config.ignored_models_for(ProviderKind::Claude).is_empty());
 
-        let read: Config = toml::from_str("[provider.claude]\nmodels = [\"Fable\"]").unwrap();
-        assert_eq!(read.models_for(ProviderKind::Claude), ["Fable"]);
+        let read: Config = toml::from_str("[provider.claude]\nignored-models = [\"Fable\"]").unwrap();
+        assert_eq!(read.ignored_models_for(ProviderKind::Claude), ["Fable"]);
         // Written only when there are some, so a file that never named one
         // keeps the shape it had.
         assert!(!toml::to_string_pretty(&config).unwrap().contains("models"));
 
         let dir = tempfile::tempdir().unwrap();
-        config.provider.entry(ProviderKind::Claude).models = vec!["  ".into()];
+        config.provider.entry(ProviderKind::Claude).ignored_models = vec!["  ".into()];
         assert!(config.save(dir.path()).is_err());
+    }
+
+    /// 0.1.9 named the models that counted, when no others did. Now that every
+    /// one does, a file naming some still loads, means what it meant and more,
+    /// and is written again without the old key.
+    #[test]
+    fn a_file_naming_the_models_that_counted_in_0_1_9_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Config::path(dir.path());
+        std::fs::write(&path, "[provider.claude]\nenabled = true\nmodels = [\"Fable\"]\n").unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        assert!(config.counts_model(ProviderKind::Claude, "Fable"));
+        assert!(config.counts_model(ProviderKind::Claude, "Opus"));
+        assert!(config.is_switching_on(ProviderKind::Claude));
+
+        config.save(dir.path()).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("models"), "{written}");
+        assert_eq!(Config::load(dir.path()).unwrap(), config);
+
+        let gone = config
+            .set("provider.claude.models", "Fable")
+            .unwrap_err()
+            .to_string();
+        assert!(gone.contains("provider.claude.ignored-models"), "{gone}");
     }
 
     #[test]

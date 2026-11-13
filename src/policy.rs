@@ -549,7 +549,7 @@ mod tests {
             }],
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -592,7 +592,7 @@ mod tests {
             ],
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -617,7 +617,7 @@ mod tests {
             ],
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -1194,10 +1194,11 @@ mod tests {
         );
     }
 
-    /// A per-model limit is not the account's: one capped model must not make
-    /// an otherwise free account look spent, or unusable to switch to.
+    /// A model named as ignored is one no work is done in, so its limit is not
+    /// the account's: its cap must not make an otherwise free account look
+    /// spent, or unusable to switch to.
     #[test]
-    fn a_capped_model_does_not_make_the_account_spent() {
+    fn an_ignored_models_cap_does_not_make_the_account_spent() {
         let now = now();
         let mut reading = metered(10.0, 3600, 20.0, 5);
         reading.windows.push(Window {
@@ -1206,17 +1207,18 @@ mod tests {
             used_percent: 100.0,
             resets_at: Timestamp::from_second(NOW + 5 * 86_400).ok(),
         });
+        assert!(reading.is_exhausted_at(now), "counted, as every limit is");
 
+        let reading = reading.ignoring(&["Fable".to_string()]);
         assert_eq!(reading.worst_at(now), 100.0, "worth showing");
         assert_eq!(reading.used_at(now), 20.0, "not worth refusing the account for");
         assert!(!reading.is_exhausted_at(now));
     }
 
-    /// A model named in the settings is the one the work is done in, so its
-    /// limit is the account's: nearing it is a reason to leave, and an account
-    /// that has spent it is nowhere to go.
+    /// A model's limit is the account's own unless it is ignored: nearing it
+    /// is a reason to leave, and an account that has spent it is nowhere to go.
     #[test]
-    fn a_counted_models_limit_is_the_accounts_own() {
+    fn a_models_limit_is_the_accounts_own() {
         let now = now();
         let week = Timestamp::from_second(NOW + 5 * 86_400).ok();
         let with_fable = |fable: f64| {
@@ -1231,25 +1233,7 @@ mod tests {
         };
         let rules = Rules::default();
 
-        // Left uncounted, the model's limit moves nothing.
         let (busy, spent, roomy) = (with_fable(95.0), with_fable(100.0), with_fable(30.0));
-        let candidates = [
-            candidate("claude-1", Some(&busy), true),
-            candidate("claude-2", Some(&spent), false),
-            candidate("claude-3", Some(&roomy), false),
-        ];
-        assert_eq!(
-            decide(&candidates, &rules, now),
-            Decision::Stay(Stay::BelowThreshold { used: 20.0 })
-        );
-
-        // Counted, however the settings happen to case its name.
-        let counted = ["fable".to_string()];
-        let (busy, spent, roomy) = (
-            busy.counting(&counted),
-            spent.counting(&counted),
-            roomy.counting(&counted),
-        );
         assert_eq!(busy.used_at(now), 95.0);
         assert!(spent.is_exhausted_at(now));
         assert_eq!(spent.next_relief(now), week);
@@ -1285,6 +1269,24 @@ mod tests {
                 relief_at: week,
                 relief_account: Some("claude-2".into()),
             })
+        );
+
+        // Ignored, however the settings happen to case its name, the model's
+        // limit moves nothing.
+        let ignored = ["fable".to_string()];
+        let (busy, spent, roomy) = (
+            busy.ignoring(&ignored),
+            spent.ignoring(&ignored),
+            roomy.ignoring(&ignored),
+        );
+        let candidates = [
+            candidate("claude-1", Some(&busy), true),
+            candidate("claude-2", Some(&spent), false),
+            candidate("claude-3", Some(&roomy), false),
+        ];
+        assert_eq!(
+            decide(&candidates, &rules, now),
+            Decision::Stay(Stay::BelowThreshold { used: 20.0 })
         );
     }
 

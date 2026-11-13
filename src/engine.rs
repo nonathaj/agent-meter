@@ -161,7 +161,7 @@ impl Engine {
                     // as equally full.
                     usage: entry
                         .and_then(|e| e.usage.clone())
-                        .map(|usage| usage.counting(self.config.models_for(account.provider))),
+                        .map(|usage| usage.ignoring(self.config.ignored_models_for(account.provider))),
                     error: entry.and_then(|e| e.error.clone()),
                     error_at: entry.and_then(|e| e.failed_at),
                     account,
@@ -1292,7 +1292,7 @@ mod tests {
             windows: Vec::new(),
             limit_reached: false,
             resets: Some(resets),
-            counted: Vec::new(),
+            ignored: Vec::new(),
         };
         let described = Resets::from_grants(vec![ResetGrant {
             title: Some("Full reset".into()),
@@ -1354,7 +1354,7 @@ mod tests {
                     windows: Vec::new(),
                     limit_reached: false,
                     resets: None,
-                    counted: Vec::new(),
+                    ignored: Vec::new(),
                 },
             );
             for _ in 0..3 {

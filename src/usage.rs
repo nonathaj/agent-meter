@@ -112,14 +112,14 @@ pub struct Usage {
     /// not say. Not saying is not the same as holding none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets: Option<Resets>,
-    /// The models whose own limits are judged as the account's: the ones the
-    /// settings say the work is done in.
+    /// The models whose own limits the account is not judged on: the ones the
+    /// settings say no work is done in.
     ///
     /// Not something a provider says, so it is no part of a stored reading.
-    /// It is put on a reading as it is read back, by [`Usage::counting`], so
+    /// It is put on a reading as it is read back, by [`Usage::ignoring`], so
     /// that everything asking how full an account is gets the same answer.
     #[serde(skip)]
-    pub counted: Vec<String>,
+    pub ignored: Vec<String>,
 }
 
 /// Limit resets: grants a provider hands out now and then which, when spent,
@@ -209,25 +209,24 @@ impl Resets {
 }
 
 impl Usage {
-    /// This reading, with the limits of `models` judged as the account's own.
-    pub fn counting(mut self, models: &[String]) -> Self {
-        self.counted = models.to_vec();
+    /// This reading, with the limits of `models` left out of every judgment.
+    pub fn ignoring(mut self, models: &[String]) -> Self {
+        self.ignored = models.to_vec();
         self
     }
 
     /// Whether `window` is one the account is judged on.
     ///
-    /// The account's own limits always are. A per-model window at 100% stops
-    /// one model; the account can still do most of its work, and counting it
-    /// would refuse an account that is largely free — or send the watcher
-    /// fleeing an account that is fine. So a model's limit counts only where
-    /// the settings name that model: to somebody working in it, an account
-    /// that has spent it is spent.
+    /// Every limit is, a model's own included: to somebody working in that
+    /// model, an account that has spent it is spent, and nothing here knows
+    /// which model the work is in. The account's own limits always count; a
+    /// model's stops counting only where the settings name that model as one
+    /// no work is done in.
     pub fn counts(&self, window: &Window) -> bool {
         match &window.scope {
             None => true,
-            Some(scope) => self
-                .counted
+            Some(scope) => !self
+                .ignored
                 .iter()
                 .any(|model| model.trim().eq_ignore_ascii_case(scope.trim())),
         }
@@ -367,7 +366,7 @@ mod tests {
             windows: vec![window(FIVE_HOURS, 40.0, 1000), window(ONE_WEEK, 70.0, 5000)],
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         };
         assert_eq!(u.binding_window(ts(10)).unwrap().window_secs, ONE_WEEK);
         assert_eq!(u.headroom_at(ts(10)), 30.0);
@@ -381,7 +380,7 @@ mod tests {
             windows: vec![window(FIVE_HOURS, 100.0, 1000)],
             limit_reached: true,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         };
         assert!(u.is_exhausted_at(ts(999)));
         assert_eq!(u.next_relief(ts(999)), Some(ts(1000)));
@@ -482,10 +481,10 @@ mod tests {
         assert_eq!(window(ONE_WEEK, 90.0, 999_000).ahead_of_pace(now), None);
     }
 
-    /// A model's limit is judged only where its model is counted, and then in
-    /// every way the account's own limits are.
+    /// A model's limit is judged in every way the account's own limits are,
+    /// except where its model is ignored.
     #[test]
-    fn a_models_limit_is_judged_only_where_it_is_counted() {
+    fn a_models_limit_is_judged_unless_it_is_ignored() {
         let now = ts(10);
         let scoped = |scope: &str, used, reset| Window {
             scope: Some(scope.into()),
@@ -502,33 +501,43 @@ mod tests {
             ],
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         };
-        assert_eq!(reading.used_at(now), 40.0);
+        // Everything counts: the spent Fable week holds the account.
+        assert_eq!(reading.used_at(now), 100.0);
         assert_eq!(reading.worst_at(now), 100.0);
-        assert_eq!(reading.slowest_headroom_at(now), Some(70.0));
-        assert_eq!(reading.resets_at(WindowKind::Weekly), Some(ts(5000)));
-        assert!(!reading.is_exhausted_at(now));
+        assert!(reading.is_exhausted_at(now));
+        assert_eq!(reading.next_relief(now), Some(ts(4000)));
+        assert_eq!(reading.recovers_at(now, 90.0), Some(ts(4000)));
+        assert_eq!(reading.resets_at(WindowKind::Weekly), Some(ts(4000)));
+        // Of the three weeks it is judged on, the tightest says what is left.
+        assert_eq!(reading.slowest_headroom_at(now), Some(0.0));
+        // Once its week has turned over it holds the account no longer.
+        assert!(!reading.is_exhausted_at(ts(4000)));
 
-        let opus = reading.clone().counting(&[" opus ".to_string()]);
+        let opus = reading.clone().ignoring(&["Fable".to_string()]);
         assert_eq!(opus.used_at(now), 55.0);
         assert_eq!(opus.binding_window(now).unwrap().scope.as_deref(), Some("Opus"));
-        // Of the two weeks it is now judged on, the tighter says what is left.
         assert_eq!(opus.slowest_headroom_at(now), Some(45.0));
         assert!(!opus.is_exhausted_at(now));
+        assert_eq!(opus.resets_at(WindowKind::Weekly), Some(ts(5000)));
 
-        let fable = reading.clone().counting(&["Fable".to_string()]);
-        assert_eq!(fable.used_at(now), 100.0);
-        assert!(fable.is_exhausted_at(now));
-        assert_eq!(fable.next_relief(now), Some(ts(4000)));
-        assert_eq!(fable.recovers_at(now, 90.0), Some(ts(4000)));
-        assert_eq!(fable.resets_at(WindowKind::Weekly), Some(ts(4000)));
-        // Once its week has turned over it holds the account no longer.
-        assert!(!fable.is_exhausted_at(ts(4000)));
+        // Matched however it is cased and spaced.
+        let neither = reading
+            .clone()
+            .ignoring(&["fable".to_string(), " OPUS ".to_string()]);
+        assert_eq!(neither.used_at(now), 40.0);
+        assert_eq!(
+            neither.worst_at(now),
+            100.0,
+            "what is shown is not what is judged"
+        );
+        assert_eq!(neither.slowest_headroom_at(now), Some(70.0));
+        assert!(!neither.is_exhausted_at(now));
 
-        // Which models count is a setting, not part of what was read.
-        let stored = serde_json::to_string(&fable).unwrap();
-        assert!(!stored.contains("counted"), "{stored}");
+        // Which models are ignored is a setting, not part of what was read.
+        let stored = serde_json::to_string(&neither).unwrap();
+        assert!(!stored.contains("ignored"), "{stored}");
         assert_eq!(serde_json::from_str::<Usage>(&stored).unwrap(), reading);
     }
 

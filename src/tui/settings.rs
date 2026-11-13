@@ -63,7 +63,7 @@ const MINUTE: u64 = 60;
 ///
 /// A model is listed where some account's reading has a limit for it, since
 /// that is the only way to know a provider meters it on its own — and where
-/// the settings already count it, so it can always be turned off again.
+/// the settings already ignore it, so it can always be counted again.
 pub fn list(config: &Config, statuses: &[Status]) -> Vec<Setting> {
     let mut settings = vec![
         Setting::Threshold,
@@ -87,7 +87,7 @@ pub fn list(config: &Config, statuses: &[Status]) -> Vec<Setting> {
     settings
 }
 
-/// The models of `kind` that can be counted, by name, as the provider writes
+/// The models of `kind` that can be ignored, by name, as the provider writes
 /// them where it has.
 fn models(config: &Config, statuses: &[Status], kind: ProviderKind) -> Vec<String> {
     let metered = statuses
@@ -97,7 +97,7 @@ fn models(config: &Config, statuses: &[Status], kind: ProviderKind) -> Vec<Strin
         .flat_map(|usage| &usage.windows)
         .filter_map(|window| window.scope.as_deref());
     let mut models: Vec<String> = Vec::new();
-    for model in metered.chain(config.models_for(kind).iter().map(String::as_str)) {
+    for model in metered.chain(config.ignored_models_for(kind).iter().map(String::as_str)) {
         let model = model.trim();
         if !model.is_empty() && !models.iter().any(|known| known.eq_ignore_ascii_case(model)) {
             models.push(model.to_string());
@@ -206,9 +206,9 @@ impl Setting {
                 kind.display_name()
             ),
             Setting::Model(_, model) => format!(
-                "A model's own limit stops that model and nothing else, so it is left out. \
-                 Counted, it is the account's: an account near its {model} limit is left, and \
-                 one that has spent it is not switched to. For when {model} is what you work in."
+                "Every limit counts, a model's own included: an account near its {model} limit \
+                 is left, and one that has spent it is not switched to. Not counted, it is left \
+                 out, for when {model} is a model you never work in."
             ),
         }
     }
@@ -294,7 +294,7 @@ mod tests {
                 .collect(),
             limit_reached: false,
             resets: None,
-            counted: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -327,9 +327,11 @@ mod tests {
             ]
         );
 
-        // A model the settings count stays listed while no reading has it, so
-        // it can be turned off, and is not listed twice when one does.
-        config.set("provider.claude.models", "fable,Sonnet").unwrap();
+        // A model the settings ignore stays listed while no reading has it, so
+        // it can be counted again, and is not listed twice when one does.
+        config
+            .set("provider.claude.ignored-models", "fable,Sonnet")
+            .unwrap();
         let listed: Vec<Setting> = list(&config, &statuses)
             .into_iter()
             .filter(|setting| matches!(setting, Setting::Model(..)))
@@ -342,8 +344,8 @@ mod tests {
                 Setting::Model(claude, "Sonnet".into()),
             ]
         );
-        assert_eq!(listed[0].value(&config), "yes");
-        assert_eq!(listed[1].value(&config), "no");
+        assert_eq!(listed[0].value(&config), "no");
+        assert_eq!(listed[1].value(&config), "yes");
 
         // With no accounts there is no agent to have settings.
         assert_eq!(list(&config, &[]).len(), 5);
@@ -438,12 +440,12 @@ mod tests {
         assert!(!config.is_enabled(claude), "turned off, not merely unset");
 
         let fable = Setting::Model(claude, "Fable".into());
-        assert_eq!(fable.value(&config), "no");
-        assert!(fable.change(&mut config, Step::Toggle));
-        assert_eq!(config.models_for(claude), ["Fable"]);
         assert_eq!(fable.value(&config), "yes");
+        assert!(fable.change(&mut config, Step::Toggle));
+        assert_eq!(config.ignored_models_for(claude), ["Fable"]);
+        assert_eq!(fable.value(&config), "no");
         assert!(fable.change(&mut config, Step::Up));
-        assert!(config.models_for(claude).is_empty());
+        assert!(config.ignored_models_for(claude).is_empty());
 
         let wait = Setting::WaitForReset;
         assert_eq!(wait.value(&config), "waits for a reset");

@@ -1862,7 +1862,7 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 4] = ["queue", "pace", "counted", "copyOf"];
+    const ADDED: [&str; 5] = ["queue", "pace", "counted", "copyOf", "disabled"];
     let added = |line: &str| {
         let text = line.trim_start();
         ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": ")))
@@ -3004,4 +3004,376 @@ fn a_json_login_never_repeats_a_settings_file_that_does_not_parse() {
             }
         }
     }
+}
+
+/// The binary under test, talking to `server` in place of every provider.
+///
+/// A debug build sends every provider request to the server named by
+/// `AGENT_METER_TEST_SERVER`, keeping its path; a release build never reads it.
+fn against(fixture: &Fixture, server: &mockito::Server, args: &[&str]) -> std::process::Output {
+    fixture
+        .cmd(args)
+        .env_remove("AGENT_METER_OFFLINE")
+        .env("AGENT_METER_TEST_SERVER", server.url())
+        .output()
+        .unwrap()
+}
+
+/// Everything a command printed, out and err.
+fn printed(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Claude's usage reading as Claude Code is sent it, with these grants.
+fn claude_reading(five_hour: f64, grants: Value) -> String {
+    let later = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(3)).to_string();
+    json!({
+        "five_hour": {"utilization": five_hour, "resets_at": later},
+        "seven_day": {"utilization": 40.0, "resets_at": later},
+        "limits": [],
+        "cedar_ember": {"eligible": true, "grants": grants}
+    })
+    .to_string()
+}
+
+fn launch_grant() -> Value {
+    let ends = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24 * 5)).to_string();
+    json!([{
+        "id": "launch-reset", "label": "Launch reset", "resets_total": 1, "resets_left": 1,
+        "ends_at": ends, "clears": ["five_hour", "seven_day"], "paused": false,
+        "usable_now": true, "use_requires_limit": false
+    }])
+}
+
+/// A reset is spent only when asked, with the account's own credential, on
+/// the grant its reading names — and what it did is read back at once.
+#[test]
+fn a_limit_reset_is_spent_only_when_asked_and_says_what_it_did() {
+    let f = Fixture::new();
+    f.sign_in_claude("dev@example.com", "uuid-1", "one");
+    f.run(&["import", "claude"]);
+
+    let mut server = mockito::Server::new();
+    let usage = "/api/oauth/usage?cedar_ember=1&skip_spend=1";
+    let before = server
+        .mock("GET", usage)
+        .with_body(claude_reading(97.0, launch_grant()))
+        .expect(1)
+        .create();
+    let after = server
+        .mock("GET", usage)
+        .with_body(claude_reading(0.0, json!([])))
+        .expect(1)
+        .create();
+    server
+        .mock("GET", "/api/oauth/profile")
+        .with_body(json!({"account": {"uuid": "uuid-1"}, "organization": {"uuid": "org-1"}}).to_string())
+        .create();
+    let spend = server
+        .mock("POST", "/api/organizations/org-1/reset_rate_limits")
+        .match_header("authorization", "Bearer sk-ant-oat01-one")
+        .match_header("user-agent", mockito::Matcher::Regex("^claude-cli/".into()))
+        .match_body(mockito::Matcher::PartialJson(
+            json!({"program": "cedar_ember", "grant_id": "launch-reset"}),
+        ))
+        .with_body(json!({"result": "reset", "resets_left": 0, "cleared": ["five_hour"]}).to_string())
+        .expect(1)
+        .create();
+
+    // Nothing is spent without a yes, and without a terminal to ask at
+    // there is no yes to be had.
+    let asked = against(&f, &server, &["spend-reset", "claude-1"]);
+    assert!(!asked.status.success());
+    assert!(printed(&asked).contains("--yes"), "{}", printed(&asked));
+
+    let spent = against(&f, &server, &["spend-reset", "claude-1", "--yes"]);
+    let said = printed(&spent);
+    assert!(spent.status.success(), "{said}");
+    assert!(said.contains("Spent a limit reset on claude-1"), "{said}");
+    assert!(
+        said.contains("claude-1 now: 5h 0% · weekly 40% · 0 limit reset(s) left"),
+        "{said}"
+    );
+    before.assert();
+    spend.assert();
+    after.assert();
+
+    // Settled, so there is no request left open to ask about.
+    let state = read_json(&f.data.join("state.json"));
+    assert!(state.get("open_claims").is_none(), "{state}");
+    // And the reading everything else shows is the one taken after.
+    assert_eq!(f.accounts()[0]["usage"]["windows"][0]["usedPercent"], 0.0);
+}
+
+/// A request that got no settled answer is asked again under the id it was
+/// sent with, so that the provider answers about it rather than spending a
+/// second reset.
+#[test]
+fn an_unanswered_spend_is_asked_again_as_the_same_request() {
+    let f = Fixture::new();
+    f.sign_in_claude("dev@example.com", "uuid-1", "one");
+    f.run(&["import", "claude"]);
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/api/oauth/usage?cedar_ember=1&skip_spend=1")
+        .with_body(claude_reading(100.0, launch_grant()))
+        .create();
+    let unanswered = server
+        .mock("POST", "/api/organizations/org-1/reset_rate_limits")
+        .with_body(json!({"result": "unavailable"}).to_string())
+        .expect(1)
+        .create();
+
+    let first = against(&f, &server, &["spend-reset", "claude-1", "--yes"]);
+    let said = printed(&first);
+    assert!(!first.status.success(), "{said}");
+    assert!(said.contains("not known"), "{said}");
+    assert!(said.contains("cannot spend a second"), "{said}");
+    unanswered.assert();
+
+    let open = read_json(&f.data.join("state.json"))["open_claims"]["claude-1"][0].clone();
+    assert_eq!(open["grant"], "launch-reset");
+    let request = open["request"].as_str().unwrap().to_string();
+    assert!(
+        request.len() <= 64 && request.chars().all(|c| c.is_ascii_alphanumeric()),
+        "an id Anthropic accepts: {request}"
+    );
+
+    let again = server
+        .mock("POST", "/api/organizations/org-1/reset_rate_limits")
+        .match_body(mockito::Matcher::PartialJson(json!({"request_id": request})))
+        .with_body(json!({"result": "already_used"}).to_string())
+        .expect(1)
+        .create();
+    let second = against(&f, &server, &["spend-reset", "claude-1", "--yes"]);
+    let said = printed(&second);
+    assert!(
+        said.contains("if an earlier try got no answer, it went through then"),
+        "{said}"
+    );
+    again.assert();
+    assert!(
+        read_json(&f.data.join("state.json")).get("open_claims").is_none(),
+        "settled now"
+    );
+}
+
+/// Codex spends a credit as its own CLI does: named by its id, in the
+/// workspace the account is in. OpenAI turns down one that is not needed,
+/// and that is said as nothing spent.
+#[test]
+fn a_codex_reset_credit_is_spent_by_its_id_in_its_workspace() {
+    let f = Fixture::new();
+    f.sign_in_codex("dev@example.com", "user-1", "one");
+    f.run(&["import", "codex"]);
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/backend-api/wham/usage")
+        .with_body(
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {"allowed": true, "limit_reached": false,
+                    "primary_window": {"used_percent": 12, "limit_window_seconds": 18000,
+                                       "reset_at": 2_000_000_000i64}},
+                "rate_limit_reset_credits": {"available_count": 1}
+            })
+            .to_string(),
+        )
+        .create();
+    server
+        .mock("GET", "/backend-api/wham/rate-limit-reset-credits")
+        .with_body(
+            json!({"credits": [{"id": "RateLimitResetCredit_1", "reset_type": "codex_rate_limits",
+                "status": "available", "granted_at": "2026-09-22T21:01:39Z",
+                "expires_at": "2099-10-22T21:01:39Z", "title": "Full reset"}], "available_count": 1})
+            .to_string(),
+        )
+        .create();
+    let consume = server
+        .mock("POST", "/backend-api/wham/rate-limit-reset-credits/consume")
+        .match_header("authorization", "Bearer access-one")
+        .match_header("chatgpt-account-id", "chatgpt-acct-1")
+        .match_body(mockito::Matcher::PartialJson(
+            json!({"credit_id": "RateLimitResetCredit_1"}),
+        ))
+        .with_body(json!({"code": "nothing_to_reset", "windows_reset": 0}).to_string())
+        .expect(1)
+        .create();
+
+    let output = against(&f, &server, &["spend-reset", "codex-1", "--yes"]);
+    let said = printed(&output);
+    assert!(!output.status.success(), "nothing was spent: {said}");
+    assert!(
+        said.contains("codex-1 is at no limit a reset would clear, so none was spent"),
+        "{said}"
+    );
+    assert!(said.contains("1 limit reset(s) left"), "{said}");
+    consume.assert();
+
+    // The id is listed, for naming one with --grant.
+    let rows = f.accounts();
+    assert_eq!(
+        rows[0]["usage"]["limitResets"]["grants"][0]["id"],
+        "RateLimitResetCredit_1"
+    );
+    let unknown = against(
+        &f,
+        &server,
+        &["spend-reset", "codex-1", "--yes", "--grant", "nope"],
+    );
+    assert!(
+        printed(&unknown).contains("holds no limit reset \"nope\""),
+        "{}",
+        printed(&unknown)
+    );
+}
+
+/// Two Claude accounts: claude-2 in use and past the threshold, claude-1
+/// nearly empty, both read just now.
+fn disable_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.sign_in_claude("spare@example.com", "uuid-1", "one");
+    f.run(&["import", "claude"]);
+    f.sign_in_claude("dev@example.com", "uuid-2", "two");
+    f.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let later = (now + jiff::SignedDuration::from_hours(3)).to_string();
+    let reading = |used: f64| {
+        json!({"usage": {"observed_at": now, "windows": [
+            {"window_secs": 18000, "used_percent": used, "resets_at": later}
+        ], "limit_reached": false}, "failures": 0})
+    };
+    write_json(
+        &f.data.join("usage.json"),
+        &json!({"entries": {"claude-1": reading(10.0), "claude-2": reading(95.0)}}),
+    );
+    f
+}
+
+/// What the watcher would do now.
+fn would_do(f: &Fixture) -> String {
+    printed(&f.cmd(&["watch", "--once", "--dry-run"]).output().unwrap())
+}
+
+/// A disabled account is never switched to, for good or for a while, and
+/// enabling it makes it one again.
+#[test]
+fn a_disabled_account_is_not_switched_to_until_it_is_enabled() {
+    let f = disable_fixture();
+    assert!(
+        would_do(&f).contains("would switch to claude-1"),
+        "{}",
+        would_do(&f)
+    );
+
+    let said = f.run(&["disable", "spare@example.com"]);
+    assert!(
+        said.contains("claude-1 is left out of automatic switching until `agent-meter enable claude-1`"),
+        "{said}"
+    );
+    let held = would_do(&f);
+    assert!(held.contains("no other usable account to switch to"), "{held}");
+    assert!(f.run(&["list"]).contains("disabled"));
+    let rows = f.accounts();
+    assert_eq!(rows[0]["disabled"], json!({"until": null}));
+    assert!(rows[1]["disabled"].is_null());
+    let config = std::fs::read_to_string(f.data.join("config.toml")).unwrap();
+    assert!(config.contains("[account.claude-1]"), "{config}");
+
+    // For a while: the same, with an end to it.
+    let said = f.run(&["disable", "claude-1", "--for", "2h"]);
+    assert!(said.contains("(in 2h)") || said.contains("(in 1h59m)"), "{said}");
+    assert!(f.accounts()[0]["disabled"]["until"].is_string());
+    assert!(would_do(&f).contains("no other usable account"));
+    f.cmd(&["disable", "claude-1", "--for", "soon"])
+        .assert()
+        .failure()
+        .stderr(contains("90m, 5h, 2d or 1w"));
+
+    assert!(
+        f.run(&["enable", "claude-1"])
+            .contains("taken into automatic switching again")
+    );
+    assert!(would_do(&f).contains("would switch to claude-1"));
+    assert!(f.accounts()[0]["disabled"].is_null());
+    assert!(f.run(&["enable", "claude-1"]).contains("was not disabled"));
+}
+
+/// Disabling the account in use moves nothing: it is left at its threshold
+/// as any other is, and only not come back to.
+#[test]
+fn disabling_the_account_in_use_does_not_move_off_it() {
+    let f = disable_fixture();
+    let said = f.run(&["disable", "claude-2"]);
+    assert!(said.contains("It is the account in use"), "{said}");
+    assert!(
+        would_do(&f).contains("would switch to claude-1"),
+        "{}",
+        would_do(&f)
+    );
+
+    // Forgetting an account forgets its settings with it.
+    f.run(&["remove", "claude-2", "--yes"]);
+    let config = std::fs::read_to_string(f.data.join("config.toml")).unwrap();
+    assert!(!config.contains("claude-2"), "{config}");
+}
+
+/// An account worked hard enough to want a reset is often one whose readings
+/// are being refused for coming too often. That says nothing about spending,
+/// so the last reading names the reset and the provider decides.
+#[test]
+fn a_reset_is_spent_from_the_last_reading_while_readings_are_refused() {
+    let f = Fixture::new();
+    f.sign_in_claude("dev@example.com", "uuid-1", "one");
+    f.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let later = (now + jiff::SignedDuration::from_hours(24 * 5)).to_string();
+    write_json(
+        &f.data.join("usage.json"),
+        &json!({"entries": {"claude-1": {"usage": {
+            "observed_at": now, "windows": [], "limit_reached": false,
+            "resets": {"available": 1, "grants": [
+                {"id": "launch-reset", "title": "Launch reset", "left": 1, "expires_at": later}
+            ]}
+        }, "failures": 0}}}),
+    );
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/api/oauth/usage?cedar_ember=1&skip_spend=1")
+        .with_status(429)
+        .with_body("{}")
+        .create();
+    let spend = server
+        .mock("POST", "/api/organizations/org-1/reset_rate_limits")
+        .match_body(mockito::Matcher::PartialJson(json!({"grant_id": "launch-reset"})))
+        .with_body(json!({"result": "reset", "resets_left": 0}).to_string())
+        .expect(1)
+        .create();
+
+    let output = against(&f, &server, &["spend-reset", "claude-1", "--yes"]);
+    let said = printed(&output);
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains("Spent a limit reset on claude-1"), "{said}");
+    assert!(
+        said.contains("Could not read claude-1 again: rate limited by the provider"),
+        "{said}"
+    );
+    spend.assert();
+
+    // With nothing to name, a refused reading is the end of it.
+    write_json(&f.data.join("usage.json"), &json!({"entries": {}}));
+    let output = against(&f, &server, &["spend-reset", "claude-1", "--yes"]);
+    assert!(
+        printed(&output).contains("could not read claude-1's limit resets first"),
+        "{}",
+        printed(&output)
+    );
+    spend.assert();
 }

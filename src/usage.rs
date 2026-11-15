@@ -138,8 +138,12 @@ pub struct Resets {
 }
 
 /// One grant of limit resets.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResetGrant {
+    /// The provider's id for it, which is what spending one names. `None` in
+    /// a reading cached before ids were kept; the next one has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// The provider's name for it, cleaned of anything that could repaint the
     /// line it is drawn on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,11 +157,29 @@ pub struct ResetGrant {
     /// does not say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refills: Vec<WindowKind>,
+    /// Whether the provider would take one now, where it says. A reading is
+    /// minutes old and the provider decides when one is spent, so this is
+    /// for saying, not for refusing to ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_now: Option<bool>,
+    /// The provider takes one only once the account is at a limit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_at_limit: bool,
 }
 
 impl ResetGrant {
     fn is_live_at(&self, now: Timestamp) -> bool {
         self.left > 0 && self.expires_at.is_none_or(|at| at > now)
+    }
+
+    /// Why the provider may turn down spending one right now, as of the
+    /// reading: `None` where nothing it said stands in the way.
+    pub fn hindrance(&self) -> Option<&'static str> {
+        match (self.usable_now, self.only_at_limit) {
+            (Some(false), true) => Some("usable only once a limit is reached"),
+            (Some(false), false) => Some("not usable right now"),
+            _ => None,
+        }
     }
 }
 
@@ -390,10 +412,9 @@ mod tests {
 
     fn grant(left: u32, expires: Option<i64>) -> ResetGrant {
         ResetGrant {
-            title: None,
             left,
             expires_at: expires.map(ts),
-            refills: Vec::new(),
+            ..ResetGrant::default()
         }
     }
 
@@ -445,10 +466,13 @@ mod tests {
 
         let mut usage = old.clone();
         usage.resets = Some(Resets::from_grants(vec![ResetGrant {
+            id: Some("grant-1".into()),
             title: Some("Full reset".into()),
             left: 1,
             expires_at: Some(ts(5000)),
             refills: vec![WindowKind::FiveHour, WindowKind::Weekly],
+            usable_now: Some(false),
+            only_at_limit: true,
         }]));
         let json = serde_json::to_string(&usage).unwrap();
         assert!(json.contains(r#""refills":["five_hour","weekly"]"#), "{json}");

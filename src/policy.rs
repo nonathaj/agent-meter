@@ -393,7 +393,7 @@ fn worth_taking(current: &Usage, best: &Usage, rules: &Rules, now: Timestamp) ->
 ///
 /// The account in use leads, because it is the one in use. After it come the
 /// accounts that could be switched to, then those that could not: spent, or
-/// with no reading, or needing a login.
+/// with no reading, needing a login, or disabled.
 pub fn queue<'a>(candidates: &'a [Candidate<'a>], rules: &Rules, now: Timestamp) -> Vec<&'a str> {
     queue_roles(candidates, rules, now)
         .into_iter()
@@ -411,7 +411,7 @@ pub enum Role {
     /// One that could be switched to, after the one next up.
     Queued,
     /// One that could not be switched to now: spent, without a recent
-    /// reading, or needing a login.
+    /// reading, needing a login, or disabled.
     Unusable,
 }
 

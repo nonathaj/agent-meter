@@ -39,6 +39,24 @@ pub fn settings_screenshot(engine: &Engine, width: u16, height: u16, index: usiz
     render(app, width, height)
 }
 
+/// [`screenshot`], with a dialog about the account `id` open: `spend` to spend
+/// one of its limit resets, or `disable` to leave it out of switching.
+pub fn dialog_screenshot(engine: &Engine, width: u16, height: u16, dialog: &str, id: &str) -> Result<String> {
+    let mut app = app::App::preview(engine, false)?;
+    app.mode = match dialog {
+        "spend" => app::Mode::ConfirmSpend {
+            id: id.to_string(),
+            index: 0,
+        },
+        "disable" => app::Mode::ChooseDisable {
+            id: id.to_string(),
+            index: 0,
+        },
+        other => anyhow::bail!("no dialog called {other:?}; spend or disable"),
+    };
+    render(app, width, height)
+}
+
 fn render(mut app: app::App, width: u16, height: u16) -> Result<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| draw::draw(frame, &mut app))?;

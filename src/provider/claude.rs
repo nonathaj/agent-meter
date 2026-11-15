@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use super::secret_store::{self, Backend};
-use super::{Provider, cli_command, config_home_from_env, sanitize_text};
+use super::{Provider, Spent, cli_command, config_home_from_env, sanitize_text};
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::fsutil::{self, Mode};
 use crate::http;
@@ -81,6 +81,11 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1
 /// would mean this needs raising to a newer Claude Code release.
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.284 (external, cli)";
 const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+/// Where an organization's limit resets are spent, as Claude Code's own
+/// `/limit-reset` spends them.
+const ORGANIZATIONS_URL: &str = "https://api.anthropic.com/api/organizations";
+/// The programme limit resets are granted under, as Claude Code names it.
+const RESET_PROGRAM: &str = "cedar_ember";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Claude Code's public OAuth client id. Not a secret; it identifies the CLI.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -149,6 +154,42 @@ impl Provider for Claude {
             ],
         )?;
         Ok(parse_usage(&response, Timestamp::now()))
+    }
+
+    fn spend_reset(
+        &self,
+        account: &Account,
+        credential: &Credential,
+        grant: &str,
+        request: &str,
+    ) -> http::Result<Spent> {
+        let refuse = |why: String| Err(http::Error::Transport(anyhow!(why)));
+        // The organisation goes into the path, and the ids are checked as
+        // Claude Code checks them before it sends either.
+        let Some(organization) = account
+            .identity
+            .workspace_id
+            .as_deref()
+            .filter(|org| !org.is_empty() && org.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        else {
+            return refuse(format!(
+                "agent-meter does not know which organization {} is in; read its usage first",
+                account.id
+            ));
+        };
+        if !is_id(grant, 40, false) || !is_id(request, 64, true) {
+            return refuse(format!("{grant:?} is not a limit reset Anthropic would know"));
+        }
+        let response: Value = http::post_json_with(
+            &format!("{ORGANIZATIONS_URL}/{organization}/reset_rate_limits"),
+            &[
+                ("authorization", &http::bearer(&credential.access_token)),
+                ("anthropic-beta", OAUTH_BETA),
+                ("user-agent", CLAUDE_CODE_USER_AGENT),
+            ],
+            json!({"program": RESET_PROGRAM, "grant_id": grant, "request_id": request}),
+        )?;
+        Ok(parse_claim(&response))
     }
 
     fn fetch_identity(&self, credential: &Credential) -> http::Result<Identity> {
@@ -713,11 +754,73 @@ fn parse_grant(grant: &Value) -> Option<ResetGrant> {
         }
     }
     Some(ResetGrant {
+        id: grant
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_id(id, 40, false))
+            .map(ToString::to_string),
         title: grant.get("label").and_then(Value::as_str).and_then(sanitize_text),
         left,
         expires_at: grant.get("ends_at").and_then(parse_rfc3339),
         refills,
+        usable_now: grant.get("usable_now").and_then(Value::as_bool),
+        only_at_limit: grant.get("use_requires_limit").and_then(Value::as_bool) == Some(true),
     })
+}
+
+/// Whether `id` is one Claude Code would send: at most `max` letters, digits,
+/// `-` and `_`, the letters lowercase unless `any_case`.
+fn is_id(id: &str, max: usize, any_case: bool) -> bool {
+    (1..=max).contains(&id.len())
+        && id.chars().all(|c| {
+            c.is_ascii_digit()
+                || c == '-'
+                || c == '_'
+                || c.is_ascii_lowercase()
+                || (any_case && c.is_ascii_uppercase())
+        })
+}
+
+/// Reads the answer to spending a reset.
+///
+/// Every answer but two settles the request. `unavailable` and `error` say
+/// the server could not finish it, and Claude Code asks again with the same
+/// request id for those, which is what [`Spent::Unconfirmed`] has the caller
+/// do.
+fn parse_claim(response: &Value) -> Spent {
+    let reason = response
+        .get("reason")
+        .and_then(Value::as_str)
+        .and_then(sanitize_text)
+        .map(|reason| reason.replace('_', " "));
+    match response.get("result").and_then(Value::as_str) {
+        Some("reset") => Spent::Reset {
+            left: response
+                .get("resets_left")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
+        },
+        Some("not_limited") => Spent::NotNeeded,
+        Some("already_used") => Spent::AlreadyUsed,
+        Some("cooldown") => Spent::Refused(
+            match response
+                .get("cooldown_until")
+                .and_then(parse_rfc3339)
+                .filter(|at| *at > Timestamp::now())
+            {
+                Some(at) => format!(
+                    "another reset can be used in {}",
+                    crate::timefmt::until(Timestamp::now(), at)
+                ),
+                None => "another reset cannot be used yet".into(),
+            },
+        ),
+        Some("ineligible") => Spent::Refused(match reason {
+            Some(reason) => format!("Anthropic says this account cannot use it ({reason})"),
+            None => "Anthropic says this account cannot use it".into(),
+        }),
+        _ => Spent::Unconfirmed("Anthropic could not confirm the reset".into()),
+    }
 }
 
 fn group_seconds(group: &str) -> Option<u64> {
@@ -1011,6 +1114,69 @@ mod tests {
         assert_eq!(grants[0].expires_at.unwrap().to_string(), "2026-10-22T16:00:00Z");
         // The overage allowance has nothing on screen to point at.
         assert_eq!(grants[0].refills, [WindowKind::FiveHour, WindowKind::Weekly]);
+        // What spending one names, and whether Anthropic would take it now.
+        assert_eq!(grants[0].id.as_deref(), Some("opus55-launch-promax-20260921"));
+        assert_eq!(grants[0].usable_now, Some(true));
+        assert!(!grants[0].only_at_limit);
+        assert_eq!(grants[0].hindrance(), None);
+    }
+
+    /// A reset that can only be used at a limit says so while the account is
+    /// not at one; an id Claude Code would refuse to send is not kept.
+    #[test]
+    fn a_grant_says_when_anthropic_would_not_take_it() {
+        let grant = parse_grant(&json!({
+            "id": "weekly-wall", "resets_left": 1, "usable_now": false, "use_requires_limit": true
+        }))
+        .unwrap();
+        assert_eq!(grant.hindrance(), Some("usable only once a limit is reached"));
+        let odd = parse_grant(&json!({"id": "Not/An Id", "resets_left": 1})).unwrap();
+        assert_eq!(odd.id, None);
+        assert_eq!(odd.usable_now, None, "not said is not a no");
+    }
+
+    /// Every answer Claude Code knows, as it reads them: two leave the
+    /// request open to be asked again, the rest settle it.
+    #[test]
+    fn reads_the_answer_to_spending_a_reset() {
+        let claim = |body: Value| parse_claim(&body);
+        assert_eq!(
+            claim(json!({"result": "reset", "resets_left": 0, "cleared": ["five_hour"]})),
+            Spent::Reset { left: Some(0) }
+        );
+        assert_eq!(claim(json!({"result": "not_limited"})), Spent::NotNeeded);
+        assert_eq!(claim(json!({"result": "already_used"})), Spent::AlreadyUsed);
+        assert_eq!(
+            claim(json!({"result": "ineligible", "reason": "no_grant"})),
+            Spent::Refused("Anthropic says this account cannot use it (no grant)".into())
+        );
+        let soon = (Timestamp::now() + jiff::SignedDuration::from_mins(90)).to_string();
+        let Spent::Refused(cooldown) = claim(json!({"result": "cooldown", "cooldown_until": soon})) else {
+            panic!("a cooldown is a refusal");
+        };
+        assert!(
+            cooldown.starts_with("another reset can be used in 1h"),
+            "{cooldown}"
+        );
+        for open in [
+            json!({"result": "unavailable"}),
+            json!({"result": "error"}),
+            json!({}),
+        ] {
+            let answer = claim(open);
+            assert!(!answer.is_settled(), "{answer:?}");
+        }
+        assert!(Spent::NotNeeded.is_settled());
+    }
+
+    #[test]
+    fn only_ids_claude_code_would_send_are_sent() {
+        assert!(is_id("opus55-launch-promax-20260921", 40, false));
+        assert!(!is_id("Upper", 40, false));
+        assert!(is_id("Upper_and-9", 64, true));
+        assert!(!is_id("", 40, false));
+        assert!(!is_id(&"a".repeat(41), 40, false));
+        assert!(!is_id("../etc", 64, true));
     }
 
     /// The server refuses to say to a client it does not recognise, and that

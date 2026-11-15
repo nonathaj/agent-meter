@@ -10,13 +10,14 @@ use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value};
 
 use crate::account::{Account, Captured, Credential, Match, ProviderKind, SCHEMA_VERSION, same_identity};
-use crate::config::Config;
+use crate::config::{Config, Disabled};
 use crate::http;
 use crate::policy::{self, Candidate, Decision, Disruption, Reason, Role, Rules};
-use crate::provider::{self, Provider};
+use crate::provider::{self, Provider, Spent};
 use crate::remote::Report;
 use crate::store::{Store, SwitchRecord, UsageCache};
-use crate::usage::Usage;
+use crate::usage::{ResetGrant, Resets, Usage};
+use sha2::{Digest, Sha256};
 
 /// Refresh an access token this long before it expires, so a poll never races
 /// the expiry. Only for accounts no agent CLI is using: see [`renewal_due`].
@@ -32,6 +33,10 @@ const LOGIN_HOME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6
 /// changes plan — about four requests a day for the one account in use, against
 /// a budget measured in tens per hour.
 const ENTITLEMENT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// How long a request to spend a limit reset that got no settled answer is
+/// asked again under the id it was sent with. Claude Code's own figure.
+const CLAIM_REASKED_FOR: SignedDuration = SignedDuration::from_mins(10);
 
 pub struct Engine {
     store: Store,
@@ -52,9 +57,20 @@ pub struct Status {
     /// The account stored first that this one is the same login as, where it
     /// is one stored twice. See [`crate::account::copy_of`].
     pub copy_of: Option<String>,
+    /// Whether it is left out of automatic switching, and until when.
+    pub disabled: Option<Disabled>,
 }
 
 impl Status {
+    /// Whether it is left out of automatic switching as of `now`.
+    ///
+    /// A screen stays up for hours between readings of the settings, and an
+    /// account disabled for a while is back the moment the while is over.
+    pub fn disabled_at(&self, now: Timestamp) -> Option<Disabled> {
+        self.disabled
+            .filter(|disabled| !matches!(disabled, Disabled::Until(at) if *at <= now))
+    }
+
     /// Percent of the tightest window used, if known.
     pub fn used(&self, now: Timestamp) -> Option<f64> {
         self.usage.as_ref().map(|usage| usage.worst_at(now))
@@ -85,6 +101,18 @@ pub struct SwitchOutcome {
     pub from: Option<String>,
     /// Whether running sessions of this CLI must be restarted to see the change.
     pub restart_required: bool,
+}
+
+/// What spending a limit reset did.
+#[derive(Debug, Clone)]
+pub struct SpendReport {
+    pub id: String,
+    /// The grant it was asked of, as the reading just before described it.
+    pub grant: ResetGrant,
+    /// What the provider said.
+    pub answer: Spent,
+    /// The account's usage, read straight afterwards, or why it could not be.
+    pub after: Result<Usage, String>,
 }
 
 /// What one watcher tick did for one provider.
@@ -152,6 +180,7 @@ impl Engine {
         // Re-read: syncing may have rewritten credentials.
         let accounts = self.store.accounts()?;
         let cache = self.store.usage_cache()?;
+        let now = Timestamp::now();
         let copies: Vec<Option<String>> = accounts
             .iter()
             .map(|account| crate::account::copy_of(account, &accounts).map(|first| first.id.clone()))
@@ -173,6 +202,7 @@ impl Engine {
                     error: entry.and_then(|e| e.error.clone()),
                     error_at: entry.and_then(|e| e.failed_at),
                     copy_of,
+                    disabled: self.config.disabled(&account.id, now),
                     account,
                 }
             })
@@ -203,7 +233,12 @@ impl Engine {
             id: &status.account.id,
             usage: status.usage.as_ref(),
             active: status.active,
-            usable: status.account.needs_login.is_none() && status.fleet_home.is_none(),
+            // A disabled account is no place to go, but the one in use is
+            // where the agent already is: disabling it leaves it to be left
+            // as any other is, rather than as one the provider signed out.
+            usable: status.account.needs_login.is_none()
+                && status.fleet_home.is_none()
+                && (status.active || status.disabled.is_none()),
             capacity: status.account.identity.capacity,
         }
     }
@@ -596,7 +631,211 @@ impl Engine {
             !crate::fleet::Fleet::load(&self.store)?.homes.contains_key(id),
             "account is registered for fleet use; removing it would strand pinned sessions"
         );
-        self.store.remove_account(id)
+        let existed = self.store.remove_account(id)?;
+        // Its settings go with it. Ids are never handed out again, so they
+        // could never come to mean another account, but a settings file is
+        // read by people too.
+        let mut config = self.store.config()?;
+        if config.account.contains_key(id) {
+            config.account.remove(id);
+            config.save(self.store.dir())?;
+        }
+        let mut state = self.store.state()?;
+        if state.open_claims.remove(id).is_some() {
+            self.store.put_state(&state)?;
+        }
+        Ok(existed)
+    }
+
+    /// Leaves an account out of automatic switching until `until`, or with
+    /// none until it is enabled again. See [`Config::disabled`].
+    ///
+    /// Written to the settings file, which the watcher and the interface both
+    /// read again when it changes.
+    pub fn disable(&self, id: &str, until: Option<Timestamp>) -> Result<()> {
+        let _lock = self.store.lock()?;
+        anyhow::ensure!(self.store.account(id)?.is_some(), "no account with id {id:?}");
+        let mut config = self.store.config()?;
+        config.disable(id, until);
+        config.save(self.store.dir())
+    }
+
+    /// Takes an account into automatic switching again.
+    pub fn enable(&self, id: &str) -> Result<()> {
+        let _lock = self.store.lock()?;
+        let mut config = self.store.config()?;
+        config.enable(id);
+        config.save(self.store.dir())
+    }
+
+    /// Spends one of an account's limit resets: one from the grant the
+    /// provider calls `grant`, or with none the one that lapses first.
+    ///
+    /// Only ever on request. A reset is spent once and is gone, so nothing in
+    /// agent-meter spends one on its own.
+    ///
+    /// The account is read first, whatever the interval says: the reset must
+    /// still be there to name, and the token must be current. It is read again
+    /// afterwards, so that everything shows what spending it did.
+    pub fn spend_reset(&self, id: &str, grant: Option<&str>) -> Result<SpendReport> {
+        let account = self
+            .store
+            .account(id)?
+            .ok_or_else(|| anyhow!("no account with id {id:?}"))?;
+        if let Some(reason) = &account.needs_login {
+            bail!(
+                "{id} is signed out ({reason}), so it cannot spend anything; \
+                 `agent-meter login {id}` signs it in again"
+            );
+        }
+        let provider = provider::get(account.provider);
+        let name = account.provider.display_name();
+
+        let usage = match self.poll(std::slice::from_ref(&account.id), true)?.pop() {
+            Some((_, Ok(usage))) => usage,
+            Some((_, Err(error))) => {
+                // A reading refused for being asked too often is the usual
+                // state of an account worked hard enough to need a reset, and
+                // it says nothing about whether one can be spent. The last
+                // reading names the reset; the provider decides the rest.
+                let signed_out = self.store.account(id)?.is_none_or(|a| a.needs_login.is_some());
+                let cached = self
+                    .store
+                    .usage_cache()?
+                    .get(id)
+                    .and_then(|entry| entry.usage.clone())
+                    .filter(|usage| {
+                        usage.resets.as_ref().is_some_and(|r| {
+                            r.live_grants_at(Timestamp::now()).iter().any(|g| g.id.is_some())
+                        })
+                    });
+                match cached {
+                    Some(usage) if !signed_out => usage,
+                    _ => bail!("could not read {id}'s limit resets first: {error}"),
+                }
+            }
+            None => bail!("no account with id {id:?}"),
+        };
+        let now = Timestamp::now();
+        let resets = usage.resets.clone().unwrap_or_else(Resets::none);
+        let live = resets.live_grants_at(now);
+        let chosen = match grant {
+            Some(wanted) => live
+                .iter()
+                .find(|g| g.id.as_deref() == Some(wanted))
+                .ok_or_else(|| anyhow!("{id} holds no limit reset {wanted:?}"))?,
+            None => match live.first() {
+                Some(first) => first,
+                None if resets.left_at(now) > 0 => bail!(
+                    "{id} holds {} limit reset(s), but {name} did not say which, so there is none \
+                     to name; try again in a minute",
+                    resets.left_at(now)
+                ),
+                None => bail!("{id} holds no limit resets"),
+            },
+        };
+        let chosen = (*chosen).clone();
+        let Some(grant_id) = chosen.id.clone() else {
+            bail!("{name} did not say which reset this is, so there is nothing to name in spending it");
+        };
+
+        // Re-read: the poll may have renewed the token.
+        let account = self
+            .store
+            .account(id)?
+            .ok_or_else(|| anyhow!("{id} was removed meanwhile"))?;
+        let fleet = crate::fleet::Fleet::load(&self.store)?;
+        let credential = match fleet.homes.get(id) {
+            Some(home) => self
+                .capture_fleet_credential(&account, home)
+                .map_err(|e| anyhow!("reading {id}'s credential from its fleet home: {e}"))?,
+            None => account.credential.clone(),
+        };
+
+        // One spend at a time for an account, here or in another agent-meter.
+        let answer = {
+            let _spending = self.store.lock_account(id)?;
+            let request = self.open_claim(id, &grant_id, now)?;
+            let answer = provider.spend_reset(&account, &credential, &grant_id, &request);
+            let settled = match &answer {
+                Ok(spent) => spent.is_settled(),
+                // Refused outright: nothing was done, so there is nothing to
+                // ask about. A timeout or an outage may have done it.
+                Err(error) => !error.is_transient(),
+            };
+            if settled {
+                self.close_claim(id, &request)?;
+            }
+            answer
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(http::Error::Offline) => return Err(http::Error::Offline.into()),
+            Err(error) if error.is_transient() => bail!(
+                "no answer came back from {name} ({}), so whether a reset was spent is not known. \
+                 Asking again within ten minutes asks about the same request, and cannot spend a second.",
+                error.brief()
+            ),
+            Err(error) => bail!("{name} refused to spend a reset on {id}: {}", error.brief()),
+        };
+
+        let after = match self.poll(std::slice::from_ref(&account.id), true)?.pop() {
+            Some((_, result)) => result,
+            None => Err(format!("{id} was removed meanwhile")),
+        };
+        Ok(SpendReport {
+            id: id.to_string(),
+            grant: chosen,
+            answer,
+            after,
+        })
+    }
+
+    /// The request id to spend a reset of `grant` on account `id` under,
+    /// recorded before it is sent.
+    ///
+    /// A request that got no settled answer is asked again under the id it
+    /// was first sent with, so the provider answers about that one rather than
+    /// spending a second. Only for a while: Claude Code keeps one ten minutes,
+    /// and past that the first request has long been settled one way or the
+    /// other.
+    fn open_claim(&self, id: &str, grant: &str, now: Timestamp) -> Result<String> {
+        let _lock = self.store.lock()?;
+        let mut state = self.store.state()?;
+        let open = state.open_claims.entry(id.to_string()).or_default();
+        // One open request per grant, and none kept past the time it is
+        // asked about for.
+        open.retain(|claim| now.duration_since(claim.at) < CLAIM_REASKED_FOR);
+        if let Some(claim) = open.iter().find(|claim| claim.grant == grant) {
+            return Ok(claim.request.clone());
+        }
+        let seed = format!("{id}\n{grant}\n{}\n{}", now.as_nanosecond(), std::process::id());
+        let request: String = Sha256::digest(seed.as_bytes())
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        open.push(crate::store::Claim {
+            grant: grant.to_string(),
+            request: request.clone(),
+            at: now,
+        });
+        self.store.put_state(&state)?;
+        Ok(request)
+    }
+
+    /// Forgets the request `request` on account `id`, now that it is settled.
+    fn close_claim(&self, id: &str, request: &str) -> Result<()> {
+        let _lock = self.store.lock()?;
+        let mut state = self.store.state()?;
+        let Some(open) = state.open_claims.get_mut(id) else {
+            return Ok(());
+        };
+        open.retain(|claim| claim.request != request);
+        if open.is_empty() {
+            state.open_claims.remove(id);
+        }
+        self.store.put_state(&state)
     }
 
     /// Signs the agent CLI in to `id`.
@@ -927,7 +1166,10 @@ impl Engine {
         let described = previous
             .and_then(|p| p.resets.as_ref())
             .filter(|p| p.available == resets.available)
-            .and_then(|p| p.grants.clone());
+            .and_then(|p| p.grants.clone())
+            // A description from before grants' ids were kept cannot name
+            // the one to spend, so it is asked for again, once.
+            .filter(|grants| grants.iter().all(|grant| grant.id.is_some()));
         resets.grants = described.or_else(|| {
             provider::get(account.provider)
                 .fetch_reset_grants(credential)
@@ -1304,10 +1546,11 @@ mod tests {
             ignored: Vec::new(),
         };
         let described = Resets::from_grants(vec![ResetGrant {
+            id: Some("RateLimitResetCredit_1".into()),
             title: Some("Full reset".into()),
             left: 1,
             expires_at: Some(Timestamp::now() + SignedDuration::from_hours(24 * 20)),
-            refills: Vec::new(),
+            ..ResetGrant::default()
         }]);
         let counted = Resets {
             available: 1,

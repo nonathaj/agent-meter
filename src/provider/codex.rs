@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 
-use super::{Provider, cli_command, config_home_from_env, sanitize_text};
+use super::{Provider, Spent, cli_command, config_home_from_env, sanitize_text};
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::fsutil::{self, Mode};
 use crate::usage::{ResetGrant, Resets, Usage, Window};
@@ -29,6 +29,9 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// Lists an account's rate limit reset credits. The usage reading only counts
 /// them; this says what each one is and when it lapses.
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+/// Spends one, as the Codex CLI's own `/usage` does.
+const CONSUME_RESET_CREDIT_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex CLI's public OAuth client id.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -143,6 +146,27 @@ impl Provider for Codex {
             &[("authorization", &http::bearer(&credential.access_token))],
         )?;
         Ok(parse_reset_credits(&response))
+    }
+
+    fn spend_reset(
+        &self,
+        account: &Account,
+        credential: &Credential,
+        grant: &str,
+        request: &str,
+    ) -> http::Result<Spent> {
+        let authorization = http::bearer(&credential.access_token);
+        let mut headers = vec![("authorization", authorization.as_str())];
+        // Which workspace the credit is spent in, as the Codex CLI says it.
+        if let Some(workspace) = account.identity.workspace_id.as_deref() {
+            headers.push(("chatgpt-account-id", workspace));
+        }
+        let response: Value = http::post_json_with(
+            CONSUME_RESET_CREDIT_URL,
+            &headers,
+            json!({"redeem_request_id": request, "credit_id": grant}),
+        )?;
+        Ok(parse_consumed(&response))
     }
 
     fn fetch_identity(&self, credential: &Credential) -> http::Result<Identity> {
@@ -393,6 +417,11 @@ fn parse_reset_credits(response: &Value) -> Vec<ResetGrant> {
         .flatten()
         .filter(|credit| credit.get("status").and_then(Value::as_str) == Some("available"))
         .map(|credit| ResetGrant {
+            id: credit
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string),
             title: credit
                 .get("title")
                 .and_then(Value::as_str)
@@ -405,8 +434,24 @@ fn parse_reset_credits(response: &Value) -> Vec<ResetGrant> {
             // "codex_rate_limits" is the only type seen, and it does not say
             // which of the windows it clears.
             refills: Vec::new(),
+            // OpenAI does not say ahead of time; it answers when one is spent.
+            usable_now: None,
+            only_at_limit: false,
         })
         .collect()
+}
+
+/// Reads the answer to spending a credit. The four codes are the ones the
+/// Codex CLI knows; anything else is an answer nobody here can read, and
+/// asking again with the same request finds out what it meant.
+fn parse_consumed(response: &Value) -> Spent {
+    match response.get("code").and_then(Value::as_str) {
+        Some("reset") => Spent::Reset { left: None },
+        Some("nothing_to_reset") => Spent::NotNeeded,
+        Some("already_redeemed") => Spent::AlreadyUsed,
+        Some("no_credit") => Spent::Refused("OpenAI says the account has no reset credit left".into()),
+        _ => Spent::Unconfirmed("OpenAI gave an answer agent-meter cannot read".into()),
+    }
 }
 
 fn collect_windows(rate_limit: &Value, scope: Option<&str>, windows: &mut Vec<Window>) {
@@ -678,12 +723,26 @@ mod tests {
             "immediate_reset_purchase_eligible": false, "history_enabled": true
         }));
         assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id.as_deref(), Some("RateLimitResetCredit_1"));
+        assert_eq!(grants[0].hindrance(), None, "OpenAI says nothing ahead of time");
         assert_eq!(grants[0].title.as_deref(), Some("Full reset"));
         assert_eq!(grants[0].left, 1);
         assert_eq!(
             grants[0].expires_at.unwrap().to_string(),
             "2026-10-22T21:01:39.507836Z"
         );
+    }
+
+    /// The codes the Codex CLI's own client knows, as its tests state them.
+    #[test]
+    fn reads_the_answer_to_spending_a_credit() {
+        let consumed = |code: &str| parse_consumed(&json!({"code": code, "windows_reset": 2}));
+        assert_eq!(consumed("reset"), Spent::Reset { left: None });
+        assert_eq!(consumed("nothing_to_reset"), Spent::NotNeeded);
+        assert_eq!(consumed("already_redeemed"), Spent::AlreadyUsed);
+        assert!(matches!(consumed("no_credit"), Spent::Refused(_)));
+        assert!(!consumed("something_new").is_settled());
+        assert!(!parse_consumed(&json!({})).is_settled());
     }
 
     #[test]

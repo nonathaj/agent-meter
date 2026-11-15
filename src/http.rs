@@ -47,6 +47,26 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// In a debug build, every provider request goes to this server instead: its
+/// scheme and host replace the provider's, and the path is kept.
+///
+/// For the end-to-end tests, which drive the real binary against a fake
+/// provider. A release build never reads it, so nothing on a user's machine
+/// can send their tokens anywhere but to the provider they belong to.
+pub const TEST_SERVER_ENV: &str = "AGENT_METER_TEST_SERVER";
+
+/// Where a request for `url` is actually sent. See [`TEST_SERVER_ENV`].
+fn destination(url: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(debug_assertions)]
+    if let Some(server) = std::env::var(TEST_SERVER_ENV).ok().filter(|s| !s.is_empty())
+        && let Some(rest) = url.strip_prefix("https://")
+    {
+        let path = rest.find('/').map_or("", |at| &rest[at..]);
+        return std::borrow::Cow::Owned(format!("{}{path}", server.trim_end_matches('/')));
+    }
+    std::borrow::Cow::Borrowed(url)
+}
+
 /// GETs JSON from `url` with the given headers.
 pub fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)]) -> Result<T> {
     get_json_unless(is_offline(), url, headers)
@@ -54,10 +74,21 @@ pub fn get_json<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)]) -> Res
 
 /// POSTs a JSON body to `url` and reads a JSON response.
 pub fn post_json<T: DeserializeOwned>(url: &str, body: Value) -> Result<T> {
+    post_json_with(url, &[], body)
+}
+
+/// POSTs a JSON body to `url` with the given headers, and reads a JSON
+/// response.
+pub fn post_json_with<T: DeserializeOwned>(url: &str, headers: &[(&str, &str)], body: Value) -> Result<T> {
     if is_offline() {
         return Err(Error::Offline);
     }
-    read_json(url, agent().post(url).send_json(body))
+    let url = destination(url);
+    let mut request = agent().post(url.as_ref());
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    read_json(&url, request.send_json(body))
 }
 
 /// The body of [`get_json`], with the offline decision passed in so a test can
@@ -66,11 +97,12 @@ fn get_json_unless<T: DeserializeOwned>(offline: bool, url: &str, headers: &[(&s
     if offline {
         return Err(Error::Offline);
     }
-    let mut request = agent().get(url);
+    let url = destination(url);
+    let mut request = agent().get(url.as_ref());
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    read_json(url, request.call())
+    read_json(&url, request.call())
 }
 
 /// Convenience for the bearer header every provider endpoint expects.

@@ -26,6 +26,14 @@ pub enum Job {
     Tick,
     /// Turn automatic switching on or off for one harness, and remember it.
     SetSwitching { provider: ProviderKind, on: bool },
+    /// Spend one of this account's limit resets: from the grant the provider
+    /// calls `grant`, or the one that lapses first.
+    SpendReset { id: String, grant: Option<String> },
+    /// Leave this account out of automatic switching, for this many seconds
+    /// or until it is enabled again.
+    Disable { id: String, for_secs: Option<i64> },
+    /// Take this account into automatic switching again.
+    Enable(String),
 }
 
 impl Job {
@@ -43,6 +51,9 @@ impl Job {
                 if *on { "on" } else { "off" },
                 provider.display_name()
             ),
+            Job::SpendReset { id, .. } => format!("Spending a limit reset on {id}…"),
+            Job::Disable { id, .. } => format!("Disabling {id}…"),
+            Job::Enable(id) => format!("Enabling {id}…"),
         }
     }
 }
@@ -161,6 +172,34 @@ fn run_job(engine: &Engine, job: &Job) -> Result<String> {
                 if *on { "on" } else { "off" },
                 provider.display_name()
             ))
+        }
+        Job::SpendReset { id, grant } => {
+            let report = engine.spend_reset(id, grant.as_deref())?;
+            let said = format!(
+                "{} · {}",
+                crate::spending::outcome(&report),
+                crate::spending::after(&report, jiff::Timestamp::now())
+            );
+            // Anything but a reset spent is a request that did nothing.
+            match report.answer {
+                crate::provider::Spent::Reset { .. } => Ok(said),
+                _ => anyhow::bail!(said),
+            }
+        }
+        Job::Disable { id, for_secs } => {
+            let until = for_secs.map(|secs| jiff::Timestamp::now() + jiff::SignedDuration::from_secs(secs));
+            engine.disable(id, until)?;
+            Ok(match until {
+                Some(at) => format!(
+                    "{id} is left out of switching until {}",
+                    crate::spending::local_moment(at)
+                ),
+                None => format!("{id} is left out of switching until you enable it again"),
+            })
+        }
+        Job::Enable(id) => {
+            engine.enable(id)?;
+            Ok(format!("{id} is taken into switching again"))
         }
         Job::Tick => {
             let outcomes = engine.tick()?;

@@ -33,6 +33,12 @@ pub enum Mode {
     ChooseProvider { action: ProviderAction, index: usize },
     /// Asking whether to remove an account.
     ConfirmRemove { id: String, name: String },
+    /// Asking whether to spend one of an account's limit resets, with `index`
+    /// the grant the cursor is on, among those its reading lists.
+    ConfirmSpend { id: String, index: usize },
+    /// Asking how long to leave an account out of automatic switching, with
+    /// `index` the choice the cursor is on.
+    ChooseDisable { id: String, index: usize },
     /// Showing the key bindings.
     Help,
     /// Following a login, which `App::login` holds.
@@ -60,6 +66,16 @@ impl ProviderAction {
         }
     }
 }
+
+/// How long an account can be disabled for from the interface, in seconds,
+/// with `None` until it is enabled again. The command line takes any length.
+pub const DISABLE_CHOICES: [(Option<i64>, &str); 5] = [
+    (None, "Until I enable it again"),
+    (Some(3600), "For an hour"),
+    (Some(5 * 3600), "For five hours"),
+    (Some(86_400), "For a day"),
+    (Some(7 * 86_400), "For a week"),
+];
 
 /// One entry in the list: a harness heading, or an account under it.
 ///
@@ -218,6 +234,21 @@ impl App {
     /// Whether anything is switching, which is when a tick is worth running.
     pub fn any_switching(&self) -> bool {
         self.switching.iter().any(|(_, on)| *on)
+    }
+
+    /// The account with this id, as last read.
+    pub fn status_of(&self, id: &str) -> Option<&Status> {
+        self.statuses.iter().find(|status| status.account.id == id)
+    }
+
+    /// The limit resets the account `id` could spend, soonest to lapse first,
+    /// as its last reading lists them.
+    pub fn spendable(&self, id: &str) -> Vec<crate::usage::ResetGrant> {
+        let now = jiff::Timestamp::now();
+        self.status_of(id)
+            .and_then(|status| status.usage.as_ref()?.resets.as_ref())
+            .map(|resets| resets.live_grants_at(now).into_iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Which account each harness is signed in to, for the headings.
@@ -561,7 +592,11 @@ fn handle_key(
         terminal.clear()?;
         return Ok(());
     }
+    mode_key(app, engine, worker, key)
+}
 
+/// A key, as whatever is on screen takes it.
+fn mode_key(app: &mut App, engine: &mut Engine, worker: &Worker, key: KeyEvent) -> Result<()> {
     match app.mode.clone() {
         Mode::Help => app.mode = Mode::Browse,
         Mode::ConfirmRemove { id, .. } => match key.code {
@@ -574,6 +609,72 @@ fn handle_key(
                 app.note("Nothing was removed");
             }
         },
+        Mode::ConfirmSpend { id, index } => {
+            let grants = app.spendable(&id);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.mode = Mode::ConfirmSpend {
+                        index: index.saturating_sub(1),
+                        id,
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.mode = Mode::ConfirmSpend {
+                        index: (index + 1).min(grants.len().saturating_sub(1)),
+                        id,
+                    }
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.mode = Mode::Browse;
+                    // The grant the cursor is on, by the provider's id; a
+                    // reading too old to have ids leaves the choice to the
+                    // one taken just before spending.
+                    let grant = grants.get(index).and_then(|grant| grant.id.clone());
+                    submit(app, worker, Job::SpendReset { id, grant });
+                }
+                _ => {
+                    app.mode = Mode::Browse;
+                    app.note("Nothing was spent");
+                }
+            }
+        }
+        Mode::ChooseDisable { id, index } => {
+            let count = DISABLE_CHOICES.len();
+            let chosen = match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    app.mode = Mode::ChooseDisable {
+                        id,
+                        index: (index + count - 1) % count,
+                    };
+                    return Ok(());
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    app.mode = Mode::ChooseDisable {
+                        id,
+                        index: (index + 1) % count,
+                    };
+                    return Ok(());
+                }
+                KeyCode::Enter => Some(index),
+                KeyCode::Char(c) => c
+                    .to_digit(10)
+                    .and_then(|n| (n as usize).checked_sub(1))
+                    .filter(|n| *n < count),
+                _ => None,
+            };
+            app.mode = Mode::Browse;
+            match chosen {
+                Some(choice) => submit(
+                    app,
+                    worker,
+                    Job::Disable {
+                        id,
+                        for_secs: DISABLE_CHOICES[choice].0,
+                    },
+                ),
+                None => app.note("Nothing was changed"),
+            }
+        }
         Mode::ChooseProvider { action, index } => match choose_provider_key(index, key) {
             Choice::Move(index) => app.mode = Mode::ChooseProvider { action, index },
             Choice::Cancel => app.mode = Mode::Browse,
@@ -771,6 +872,33 @@ fn browse_key(app: &mut App, engine: &Engine, worker: &Worker, key: KeyEvent) {
             }
             None => app.fail("There are no accounts yet — press a to add one"),
         },
+        // Capital, and asked about: a reset is spent once and is gone.
+        KeyCode::Char('R') => match app.selected() {
+            Some(status) => {
+                let id = status.account.id.clone();
+                if app.spendable(&id).is_empty() {
+                    app.fail(format!("{id} holds no limit resets to spend"));
+                } else {
+                    app.mode = Mode::ConfirmSpend { id, index: 0 };
+                }
+            }
+            None => app.fail("Select an account to spend one of its limit resets"),
+        },
+        KeyCode::Char('x') => match app.selected() {
+            Some(status) if status.disabled_at(jiff::Timestamp::now()).is_some() => {
+                let id = status.account.id.clone();
+                // Taken back is something to switch to, and worth a look now.
+                app.next_tick = Instant::now();
+                submit(app, worker, Job::Enable(id));
+            }
+            Some(status) => {
+                app.mode = Mode::ChooseDisable {
+                    id: status.account.id.clone(),
+                    index: 0,
+                }
+            }
+            None => app.fail("Select an account to leave it out of switching"),
+        },
         KeyCode::Char('d') | KeyCode::Delete => match app.selected() {
             Some(status) => {
                 app.mode = Mode::ConfirmRemove {
@@ -930,6 +1058,7 @@ pub(crate) fn sample_statuses(count: usize) -> Vec<Status> {
             error: None,
             error_at: None,
             copy_of: None,
+            disabled: None,
         })
         .collect()
 }
@@ -1247,6 +1376,149 @@ mod tests {
         assert!(change_setting(&engine, &Setting::Threshold, Step::Down).is_err());
         reopen(&mut engine);
         assert_eq!(engine.rules_for(claude).threshold, 89.0);
+    }
+
+    /// Waits for the worker to finish the job it was given, and takes in what
+    /// it did, as the event loop does.
+    fn settle(app: &mut App, engine: &mut Engine, worker: &Worker) {
+        let outcome = loop {
+            if let Some(outcome) = worker.poll() {
+                break outcome;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        app.busy = None;
+        match outcome {
+            Ok(note) => app.note(note),
+            Err(error) => app.fail(error),
+        }
+        reopen(engine);
+        app.reload(engine).unwrap();
+    }
+
+    /// An engine over a store holding two Claude accounts, the first of them
+    /// with one limit reset to spend.
+    fn two_accounts() -> (tempfile::TempDir, Engine) {
+        use crate::usage::{ResetGrant, Resets, Usage};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let mut cache = crate::store::UsageCache::default();
+        for status in sample_statuses(2) {
+            let mut account = status.account;
+            account.credential.refresh_token = format!("r-{}", account.id);
+            store.put_account(&account).unwrap();
+            let resets = (account.id == "claude-1").then(|| {
+                Resets::from_grants(vec![ResetGrant {
+                    id: Some("launch-reset".into()),
+                    left: 1,
+                    ..ResetGrant::default()
+                }])
+            });
+            let usage = Usage {
+                observed_at: jiff::Timestamp::now(),
+                windows: Vec::new(),
+                limit_reached: false,
+                resets,
+                ignored: Vec::new(),
+            };
+            cache.record_success(&account.id, usage);
+        }
+        store.put_usage_cache(&cache).unwrap();
+        let engine = Engine::with_store(store).unwrap();
+        (dir, engine)
+    }
+
+    /// `x` asks for how long, and a number answers; on an account already
+    /// disabled it enables it at once.
+    #[test]
+    fn x_disables_the_selected_account_for_as_long_as_is_chosen() {
+        let (_dir, mut engine) = two_accounts();
+        let worker = Worker::spawn(engine.store().clone()).unwrap();
+        let mut app = App::new(&engine).unwrap();
+        let press = |app: &mut App, engine: &mut Engine, code| {
+            mode_key(app, engine, &worker, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+        };
+
+        press(&mut app, &mut engine, KeyCode::Char('x'));
+        let id = app.selected().unwrap().account.id.clone();
+        assert_eq!(
+            app.mode,
+            Mode::ChooseDisable {
+                id: id.clone(),
+                index: 0
+            }
+        );
+        // Changing one's mind changes nothing.
+        press(&mut app, &mut engine, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.message.as_ref().unwrap().text, "Nothing was changed");
+
+        press(&mut app, &mut engine, KeyCode::Char('x'));
+        press(&mut app, &mut engine, KeyCode::Down);
+        press(&mut app, &mut engine, KeyCode::Enter);
+        settle(&mut app, &mut engine, &worker);
+        let now = jiff::Timestamp::now();
+        let Some(crate::config::Disabled::Until(until)) = engine.config().disabled(&id, now) else {
+            panic!("disabled for an hour: {:?}", app.message);
+        };
+        assert!((until.as_second() - now.as_second() - 3600).abs() < 60);
+        assert!(
+            app.selected().unwrap().disabled.is_some(),
+            "and the screen says so"
+        );
+
+        // Pressed again, it is enabled with no question.
+        press(&mut app, &mut engine, KeyCode::Char('x'));
+        assert_eq!(app.mode, Mode::Browse);
+        settle(&mut app, &mut engine, &worker);
+        assert_eq!(engine.config().disabled(&id, now), None);
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("taken into switching again")
+        );
+
+        // A number picks a choice outright.
+        press(&mut app, &mut engine, KeyCode::Char('x'));
+        press(&mut app, &mut engine, KeyCode::Char('1'));
+        settle(&mut app, &mut engine, &worker);
+        assert_eq!(
+            engine.config().disabled(&id, now),
+            Some(crate::config::Disabled::UntilEnabled)
+        );
+    }
+
+    /// `R` is asked about before anything is spent, and only offered where
+    /// there is something to spend.
+    #[test]
+    fn r_asks_before_spending_and_only_where_there_is_a_reset() {
+        let (_dir, mut engine) = two_accounts();
+        let worker = Worker::spawn(engine.store().clone()).unwrap();
+        let mut app = App::new(&engine).unwrap();
+        let press = |app: &mut App, engine: &mut Engine, code| {
+            mode_key(app, engine, &worker, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+        };
+
+        let holder = app.selected().unwrap().account.id.clone();
+        assert_eq!(holder, "claude-1");
+        press(&mut app, &mut engine, KeyCode::Char('R'));
+        assert_eq!(app.mode, Mode::ConfirmSpend { id: holder, index: 0 });
+        press(&mut app, &mut engine, KeyCode::Char('n'));
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.message.as_ref().unwrap().text, "Nothing was spent");
+        assert!(app.busy.is_none(), "and nothing was sent");
+
+        // An account holding none is told so, and asked nothing.
+        app.move_selection(1);
+        press(&mut app, &mut engine, KeyCode::Char('R'));
+        assert_eq!(app.mode, Mode::Browse);
+        let said = app.message.as_ref().unwrap();
+        assert!(
+            said.is_error && said.text.contains("claude-2 holds no limit resets"),
+            "{said:?}"
+        );
     }
 
     #[test]

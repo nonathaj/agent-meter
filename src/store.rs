@@ -309,6 +309,25 @@ pub struct State {
     /// kept — reads as zero, and the accounts on disk carry the count.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub issued: BTreeMap<String, u32>,
+    /// Requests to spend a limit reset that got no settled answer, keyed by
+    /// account id, one at most for each grant.
+    ///
+    /// Asking again under the same request id finds out what became of the
+    /// first one without spending a second reset, so the id is kept until an
+    /// answer settles it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub open_claims: BTreeMap<String, Vec<Claim>>,
+}
+
+/// A request to spend a limit reset, as it was sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    /// The provider's id for the grant the reset was asked of.
+    pub grant: String,
+    /// The id the request was sent under.
+    pub request: String,
+    /// When it was first sent.
+    pub at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

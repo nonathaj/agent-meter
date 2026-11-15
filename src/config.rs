@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::account::ProviderKind;
@@ -38,6 +39,30 @@ pub struct Config {
     /// Other machines running agent-meter, keyed by the name you call them.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub remote: BTreeMap<String, RemoteConfig>,
+    /// Settings for one account, keyed by its id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub account: BTreeMap<String, AccountConfig>,
+}
+
+/// Settings for one account.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AccountConfig {
+    /// Never switch to this account automatically, until this is turned off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// Never switch to this account automatically before this moment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_until: Option<Timestamp>,
+}
+
+/// How long an account is left out of automatic switching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disabled {
+    /// Until somebody turns it back on.
+    UntilEnabled,
+    /// Until this moment, when it is taken into account again on its own.
+    Until(Timestamp),
 }
 
 /// Another machine running agent-meter.
@@ -250,6 +275,14 @@ impl Config {
                 _ => {}
             }
         }
+        for (id, account) in &self.account {
+            if account.disabled && account.disabled_until.is_some() {
+                bail!(
+                    "account.{id} states both disabled and disabled-until; one of them says \
+                     how long it is left out"
+                );
+            }
+        }
         if self.watch.poll_secs < MIN_POLL_SECS {
             bail!(
                 "watch.poll-secs must be at least {MIN_POLL_SECS}. It is how often the watcher \
@@ -293,6 +326,41 @@ impl Config {
         ignored.retain(|name| !name.trim().eq_ignore_ascii_case(model.trim()));
         if !count {
             ignored.push(model.trim().to_string());
+        }
+    }
+
+    /// Whether the account `id` is left out of automatic switching as of
+    /// `now`, and for how long.
+    ///
+    /// Only as a place to go: a disabled account is never switched to, and
+    /// switching to one by hand is still allowed. Disabling the account in use
+    /// does not move anything off it either. It is left as any other is, once
+    /// its limits come close.
+    pub fn disabled(&self, id: &str, now: Timestamp) -> Option<Disabled> {
+        let account = self.account.get(id)?;
+        match account.disabled_until {
+            _ if account.disabled => Some(Disabled::UntilEnabled),
+            Some(until) if until > now => Some(Disabled::Until(until)),
+            _ => None,
+        }
+    }
+
+    /// Leaves the account `id` out of automatic switching, until `until` or,
+    /// with none, until [`Self::enable`].
+    pub fn disable(&mut self, id: &str, until: Option<Timestamp>) {
+        let account = self.account.entry(id.to_string()).or_default();
+        account.disabled = until.is_none();
+        account.disabled_until = until;
+    }
+
+    /// Takes the account `id` into automatic switching again.
+    pub fn enable(&mut self, id: &str) {
+        if let Some(account) = self.account.get_mut(id) {
+            account.disabled = false;
+            account.disabled_until = None;
+            if *account == AccountConfig::default() {
+                self.account.remove(id);
+            }
         }
     }
 
@@ -353,6 +421,21 @@ impl Config {
                     _ => bail!("unknown setting {key:?}"),
                 }
             }
+            ["account", id, field] => match *field {
+                "disabled" => match parse_bool(key)? {
+                    true => self.disable(id, None),
+                    false => self.enable(id),
+                },
+                // A moment, or nothing to clear it.
+                "disabled-until" if value.trim().is_empty() => self.enable(id),
+                "disabled-until" => {
+                    let until = value.trim().parse().with_context(|| {
+                        format!("{key} must be a moment such as 2026-11-15T09:00:00Z, got {value:?}")
+                    })?;
+                    self.disable(id, Some(until));
+                }
+                _ => bail!("unknown setting {key:?}"),
+            },
             ["provider", name, field] => {
                 let provider =
                     ProviderKind::parse(name).with_context(|| format!("unknown provider {name:?}"))?;
@@ -378,6 +461,7 @@ impl Config {
                  watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
                  provider.<claude|codex>.threshold, provider.<claude|codex>.enabled, \
                  provider.<claude|codex>.ignored-models, \
+                 account.<id>.<disabled|disabled-until>, \
                  remote.<name>.<ssh|command|auto>"
             ),
         }
@@ -516,6 +600,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(gone.contains("provider.claude.ignored-models"), "{gone}");
+    }
+
+    /// An account is left out until it is turned back on, or until a moment
+    /// passes, and either way the file says which in a line of its own.
+    #[test]
+    fn an_account_is_disabled_for_good_or_for_a_while() {
+        let now = Timestamp::from_second(1_800_000_000).unwrap();
+        let later = Timestamp::from_second(1_800_003_600).unwrap();
+        let mut config = Config::default();
+        assert_eq!(config.disabled("claude-2", now), None);
+
+        config.disable("claude-2", None);
+        assert_eq!(config.disabled("claude-2", now), Some(Disabled::UntilEnabled));
+        config.disable("claude-2", Some(later));
+        assert_eq!(config.disabled("claude-2", now), Some(Disabled::Until(later)));
+        assert_eq!(config.disabled("claude-2", later), None, "and then it is back");
+        assert_eq!(config.disabled("claude-3", now), None, "each account is its own");
+
+        let dir = tempfile::tempdir().unwrap();
+        config.save(dir.path()).unwrap();
+        let written = std::fs::read_to_string(Config::path(dir.path())).unwrap();
+        assert!(written.contains("[account.claude-2]"), "{written}");
+        assert!(
+            !written.contains("disabled ="),
+            "only the one that applies: {written}"
+        );
+        assert_eq!(Config::load(dir.path()).unwrap(), config);
+
+        config.enable("claude-2");
+        assert!(config.account.is_empty(), "nothing is left behind");
+
+        config.set("account.codex-1.disabled", "true").unwrap();
+        assert_eq!(config.disabled("codex-1", now), Some(Disabled::UntilEnabled));
+        config
+            .set("account.codex-1.disabled-until", &later.to_string())
+            .unwrap();
+        assert_eq!(config.disabled("codex-1", now), Some(Disabled::Until(later)));
+        config.set("account.codex-1.disabled-until", "").unwrap();
+        assert_eq!(config.disabled("codex-1", now), None);
+        assert!(config.set("account.codex-1.disabled-until", "soon").is_err());
+        assert!(config.set("account.codex-1.colour", "red").is_err());
+
+        let both = "[account.claude-2]\ndisabled = true\ndisabled-until = \"2027-01-01T00:00:00Z\"\n";
+        std::fs::write(Config::path(dir.path()), both).unwrap();
+        assert!(Config::load(dir.path()).is_err());
     }
 
     #[test]

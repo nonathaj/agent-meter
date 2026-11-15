@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::account::ProviderKind;
+use crate::config::Disabled;
 use crate::engine::{AddOutcome, Engine, Status, SwitchOutcome, TickOutcome};
 use crate::foreign::Source;
 use crate::policy::{Blocked, Decision, Reason, Role, Stay};
@@ -88,6 +89,22 @@ enum Command {
     /// Forget a stored account
     #[command(visible_alias = "rm")]
     Remove(RemoveArgs),
+
+    /// Spend one of an account's limit resets, refilling its limits now
+    ///
+    /// A reset is spent once and is gone, so this asks first. Nothing else in
+    /// agent-meter ever spends one.
+    SpendReset(SpendResetArgs),
+
+    /// Leave an account out of automatic switching, for good or for a while
+    ///
+    /// The watcher never switches to a disabled account. Switching to it by
+    /// hand still works, and disabling the account in use does not move off
+    /// it: it is left as any other is, once its limits come close.
+    Disable(DisableArgs),
+
+    /// Take a disabled account into automatic switching again
+    Enable(EnableArgs),
 
     /// Watch usage and switch accounts as limits approach
     ///
@@ -456,6 +473,66 @@ struct RemoveArgs {
 }
 
 #[derive(Args, Debug)]
+struct SpendResetArgs {
+    /// Account id, email or label
+    account: String,
+    /// Which reset, by the provider's id for its grant; the one that lapses
+    /// first otherwise
+    #[arg(long)]
+    grant: Option<String>,
+    /// Do not ask for confirmation
+    #[arg(short, long)]
+    yes: bool,
+}
+
+#[derive(Args, Debug)]
+struct DisableArgs {
+    /// Account id, email or label
+    account: String,
+    /// For how long, such as `90m`, `5h`, `2d` or `1w`; until `enable` otherwise
+    #[arg(long = "for", value_name = "DURATION", value_parser = parse_duration)]
+    for_: Option<jiff::SignedDuration>,
+}
+
+#[derive(Args, Debug)]
+struct EnableArgs {
+    /// Account id, email or label
+    account: String,
+}
+
+/// Reads a length of time such as `90m`, `5h`, `2d`, `1w` or `1d12h`.
+fn parse_duration(text: &str) -> Result<jiff::SignedDuration, String> {
+    let wrong = || format!("{text:?} is not a length of time; say it like 90m, 5h, 2d or 1w");
+    let mut total: i64 = 0;
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err(wrong());
+    }
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let number: i64 = rest[..digits].parse().map_err(|_| wrong())?;
+        rest = &rest[digits..];
+        let unit = rest.find(|c: char| c.is_ascii_digit()).unwrap_or(rest.len());
+        let seconds = match rest[..unit].trim() {
+            "m" | "min" | "mins" => 60,
+            "h" | "hr" | "hrs" => 3600,
+            "d" | "day" | "days" => 86_400,
+            "w" | "wk" | "wks" | "week" | "weeks" => 7 * 86_400,
+            _ => return Err(wrong()),
+        };
+        rest = &rest[unit..];
+        total = number
+            .checked_mul(seconds)
+            .and_then(|s| total.checked_add(s))
+            .ok_or_else(wrong)?;
+    }
+    if total == 0 {
+        return Err(wrong());
+    }
+    Ok(jiff::SignedDuration::from_secs(total))
+}
+
+#[derive(Args, Debug)]
 struct WatchArgs {
     /// Check once and exit instead of running until interrupted
     #[arg(long)]
@@ -537,6 +614,9 @@ fn run() -> Result<ExitCode> {
         Command::Remote(args) => remote(&engine, &args),
         Command::Use(args) => switch(&engine, &args),
         Command::Remove(args) => remove(&engine, &args),
+        Command::SpendReset(args) => spend_reset(&engine, &args),
+        Command::Disable(args) => disable(&engine, &args),
+        Command::Enable(args) => enable(&engine, &args),
         Command::Watch(args) => watch(&engine, &args),
         Command::Tui => crate::tui::run(&engine).map(|()| ExitCode::SUCCESS),
         Command::Config(args) => config(&engine, &args),
@@ -660,6 +740,10 @@ fn status_json(
                     "left": g.left,
                     "expiresAt": g.expires_at,
                     "refills": g.refills,
+                    // What `spend-reset --grant` names it by.
+                    "id": g.id,
+                    "usableNow": g.usable_now,
+                    "onlyAtLimit": g.only_at_limit,
                 })).collect::<Vec<_>>()),
             })),
         })),
@@ -675,6 +759,12 @@ fn status_json(
             },
         })),
         "copyOf": status.copy_of,
+        "disabled": status.disabled.map(|disabled| json!({
+            "until": match disabled {
+                Disabled::UntilEnabled => None,
+                Disabled::Until(at) => Some(at),
+            },
+        })),
     })
 }
 
@@ -750,6 +840,14 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
             ),
             (None, None, None) if status.fleet_home.is_some() => ("fleet home", None),
             (None, None, None) => ("", None),
+        };
+        let disabled = status.disabled.map(|disabled| match disabled {
+            Disabled::UntilEnabled => "disabled".to_string(),
+            Disabled::Until(at) => format!("disabled for {}", crate::timefmt::until(now, at)),
+        });
+        let flag = match (&disabled, flag.is_empty()) {
+            (Some(disabled), true) => disabled.as_str(),
+            _ => flag,
         };
         notes.extend(detail);
         // Said whatever else is wrong: the copy is the reason for some of it,
@@ -1319,6 +1417,97 @@ fn remove(engine: &Engine, args: &RemoveArgs) -> Result<ExitCode> {
     }
     engine.remove(&account.id)?;
     println!("Removed {}", account.id);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn spend_reset(engine: &Engine, args: &SpendResetArgs) -> Result<ExitCode> {
+    let account = engine.resolve(&args.account)?;
+    let now = Timestamp::now();
+    if !args.yes {
+        // What is about to be spent, as the last reading has it. The reading
+        // taken just before spending decides which reset that is, and it is
+        // the same one unless one was granted or spent in between.
+        let status = engine
+            .status()?
+            .into_iter()
+            .find(|status| status.account.id == account.id);
+        let usage = status.as_ref().and_then(|status| status.usage.as_ref());
+        let grants = usage
+            .and_then(|usage| usage.resets.as_ref())
+            .map(|resets| resets.live_grants_at(now))
+            .unwrap_or_default();
+        let grant = match &args.grant {
+            Some(wanted) => grants.iter().find(|g| g.id.as_deref() == Some(wanted)),
+            None => grants.first(),
+        };
+        println!(
+            "Spend a limit reset on {} ({})?",
+            account.id,
+            account.display_name()
+        );
+        match grant {
+            Some(grant) => {
+                for line in crate::spending::offer(account.provider, grant, usage, now) {
+                    println!("  {line}");
+                }
+            }
+            None => println!("  The last reading describes no such reset; the next one decides."),
+        }
+        if !confirm("It cannot be undone. [y/N] ")? {
+            println!("Nothing was spent.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    let report = engine.spend_reset(&account.id, args.grant.as_deref())?;
+    println!("{}", crate::spending::outcome(&report));
+    println!("{}", crate::spending::after(&report, Timestamp::now()));
+    Ok(match report.answer {
+        crate::provider::Spent::Reset { .. } => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    })
+}
+
+fn disable(engine: &Engine, args: &DisableArgs) -> Result<ExitCode> {
+    let account = engine.resolve(&args.account)?;
+    let until = args.for_.map(|length| Timestamp::now() + length);
+    engine.disable(&account.id, until)?;
+    match until {
+        Some(at) => println!(
+            "{} is left out of automatic switching until {} (in {}).",
+            account.id,
+            crate::spending::local_moment(at),
+            crate::timefmt::until(Timestamp::now(), at)
+        ),
+        None => println!(
+            "{} is left out of automatic switching until `agent-meter enable {}`.",
+            account.id, account.id
+        ),
+    }
+    let in_use = engine
+        .status()?
+        .iter()
+        .any(|status| status.account.id == account.id && status.active);
+    if in_use {
+        println!(
+            "It is the account in use: it stays in use until its limits come close, and is \
+             not switched back to after."
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn enable(engine: &Engine, args: &EnableArgs) -> Result<ExitCode> {
+    let account = engine.resolve(&args.account)?;
+    let was = engine.config().disabled(&account.id, Timestamp::now());
+    engine.enable(&account.id)?;
+    match was {
+        Some(_) => println!("{} is taken into automatic switching again.", account.id),
+        None => println!(
+            "{} was not disabled; automatic switching already takes it into account.",
+            account.id
+        ),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

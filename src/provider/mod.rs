@@ -63,6 +63,20 @@ pub trait Provider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Spends one of the account's limit resets: one from the grant the
+    /// provider calls `grant`, sent as request `request`.
+    ///
+    /// The provider settles a request once, so sending the same `request`
+    /// again — after a timeout, say — cannot spend a second reset. Nothing
+    /// here retries; the caller keeps the id while the answer is unknown.
+    fn spend_reset(
+        &self,
+        account: &Account,
+        credential: &Credential,
+        grant: &str,
+        request: &str,
+    ) -> http::Result<Spent>;
+
     /// Reads identity details the credential alone does not carry. Providers
     /// that need no extra call return what they can derive.
     fn fetch_identity(&self, credential: &Credential) -> http::Result<Identity>;
@@ -82,6 +96,32 @@ pub trait Provider: Send + Sync {
     /// can cost an hour of being refused outright.
     fn poll_interval(&self) -> Duration {
         CAUTIOUS_POLL_INTERVAL
+    }
+}
+
+/// What a provider said to spending a limit reset.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Spent {
+    /// One was spent, and the limits it covers refilled. `left` is how many
+    /// the grant still holds, where the provider says.
+    Reset { left: Option<u32> },
+    /// The account is at no limit the reset would clear, so none was spent.
+    NotNeeded,
+    /// That reset is already used. After a request that timed out, it is
+    /// that request which used it.
+    AlreadyUsed,
+    /// The provider would not spend one, for the reason given, and none was.
+    Refused(String),
+    /// The provider could not say whether one was spent. Asking again with
+    /// the same request finds out without spending a second.
+    Unconfirmed(String),
+}
+
+impl Spent {
+    /// Whether the provider has settled the request, one way or the other,
+    /// so that its id has done its job.
+    pub fn is_settled(&self) -> bool {
+        !matches!(self, Spent::Unconfirmed(_))
     }
 }
 

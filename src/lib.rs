@@ -25,6 +25,7 @@ pub mod paths;
 pub mod policy;
 pub mod provider;
 pub mod remote;
+pub mod spending;
 pub mod store;
 pub mod timefmt;
 pub mod tui;

@@ -1,7 +1,7 @@
 //! Renders the terminal UI to stdout with the real store's data.
 //!
 //! Useful for checking layout without an interactive terminal:
-//! `cargo run --example screenshot -- [width] [height] [watch|settings [row]]`.
+//! `cargo run --example screenshot -- [width] [height] [watch|settings [row]|spend <id>|disable <id>]`.
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -15,6 +15,11 @@ fn main() -> anyhow::Result<()> {
         Some("settings") => {
             let row: usize = args.next().map_or(Ok(0), |a| a.parse())?;
             agent_meter::tui::settings_screenshot(&engine, width, height, row)?
+        }
+        // A dialog about one account.
+        Some(dialog @ ("spend" | "disable")) => {
+            let id = args.next().unwrap_or_default();
+            agent_meter::tui::dialog_screenshot(&engine, width, height, dialog, &id)?
         }
         view => agent_meter::tui::screenshot(&engine, width, height, view == Some("watch"))?,
     };

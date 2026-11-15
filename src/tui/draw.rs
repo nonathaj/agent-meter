@@ -23,6 +23,7 @@ use super::app::{App, Mode, ProviderAction, Row};
 use super::login::{self, Login};
 use super::settings::Kind;
 use crate::account::ProviderKind;
+use crate::config::Disabled;
 use crate::engine::Status;
 use crate::timefmt;
 use crate::usage::{Usage, Window, WindowKind};
@@ -82,6 +83,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(frame),
         Mode::ChooseProvider { action, index } => draw_provider_chooser(frame, action, index),
         Mode::ConfirmRemove { id, name } => draw_confirm_remove(frame, &id, &name),
+        Mode::ConfirmSpend { id, index } => draw_confirm_spend(frame, app, &id, index),
+        Mode::ChooseDisable { id, index } => draw_disable_chooser(frame, app, &id, index),
         Mode::Login => {
             if let Some(login) = &app.login {
                 draw_login(frame, login, spinner(app));
@@ -391,13 +394,29 @@ fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Vec<
                 .add_modifier(Modifier::BOLD),
         )]
     };
+    // Left out of switching, and for how long: the reason it sits where it
+    // does in the order, or for the one in use, that nothing comes back to it.
+    let disabled = status.disabled_at(now).map(|disabled| {
+        let text = match disabled {
+            Disabled::UntilEnabled => " disabled ".to_string(),
+            Disabled::Until(at) => format!(" disabled · {} ", timefmt::until(now, at)),
+        };
+        Span::styled(text, Style::new().fg(Color::Yellow))
+    });
     if status.active {
         // Filled, rather than a word among words: this is the one fact
         // somebody opens the interface to find.
-        return badge("IN USE", Color::Green);
+        let mut spans = badge("IN USE", Color::Green);
+        if let Some(disabled) = disabled {
+            spans.insert(0, disabled);
+        }
+        return spans;
     }
     if status.account.needs_login.is_some() {
         return vec![Span::styled(" login needed ", Style::new().fg(Color::Red))];
+    }
+    if let Some(disabled) = disabled {
+        return vec![disabled];
     }
     if status
         .usage
@@ -705,6 +724,20 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             ("esc", "cancel".into()),
         ],
         Mode::ConfirmRemove { .. } => vec![("y", "remove".into()), ("any key", "cancel".into())],
+        Mode::ConfirmSpend { id, .. } => {
+            let mut keys = Vec::new();
+            if app.spendable(id).len() > 1 {
+                keys.push(("↑↓", "choose".into()));
+            }
+            keys.push(("y", "spend".into()));
+            keys.push(("any key", "cancel".into()));
+            keys
+        }
+        Mode::ChooseDisable { .. } => vec![
+            ("↑↓", "choose".into()),
+            ("enter", "confirm".into()),
+            ("esc", "cancel".into()),
+        ],
         Mode::Login => match &app.login {
             Some(login) if !login.is_running() => vec![("esc", "close".into())],
             Some(login) if login.wants_input() => vec![
@@ -748,11 +781,29 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 Some(kind) => format!("{} auto", kind.display_name()),
                 None => "auto-switch".into(),
             };
-            vec![
+            let mut keys = vec![
                 ("enter", "use".into()),
                 ("l", "sign in".into()),
                 ("w", switching),
                 ("s", "settings".into()),
+            ];
+            // Only where there is one to spend, so the bar is not one key
+            // longer under every account that has never been granted one.
+            if let Some(status) = app.selected() {
+                if !app.spendable(&status.account.id).is_empty() {
+                    keys.push(("R", "spend reset".into()));
+                }
+                keys.push((
+                    "x",
+                    if status.disabled_at(Timestamp::now()).is_some() {
+                        "enable"
+                    } else {
+                        "disable"
+                    }
+                    .into(),
+                ));
+            }
+            keys.extend([
                 ("tab", "agents".into()),
                 ("r", "refresh".into()),
                 ("a", "add".into()),
@@ -760,7 +811,8 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
                 ("d", "remove".into()),
                 ("?", "keys".into()),
                 ("q", "quit".into()),
-            ]
+            ]);
+            keys
         }
     };
 
@@ -822,6 +874,8 @@ fn draw_help(frame: &mut Frame) {
         row("i", "import the account a CLI is signed in to"),
         row("d", "forget the selected account"),
         row("w", "switch automatically as limits approach"),
+        row("x", "leave it out of switching, or take it back"),
+        row("R", "spend one of its limit resets"),
         row("s", "change the settings"),
         row("tab  p", "show one agent at a time, or all"),
         row("r", "read usage now"),
@@ -967,6 +1021,125 @@ fn draw_provider_chooser(frame: &mut Frame, action: ProviderAction, index: usize
     let area = popup(frame.area(), 46, lines.len() as u16 + 4);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(dialog("Which agent?")), area);
+}
+
+/// How wide the spending dialog is.
+const SPEND_WIDTH: u16 = 66;
+
+/// Asks whether to spend a limit reset, saying what it would refill and how
+/// full that is now, and with several grants to spend from, which.
+fn draw_confirm_spend(frame: &mut Frame, app: &App, id: &str, index: usize) {
+    let inner = SPEND_WIDTH.saturating_sub(4) as usize;
+    let now = Timestamp::now();
+    let status = app.status_of(id);
+    let name = status.map_or(id.to_string(), |s| s.account.display_name().to_string());
+    let grants = app.spendable(id);
+    let index = index.min(grants.len().saturating_sub(1));
+    let dim = Style::new().fg(DIM);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Spend a limit reset on "),
+            Span::styled(id.to_string(), Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(truncate(
+                &format!(" ({name})?"),
+                inner.saturating_sub(24 + id.len()),
+            )),
+        ]),
+        Line::raw(""),
+    ];
+    match (status, grants.get(index)) {
+        (Some(status), Some(grant)) => {
+            let offer = crate::spending::offer(status.account.provider, grant, status.usage.as_ref(), now);
+            if grants.len() > 1 {
+                for (at, each) in grants.iter().enumerate() {
+                    let (marker, style) = if at == index {
+                        ("▸ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("  ", Style::new())
+                    };
+                    let title = each.title.as_deref().unwrap_or("A limit reset");
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::new().fg(ACCENT)),
+                        Span::styled(truncate(title, inner - 2), style),
+                    ]));
+                }
+                lines.push(Line::raw(""));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    truncate(&offer[0], inner),
+                    Style::new().add_modifier(Modifier::BOLD),
+                )));
+            }
+            let hindered = grant.hindrance().is_some();
+            let details = &offer[1..];
+            for (at, line) in details.iter().enumerate() {
+                let style = if hindered && at + 1 == details.len() {
+                    Style::new().fg(Color::Yellow)
+                } else {
+                    dim
+                };
+                lines.push(Line::from(Span::styled(truncate(line, inner), style)));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "Its reading lists no limit resets any more.",
+            dim,
+        ))),
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::from(Span::styled("A reset is spent once, and cannot be undone.", dim)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("y", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" spend   ", dim),
+            Span::styled("any key", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", dim),
+        ]),
+    ]);
+    let area = popup(frame.area(), SPEND_WIDTH, lines.len() as u16 + 4);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(dialog("Spend a limit reset")), area);
+}
+
+/// Asks how long to leave an account out of automatic switching.
+fn draw_disable_chooser(frame: &mut Frame, app: &App, id: &str, index: usize) {
+    let dim = Style::new().fg(DIM);
+    let in_use = app.status_of(id).is_some_and(|status| status.active);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Leave ", dim),
+            Span::styled(id.to_string(), Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(" out of automatic switching:", dim),
+        ]),
+        Line::raw(""),
+    ];
+    for (at, (_, label)) in super::app::DISABLE_CHOICES.iter().enumerate() {
+        let (marker, style) = if at == index {
+            ("▸", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            (" ", Style::new())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::new().fg(ACCENT)),
+            Span::styled(format!("{}  ", at + 1), dim),
+            Span::styled(*label, style),
+        ]));
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::from(Span::styled("Switching to it by hand still works.", dim)),
+    ]);
+    if in_use {
+        lines.push(Line::from(Span::styled(
+            "It is in use, and stays so until its limits come close.",
+            dim,
+        )));
+    }
+    let area = popup(frame.area(), 62, lines.len() as u16 + 4);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(dialog("Disable account")), area);
 }
 
 fn draw_confirm_remove(frame: &mut Frame, id: &str, name: &str) {
@@ -1301,10 +1474,12 @@ mod tests {
 
     fn reset(expires_in: Option<i64>) -> Resets {
         Resets::from_grants(vec![ResetGrant {
+            id: Some("opus55-launch-promax-20260921".into()),
             title: Some("Claude Opus 5.5 launch: one usage-limit reset for Pro and Max".into()),
             left: 1,
             expires_at: expires_in.map(|secs| Timestamp::now() + jiff::SignedDuration::from_secs(secs)),
             refills: vec![WindowKind::FiveHour, WindowKind::Weekly],
+            ..ResetGrant::default()
         }])
     }
 
@@ -1589,6 +1764,14 @@ mod tests {
                 index: 6,
                 changed: false,
             },
+            Mode::ConfirmSpend {
+                id: "claude-1".into(),
+                index: 4,
+            },
+            Mode::ChooseDisable {
+                id: "claude-1".into(),
+                index: 2,
+            },
             Mode::Browse,
         ] {
             app.mode = mode;
@@ -1635,8 +1818,8 @@ mod tests {
         let wide = footer(&mut app, 200);
         assert_eq!(
             wide,
-            "enter use   l sign in   w Claude Code auto   s settings   tab agents   r refresh   a add   \
-             i import   d remove   ? keys   q quit"
+            "enter use   l sign in   w Claude Code auto   s settings   x disable   tab agents   \
+             r refresh   a add   i import   d remove   ? keys   q quit"
         );
         // Keys go from the middle, last first, and the order of the rest holds.
         assert_eq!(
@@ -1965,5 +2148,134 @@ mod tests {
             screen.contains("1  Claude Code") && screen.contains("▸ 2  Codex"),
             "the cursor is on the second agent:\n{screen}"
         );
+
+        app.mode = Mode::ChooseDisable {
+            id: "claude-1".into(),
+            index: 3,
+        };
+        let screen = render(&mut app, 80, 24);
+        assert!(
+            screen.contains("Leave claude-1 out of automatic switching:"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("1  Until I enable it again") && screen.contains("▸ 4  For a day"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Switching to it by hand still works."),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("It is in use, and stays so until its limits come close."),
+            "{screen}"
+        );
+    }
+
+    /// Before a reset is spent the dialog says what it refills and how full
+    /// that is now, when it lapses, and anything that stands in its way; with
+    /// several to spend, which one is chosen.
+    #[test]
+    fn spending_a_reset_says_what_it_would_do_first() {
+        let mut statuses = crate::tui::app::sample_statuses(1);
+        let mut reading = usage(vec![
+            window(FIVE_HOURS, None, 97.0, 3600),
+            window(ONE_WEEK, None, 40.0, 4 * 86_400),
+        ]);
+        let mut resets = reset(Some(3 * 86_400 + 600));
+        if let Some(grants) = resets.grants.as_mut() {
+            grants[0].usable_now = Some(false);
+            grants[0].only_at_limit = true;
+        }
+        reading.resets = Some(resets);
+        statuses[0].usage = Some(reading);
+        let mut app = App::for_tests(statuses);
+
+        // The key is offered under an account that holds one.
+        let screen = render(&mut app, 200, 30);
+        assert!(screen.contains("R spend reset"), "{screen}");
+
+        app.mode = Mode::ConfirmSpend {
+            id: "claude-1".into(),
+            index: 0,
+        };
+        let screen = render(&mut app, 100, 30);
+        for said in [
+            "Spend a limit reset on claude-1 (claude-1)?",
+            "Claude Opus 5.5 launch",
+            "refills 5h (now 97%) and weekly (now 40%)",
+            "expires in 3d",
+            "Anthropic says it is usable only once a limit is reached",
+            "A reset is spent once, and cannot be undone.",
+            "y spend   any key cancel",
+        ] {
+            assert!(screen.contains(said), "{said:?}:\n{screen}");
+        }
+        assert!(!screen.contains("▸"), "one reset is no choice:\n{screen}");
+
+        // Two to spend from: the cursor says which.
+        let second = ResetGrant {
+            id: Some("weekly-wall".into()),
+            title: Some("Weekly wall reset".into()),
+            left: 2,
+            ..ResetGrant::default()
+        };
+        if let Some(grants) = app.statuses[0]
+            .usage
+            .as_mut()
+            .and_then(|u| u.resets.as_mut())
+            .and_then(|r| r.grants.as_mut())
+        {
+            grants.push(second);
+        }
+        app.mode = Mode::ConfirmSpend {
+            id: "claude-1".into(),
+            index: 1,
+        };
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("  Claude Opus 5.5 launch"), "{screen}");
+        assert!(screen.contains("▸ Weekly wall reset"), "{screen}");
+        assert!(
+            !screen.contains("refills 5h (now"),
+            "the details are the chosen one's:\n{screen}"
+        );
+
+        // An account holding none is not offered the key.
+        let mut app = App::for_tests(crate::tui::app::sample_statuses(1));
+        assert!(!render(&mut app, 200, 30).contains("spend reset"));
+    }
+
+    /// A disabled account says so, and for how long, where its standing is
+    /// drawn; the account in use says so beside the badge it keeps.
+    #[test]
+    fn a_disabled_account_says_so_and_for_how_long() {
+        let mut statuses = crate::tui::app::sample_statuses(3);
+        statuses[0].disabled = Some(Disabled::UntilEnabled);
+        statuses[1].disabled = Some(Disabled::Until(
+            Timestamp::now() + jiff::SignedDuration::from_secs(5 * 3600 - 30),
+        ));
+        // Read while it was, and over since: on screen, it is back.
+        statuses[2].disabled = Some(Disabled::Until(
+            Timestamp::now() - jiff::SignedDuration::from_secs(60),
+        ));
+        let mut app = App::for_tests(statuses);
+        let screen = render(&mut app, 110, 30);
+        let line = |id: &str| {
+            screen
+                .lines()
+                .find(|line| line.contains(&format!("  {id}")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line("claude-1").contains("disabled  IN USE"), "{screen}");
+        assert!(
+            line("claude-2").trim_end().ends_with("disabled · 4h59m"),
+            "{screen}"
+        );
+        assert!(!line("claude-3").contains("disabled"), "{screen}");
+        // And the key says what it does to the one selected.
+        assert!(screen.contains("x enable"), "{screen}");
+        app.move_selection(2);
+        assert!(render(&mut app, 200, 30).contains("x disable"));
     }
 }

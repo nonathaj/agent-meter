@@ -187,6 +187,9 @@ next machine that still has it. Remove it on each.
 | `agent-meter remote add\|list\|remove` | The other machines to sync with. |
 | `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
+| `agent-meter spend-reset <account>` | Spends one of an account's [limit resets](#limit-resets), after saying what it refills and asking. `--grant <id>` picks which; `--yes` skips the question. |
+| `agent-meter disable <account>` | Leaves an account out of automatic switching until `enable`, or `--for 5h` (`90m`, `2d`, `1w`). See [Accounts to leave alone](#accounts-to-leave-alone). |
+| `agent-meter enable <account>` | Takes a disabled account into automatic switching again. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
 | `agent-meter tui` | The same operations in a full-screen interface. |
 | `agent-meter config` | Reads and changes settings. |
@@ -238,8 +241,16 @@ that corrects itself.
 
 Every operation is on a key: `enter` to switch, `r` to refresh, `tab` to filter
 by harness, `a` to add, `l` to sign in to the selected account again, `i` to
-import, `d` to remove, `w` to switch automatically, `s` for the settings, `?`
-for the rest.
+import, `d` to remove, `w` to switch automatically, `x` to disable or enable the
+selected account, `R` to spend one of its limit resets, `s` for the settings,
+`?` for the rest.
+
+`R` is offered only under an account holding a reset, and asks first: it names
+the reset, what spending it refills and how full that is now, when it lapses,
+and anything the provider said that stands in its way, with `↑` `↓` to choose
+where there are several. `x` asks for how long — until you enable it again, an
+hour, five hours, a day or a week — and pressed on a disabled account, enables
+it. A disabled account says so where its badge goes, with the time left.
 
 `s` lists every [setting](#settings) with what it is set to: those every agent
 shares, then each agent's own — whether it switches, a threshold for it alone,
@@ -277,22 +288,27 @@ toward the account's `usedPercent` and `exhausted` like any other, unless
 in `counted`: `true` for a limit the account is judged on.
 
 Usage also carries `limitResets`: `available`, `nextExpiresAt`, and `grants`,
-each with a `title`, `left`, `expiresAt` and the window kinds it `refills`.
+each with a `title`, `left`, `expiresAt`, the window kinds it `refills`, the
+provider's `id` for it (what `spend-reset --grant` takes), and, where the
+provider says, `usableNow` and `onlyAtLimit`.
 `limitResets` is `null` where the provider did not say, which is not the same as
 holding none (`available: 0`). `grants` is `null` where the provider counted
 its resets without describing them. Resets past their deadline are left out.
 
 Each account also carries `queue`: its `position` in its provider's switching
 order, counted from 1, and its `role` there — `in_use`, `next_up` (where a
-switch would go), `queued`, or `unusable` (spent, without a recent reading, or
-needing a login). It is the ranking `watch` switches on, in the order the
+switch would go), `queued`, or `unusable` (spent, without a recent reading,
+needing a login, or disabled). It is the ranking `watch` switches on, in the order the
 terminal UI lists accounts. Weekly windows carry `pace.aheadPercent`: how many
 points more of the week is spent than an even pace through it would have spent,
 `usedPercent − 100 × elapsed / windowSeconds`, or `null` when the window is not
 ahead or nothing dates it. Five-hour windows are a rate rather than a budget and
 carry no `pace`. `copyOf` names the account stored first where this one is the
 same login stored a second time, and is `null` otherwise; `list` and the
-terminal UI point such a copy out, and `agent-meter remove` forgets it. New
+terminal UI point such a copy out, and `agent-meter remove` forgets it.
+`disabled` is `null` for an account automatic switching may take, and
+otherwise says `until` when it is left out, `null` for until it is enabled
+again. A disabled account's `role` is `unusable`, except for the one in use. New
 fields are only ever added at the end of an object.
 
 A successful command can contain failed account polls: inspect `error`,
@@ -399,6 +415,24 @@ again without it, since every model counts now. An `agent-meter` older than
 0.1.10 refuses a file with `ignored-models` in it, so where several installs
 read one file, update them all first.
 
+### Accounts to leave alone
+
+An account you are keeping for something else — a colleague's this week, the
+one a long job is running on — can be left out of automatic switching:
+
+```console
+agent-meter disable oncall@example.com            # until you enable it again
+agent-meter disable claude-3 --for 5h             # or for a while
+agent-meter enable claude-3
+```
+
+The watcher never switches to a disabled account. Switching to it by hand still
+works, and disabling the account in use moves nothing: it is left as any other
+is once its limits come close, and only not switched back to. `x` in the
+terminal UI does the same. It is written to the settings file as
+`account.<id>.disabled` or `account.<id>.disabled-until`, so a running watcher
+takes it up at once, and removing the account removes it.
+
 ### The five-hour window gates; the week ranks
 
 The two limits are not the same kind of thing, and ranking on whichever happens
@@ -470,6 +504,8 @@ agent-meter config set provider.codex.enabled false
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
 | `provider.<name>.ignored-models` | — | Models whose own limits are left out of judging an account, such as `GPT-5.3-Codex-Spark`. See [Models you never use](#models-you-never-use). |
+| `account.<id>.disabled` | `false` | Never switch to this account automatically. See [Accounts to leave alone](#accounts-to-leave-alone). |
+| `account.<id>.disabled-until` | — | The same, until this moment, such as `2026-11-15T09:00:00Z`. |
 
 All of them are in the terminal UI as well: `s` opens a panel that lists each
 with what it is set to and what it does, and changes the same file.
@@ -539,8 +575,9 @@ Code and `/status` in Codex.
 
 Both vendors now and then hand out a free **limit reset**: spent, it refills an
 account's windows at once, and unspent it lapses on a date. `agent-meter` shows
-the ones each account holds, and when they expire, next to its usage. It never
-spends one.
+the ones each account holds, and when they expire, next to its usage, and
+spends one when you ask — `agent-meter spend-reset <account>`, or `R` in the
+terminal UI. Nothing spends one on its own: a reset is used once and is gone.
 
 - **Claude Code** — the usage reading asks for the same `cedar_ember` block
   Claude Code's `/limit-reset` reads. Anthropic describes it only to Claude
@@ -551,8 +588,24 @@ spends one.
   `/wham/rate-limit-reset-credits` describes them. That second request is made
   only when the count changes, not at every poll.
 
-Anthropic's own instructions say to spend a reset from Settings → Usage on the
-web or in Claude Desktop.
+Spending one is the request each vendor's own CLI sends, made with the
+account's own sign-in:
+
+- **Claude Code** — `POST /api/organizations/<org>/reset_rate_limits`, as
+  `/limit-reset` sends it, naming the grant. Some grants are usable only once a
+  limit is reached; the reading says so, and the dialog passes it on.
+- **Codex** — `POST /wham/rate-limit-reset-credits/consume`, as `/usage` sends
+  it, naming the credit.
+
+Either vendor may turn one down — no limit it would clear, a cooldown, already
+used — and that is said as nothing spent. The account is read just before, to
+name a reset that is still there, and just after, to show what it did. Every
+request carries an id of its own. Where no answer comes back, the id is kept,
+and asking again within ten minutes asks about that request rather than
+spending a second reset. These are the vendors' private endpoints, not a
+published API, so they can change without notice. Anthropic's own instructions
+say to spend a reset from Settings → Usage on the web or in Claude Desktop, or
+with `/limit-reset` in Claude Code.
 
 Refresh tokens are single-use. If a CLI refreshes its own token, `agent-meter`
 notices and adopts the new one rather than keeping a spent copy — otherwise the
@@ -573,7 +626,9 @@ stored account would be one failed refresh away from needing a manual login.
 Bug reports and pull requests are welcome. Run `cargo test` and
 `cargo clippy --all-targets` before sending a change; both are clean and are
 expected to stay that way. Tests never touch the network or your real agent
-configuration.
+configuration: the end-to-end ones that need a provider run the debug binary
+against a local fake one, named by `AGENT_METER_TEST_SERVER`, which a release
+build never reads.
 
 ## Licence
 

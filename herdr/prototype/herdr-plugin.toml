@@ -1,0 +1,33 @@
+# Prototype of the proposed agent-meter herdr plugin. The PowerShell scripts
+# stand in for `agent-meter herdr ...` subcommands.
+id = "agent-meter"
+name = "agent-meter"
+version = "0.0.1"
+min_herdr_version = "0.9.0"
+description = "Subscription usage and account switching for the agents in your panes"
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+command = ["pwsh", "-NoProfile", "-File", "report.ps1"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["pwsh", "-NoProfile", "-File", "report.ps1"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["pwsh", "-NoProfile", "-File", "report.ps1"]
+
+[[actions]]
+id = "open"
+title = "agent-meter: accounts and limits"
+contexts = ["workspace"]
+command = ["pwsh", "-NoProfile", "-File", "open.ps1"]
+
+[[panes]]
+id = "meter"
+title = "agent-meter"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["agent-meter", "tui"]

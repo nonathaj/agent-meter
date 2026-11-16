@@ -8,7 +8,7 @@
 // agent-meter CLI. Nothing here polls a provider.
 
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, ScrollHandle } from "gpui-base";
 import { agents, exec, run, theme, props, layout, openOverlay, closeOverlay, notify, watchFolder, checking } from "herdr";
 
 const PROVIDERS = [
@@ -43,6 +43,28 @@ const used = (a) => Math.round(a.usage?.usedPercent ?? 0);
 const level = (pct, threshold) => (pct >= threshold ? "hot" : pct >= threshold - 20 ? "warn" : "ok");
 const provider = (key) => PROVIDERS.find(p => p.key === key);
 
+// agent-meter's settings, as `agent-meter config show` prints them (TOML). The real mod
+// would read `config show --json` instead, with each setting's wording and range.
+function parseConfig(text) {
+  const out = {};
+  let section = out;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const head = line.match(/^\[(.+)\]$/);
+    if (head) {
+      section = out;
+      for (const k of head[1].split(".")) section = section[k] = section[k] ?? {};
+      continue;
+    }
+    const kv = line.match(/^([\w-]+)\s*=\s*(.+)$/);
+    if (kv) { try { section[kv[1]] = JSON.parse(kv[2]); } catch { section[kv[1]] = kv[2]; } }
+  }
+  return out;
+}
+const minutes = (secs) => (secs >= 3600 ? `${Math.floor(secs / 3600)}h${secs % 3600 ? `${Math.round((secs % 3600) / 60)}m` : ""}` : `${Math.round(secs / 60)}m`);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
 // Who an account is, as the person knows it: their own label, else the email
 // they signed in with. agent-meter's ids (`claude-7`) are for the CLI.
 const who = (a) => a?.label || a?.email || a?.id || "";
@@ -61,9 +83,13 @@ export default class AgentMeter extends View {
     this.error = null;
     this.threshold = 90;
     this.choice = 0;
+    this.config = null;
+    this.page = "accounts";
+    this.settingsScroll = ScrollHandle.new();
     const p = props() ?? {};
     if (checking() || p.dialog) return;
     this.refresh(cx);
+    this.readConfig(cx);
     cx.timer.every(30000, (cx) => this.refresh(cx));
     // A switch or a fresh reading lands in agent-meter's own files: follow them.
     cx.spawn(async (cx) => {
@@ -72,6 +98,7 @@ export default class AgentMeter extends View {
       for (;;) {
         await watchFolder(where);
         this.refresh(cx);
+        this.readConfig(cx);
       }
     });
   }
@@ -88,6 +115,31 @@ export default class AgentMeter extends View {
       if (props()?.compact) this.fit();
       cx.notify();
     });
+  }
+
+  readConfig(cx) {
+    cx.spawn(async (cx) => {
+      const r = await exec("agent-meter", ["config", "show"]);
+      if (r.code !== 0) return;
+      this.config = parseConfig(r.stdout);
+      this.threshold = this.config.watch?.threshold ?? 90;
+      cx.notify();
+    });
+  }
+
+  // Changes one setting the way `agent-meter config set` does, then reads them all again.
+  set(cx, key, value) {
+    cx.spawn(async (cx) => {
+      const r = await exec("agent-meter", ["config", "set", key, String(value)]);
+      this.error = r.code === 0 ? null : (r.stderr.trim().split("\n")[0] || `Could not set ${key}`);
+      this.readConfig(cx);
+      this.refresh(cx);
+    });
+  }
+
+  // The mark one provider's accounts are judged by: its own, else the shared one.
+  thresholdFor(key) {
+    return this.config?.provider?.[key]?.threshold ?? this.threshold;
   }
 
   // A switch made since the last reading becomes a notice.
@@ -145,7 +197,7 @@ export default class AgentMeter extends View {
       .when(collapsed, el => el.px(0).items_center())
       .children(this.inUse().map(a => {
         const pct = used(a);
-        const lv = level(pct, this.threshold);
+        const lv = level(pct, this.thresholdFor(a.provider));
         const prov = provider(a.provider);
         const tip = `${prov.name}: ${named(a)}, ${pct}% used`;
         if (collapsed) {
@@ -175,7 +227,7 @@ export default class AgentMeter extends View {
     // One limit: its name, a bar, how full, and when it starts over.
     const limit = (a, w) => {
       const pct = Math.round(w.usedPercent);
-      const color = w.counted ? c[level(pct, this.threshold)] : t.dim;
+      const color = w.counted ? c[level(pct, this.thresholdFor(a.provider))] : t.dim;
       return h_flex().h(18).gap(10).items_center().text_size(11.5)
         .when(!w.counted, el => el.tooltip("Not counted for switching"))
         .child(div().flex_none().w(96).truncate().text_color(w.counted ? t.muted : t.dim).child(w.label))
@@ -221,30 +273,132 @@ export default class AgentMeter extends View {
       const place = (a) => a.queue?.position ?? Number.MAX_SAFE_INTEGER;
       const mine = list.filter(a => a.provider === prov.key).sort((x, y) => place(x) - place(y));
       if (!mine.length) return [];
-      const room = mine.filter(a => used(a) < this.threshold && !a.disabled).length;
+      const mark = this.thresholdFor(prov.key);
+      const room = mine.filter(a => used(a) < mark && !a.disabled).length;
       return [
         h_flex().id(`am-h-${prov.key}`).px(10).pt(12).pb(4).flex_none().gap(7).items_center().text_size(11.5).font_medium()
           .child(image(prov.icon).w(14).h(14))
           .child(div().text_color(t.muted).child(prov.name))
           .child(div().flex_1())
-          .child(div().text_color(t.dim).child(`${room} of ${mine.length} below ${this.threshold}%`)),
+          .child(div().text_color(t.dim).child(`${room} of ${mine.length} below ${mark}%`)),
         ...mine.map(a => row(prov, a)),
       ];
     };
 
+    const settings = this.page === "settings";
+    const icon = (id, name, tip, onClick) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6)
+      .text_color(t.dim).cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip(tip).on_click(onClick)
+      .child(svg(`mods/agent-meter/${name}.svg`).size(14));
     return v_flex().size_full().min_h(0).bg(t.popover).text_size(13)
-      .child(h_flex().px(18).h(48).flex_none().gap(10).items_center().border_b(1).border_color(t.border)
-        .child(div().flex_1().text_size(14).font_semibold().text_color(t.foreground).child("Accounts"))
-        .child(div().id("am-refresh").text_size(14).text_color(t.dim).cursor_pointer()
-          .hover(s => s.text_color(t.foreground)).tooltip("Read again")
-          .on_click((_e, cx) => this.refresh(cx)).child("↻"))
-        .when(Boolean(p.overlay), el => el.child(div().id("am-close").text_color(t.dim).cursor_pointer()
-          .hover(s => s.text_color(t.foreground)).tooltip("Close")
+      .child(h_flex().pl(settings ? 10 : 18).pr(12).h(48).flex_none().gap(4).items_center().border_b(1).border_color(t.border)
+        .when(settings, el => el.child(icon("am-back", "chevron-left", "Accounts", (_e, cx) => { this.page = "accounts"; cx.notify(); })))
+        .child(div().flex_1().pl(settings ? 4 : 0).text_size(14).font_semibold().text_color(t.foreground).child(settings ? "Settings" : "Accounts"))
+        .when(!settings, el => el
+          .child(div().id("am-refresh").size(26).flex().items_center().justify_center().rounded(6).text_size(14).text_color(t.dim).cursor_pointer()
+            .hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip("Read again")
+            .on_click((_e, cx) => this.refresh(cx)).child("↻"))
+          .child(icon("am-settings", "settings", "Settings", (_e, cx) => { this.page = "settings"; cx.notify(); })))
+        .when(Boolean(p.overlay), el => el.child(div().id("am-close").size(26).flex().items_center().justify_center().rounded(6).text_color(t.dim).cursor_pointer()
+          .hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip("Close")
           .on_click(() => closeOverlay(p.overlay)).child(svg("mods/pane/close.svg").size(13)))))
       .when(Boolean(this.error), el => el.child(div().px(18).pt(10).text_size(12).text_color(t.blocked).child(this.error)))
       .when(this.accounts === null && !this.error, el => el.child(div().px(18).pt(10).text_size(12).text_color(t.dim).child("Reading accounts…")))
-      .child(v_flex().id("am-list").flex_1().min_h(0).px(8).pb(10).overflow_y_scrollbar().children(PROVIDERS.flatMap(group)));
+      .when(settings, el => el.child(this.settingsView(t, list)))
+      .when(!settings, el => el.child(v_flex().id("am-list").flex_1().min_h(0).px(8).pb(10).overflow_y_scrollbar().children(PROVIDERS.flatMap(group))));
   }
+
+  // agent-meter's own settings, as its terminal UI lists them: those every agent
+  // shares, then each provider that has accounts. Every change is `config set`.
+  settingsView(t, list) {
+    const c = this.config ?? {};
+    const w = c.watch ?? {};
+
+    const button = (id, name, enabled, onClick) => div().id(id).w(28).h_full().flex().items_center().justify_center()
+      .text_color(enabled ? t.muted : t.border)
+      .when(enabled, el => el.cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(onClick))
+      .child(svg(`mods/agent-meter/${name}.svg`).size(12));
+    // A value stepped up and down within its range.
+    const stepper = (id, value, cur, step, lo, hi, key, dim = false) => h_flex().flex_none().h(28).rounded(7).border(1).border_color(t.border).overflow_hidden()
+      .child(button(`${id}-down`, "minus", cur > lo, (_e, cx) => this.set(cx, key, clamp(cur - step, lo, hi))))
+      .child(div().w(132).h_full().flex().items_center().justify_center().border_l(1).border_r(1).border_color(t.border)
+        .text_size(12.5).text_color(dim ? t.muted : t.foreground).child(value))
+      .child(button(`${id}-up`, "plus", cur < hi, (_e, cx) => this.set(cx, key, clamp(cur + step, lo, hi))));
+    const toggle = (id, on, key, value) => div().id(id).flex_none().relative().w(34).h(20).rounded_full().cursor_pointer()
+      .bg(on ? t.accent : t.border).on_click((_e, cx) => this.set(cx, key, value ?? !on))
+      .child(div().absolute().top(3).left(on ? 17 : 3).size(14).rounded_full().bg(on ? "#ffffff" : t.muted));
+    const choice = (id, options, current, key) => h_flex().flex_none().h(28).p(2).gap(2).rounded(7).border(1).border_color(t.border)
+      .children(options.map(([label, v], i) => div().id(`${id}-${i}`).h_full().px(10).flex().items_center().rounded(5).text_size(12.5).cursor_pointer()
+        .when(v === current, el => el.bg(t.selected).text_color(t.foreground))
+        .when(v !== current, el => el.text_color(t.muted).hover(s => s.bg(t.hover)))
+        .on_click((_e, cx) => this.set(cx, key, v)).child(label)));
+    const row = (id, label, help, control, extra) => h_flex().id(id).px(10).py(9).gap(18).items_center().flex_none()
+      .child(v_flex().flex_1().min_w(0).gap(3)
+        .child(h_flex().gap(8).items_center().child(div().text_color(t.foreground).child(label)).when(Boolean(extra), el => el.child(extra)))
+        .child(div().text_size(11.5).text_color(t.dim).child(help)))
+      .child(control);
+    const heading = (id, text, icon) => h_flex().id(id).px(10).pt(14).pb(2).flex_none().gap(7).items_center().text_size(11.5).font_medium().text_color(t.muted)
+      .when(Boolean(icon), el => el.child(image(icon).w(14).h(14))).child(text);
+
+    const threshold = Math.round(w.threshold ?? 90);
+    const margin = Math.round(w.margin ?? 5);
+    const cooldown = w["cooldown-secs"] ?? 120;
+    const poll = w["poll-secs"] ?? 60;
+    const waits = w["wait-for-reset"] ?? true;
+
+    const shared = [
+      heading("s-h", "Every agent"),
+      row("s-threshold", "Switch at", "An account is left once any limit it is judged on is this full, for one that is not.",
+        stepper("st", `${threshold}% used`, threshold, 1, 1, 100, "watch.threshold")),
+      row("s-margin", "Once all are past it, switch for", "With every account past the mark there is only a least bad one. It is taken only if it has this much more left, so two alike are not traded back and forth.",
+        stepper("sm", `${margin} points more room`, margin, 1, 0, 50, "watch.margin")),
+      row("s-cooldown", "Between switches, wait", "The shortest time between two automatic switches of one agent.",
+        stepper("sc", cooldown ? `at least ${minutes(cooldown)}` : "no time at all", Math.round(cooldown / 60) * 60, 60, 0, 3600, "watch.cooldown-secs")),
+      row("s-poll", "Check every", "How often usage is looked at. No provider is asked more often than it allows, however short this is.",
+        stepper("sp", minutes(poll), Math.round(poll / 60) * 60, 60, 60, 3600, "watch.poll-secs")),
+      row("s-wait", "With every account spent", "What the watcher does when no account has anything left: wait for the first to come back, or stop.",
+        choice("sw", [["Wait for a reset", true], ["Stop", false]], waits, "watch.wait-for-reset")),
+    ];
+
+    const perProvider = PROVIDERS.flatMap(prov => {
+      const mine = list.filter(a => a.provider === prov.key);
+      if (!mine.length) return [];
+      const own = c.provider?.[prov.key] ?? {};
+      const on = own.enabled ?? true;
+      const mark = Math.round(own.threshold ?? threshold);
+      const ignored = own["ignored-models"] ?? [];
+      // A model is listed where some account has a limit of its own for it, or the settings leave it out.
+      const models = [];
+      for (const m of [...mine.flatMap(a => (a.usage?.windows ?? []).map(x => x.scope).filter(Boolean)), ...ignored]) {
+        if (!models.some(k => k.toLowerCase() === m.toLowerCase())) models.push(m);
+      }
+      models.sort((x, y) => x.toLowerCase().localeCompare(y.toLowerCase()));
+      const counts = (m) => !ignored.some(k => k.toLowerCase() === m.toLowerCase());
+      const pill = (text, tip, onClick) => div().id(`${prov.key}-pill`).px(6).h(17).rounded(5).border(1).border_color(t.border).flex().items_center()
+        .text_size(10.5).text_color(t.dim).tooltip(tip)
+        .when(Boolean(onClick), el => el.cursor_pointer().hover(s => s.text_color(t.foreground)).on_click(onClick)).child(text);
+      return [
+        heading(`${prov.key}-h`, prov.name, prov.icon),
+        row(`${prov.key}-on`, "Switch automatically", `Whether ${prov.name} is moved to another account on its own as a limit nears.`,
+          toggle(`${prov.key}-t`, on, `provider.${prov.key}.enabled`)),
+        row(`${prov.key}-mark`, "Switch at", `A mark for ${prov.name} alone, where it should differ from the one every agent shares.`,
+          stepper(`${prov.key}-st`, `${mark}% used`, mark, 1, 1, 100, `provider.${prov.key}.threshold`, own.threshold == null),
+          own.threshold == null
+            ? pill("as every agent", `Every agent's mark, ${threshold}%`)
+            : pill(`every agent's is ${threshold}%`, "Use every agent's mark again", (_e, cx) => this.set(cx, `provider.${prov.key}.threshold`, ""))),
+        ...models.map(m => row(`${prov.key}-m-${m}`, `Count the ${m} limit`,
+          counts(m)
+            ? `An account near its ${m} limit is left, and one that has spent it is not switched to.`
+            : `Left out, for when ${m} is a model you never work in. Counted, an account near its ${m} limit is left.`,
+          toggle(`${prov.key}-mt-${m}`, counts(m), `provider.${prov.key}.ignored-models`,
+            (counts(m) ? [...ignored, m] : ignored.filter(k => k.toLowerCase() !== m.toLowerCase())).join(",")))),
+      ];
+    });
+
+    return v_flex().id("am-settings").flex_1().min_h(0).px(8).pb(12).overflow_y_scrollbar().track_scroll(this.settingsScroll)
+      .when(this.config === null, el => el.child(div().px(10).pt(12).text_size(12).text_color(t.dim).child("Reading settings…")))
+      .when(this.config !== null, el => el.children([...shared, ...perProvider]));
+  }
+
 
   openMenu(a, at) {
     if (!a) return;

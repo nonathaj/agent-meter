@@ -462,7 +462,7 @@ mod tests {
         )
         .unwrap();
 
-        install(home.path(), false, false).unwrap();
+        assert_eq!(install(home.path(), false, false).unwrap(), ExitCode::SUCCESS);
         let folder = home.path().join("mods").join(MOD);
         for (name, _) in FILES {
             assert!(folder.join(name).is_file(), "{name} is written");
@@ -473,7 +473,7 @@ mod tests {
             "a personal layout is changed in place"
         );
 
-        uninstall(home.path()).unwrap();
+        assert_eq!(uninstall(home.path()).unwrap(), ExitCode::SUCCESS);
         assert!(!folder.exists());
         assert_eq!(read_layout(&layouts.join("mine.json")).unwrap(), layout());
     }

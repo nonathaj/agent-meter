@@ -1,1 +1,1 @@
-{ "place": "none", "title": "Accounts", "overlay": { "kind": "window", "width": 380, "height": 452 } }
+{ "place": "none", "title": "Accounts", "overlay": { "kind": "dialog", "width": 480, "height": 596 } }

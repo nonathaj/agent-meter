@@ -1,0 +1,12 @@
+{
+  "id": "sidebar-bottom",
+  "type": "column",
+  "size": { "px": 133 },
+  "resizable": false,
+  "children": [
+    { "id": "sidebar-footer", "type": "block", "size": { "px": 69 },
+      "content": { "mod": "workspace-chrome", "props": { "footer": true } } },
+    { "id": "accounts", "type": "block", "size": { "px": 64 },
+      "content": { "mod": "agent-meter", "props": { "compact": true } } }
+  ]
+}

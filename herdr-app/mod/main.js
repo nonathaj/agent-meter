@@ -1,19 +1,34 @@
-// agent-meter for the Herdr app: every subscription account, how much of it is
-// used, which of your agents run on it, and the switches the watcher makes.
+// agent-meter for the Herdr app.
+//
+// In the sidebar's footer: the account each provider is on now, and how full
+// it is. Clicking it opens every account, with what agent-meter can do with
+// each. A switch the watcher makes is announced.
 //
 // Prototype. Everything comes from `agent-meter list --json`; actions run the
 // agent-meter CLI. Nothing here polls a provider.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, exec, run, theme, props, openOverlay, closeOverlay, notify, watchFolder, checking } from "herdr";
+import { agents, exec, run, theme, props, layout, openOverlay, closeOverlay, notify, watchFolder, checking } from "herdr";
 
 const PROVIDERS = [
   { key: "claude", name: "Claude Code", app: ["claude-code", "claude"], icon: "icons/claude.svg" },
   { key: "codex", name: "Codex", app: ["codex"], icon: "icons/codex.svg" },
 ];
-
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// The footer's own rows: Settings and Add machine are 28 px with 8 px under them.
+const ROW = 28;
+const FOOTER = 69;
+
+function find(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = find(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
 function span(ms) {
   const m = Math.max(1, Math.round(ms / 60000));
@@ -22,22 +37,22 @@ function span(ms) {
   if (h < 24) return `${h}h${String(m % 60).padStart(2, "0")}m`;
   return `${Math.floor(h / 24)}d${h % 24}h`;
 }
+const day = (iso) => { const d = new Date(iso); return `${MONTHS[d.getMonth()]} ${d.getDate()}`; };
 
 const used = (a) => Math.round(a.usage?.usedPercent ?? 0);
 // The window that decides how full the account is: the fullest one it is judged on.
 const top = (a) => [...(a.usage?.windows ?? [])].filter(w => w.counted).sort((x, y) => y.usedPercent - x.usedPercent)[0];
 const level = (pct, threshold) => (pct >= threshold ? "hot" : pct >= threshold - 20 ? "warn" : "ok");
+const provider = (key) => PROVIDERS.find(p => p.key === key);
 
 export default class AgentMeter extends View {
   init(_props, cx) {
     this.accounts = null;
     this.error = null;
     this.threshold = 90;
-    this.hovered = null;
-    this.busy = null;
     this.choice = 0;
-    if (checking()) return;
-    if (props()?.dialog) return;
+    const p = props() ?? {};
+    if (checking() || p.dialog) return;
     this.refresh(cx);
     cx.timer.every(30000, (cx) => this.refresh(cx));
     // A switch or a fresh reading lands in agent-meter's own files: follow them.
@@ -56,14 +71,16 @@ export default class AgentMeter extends View {
       const r = await exec("agent-meter", ["list", "--json"]);
       if (r.code !== 0) { this.error = r.stderr.trim() || "agent-meter list failed"; cx.notify(); return; }
       const next = JSON.parse(r.stdout);
-      this.announce(this.accounts, next);
+      // The footer copy is always there, so it is the one that announces.
+      if (props()?.compact) this.announce(this.accounts, next);
       this.accounts = next;
       this.error = null;
+      if (props()?.compact) this.fit();
       cx.notify();
     });
   }
 
-  // A switch the watcher made since the last reading becomes a notice.
+  // A switch made since the last reading becomes a notice.
   announce(before, after) {
     if (!before) return;
     for (const p of PROVIDERS) {
@@ -80,61 +97,96 @@ export default class AgentMeter extends View {
     }
   }
 
-  render(cx) {
-    const t = theme();
-    const p = props() ?? {};
-    if (p.dialog === "spend") return this.spendDialog(t, p);
-    if (p.dialog === "menu") return this.menu(t, p);
-    return this.panel(t);
+  // One footer row per provider with an account in use: size the block to them.
+  fit() {
+    const rows = this.inUse().length;
+    const px = rows ? rows * ROW + 8 : 0;
+    if (find(layout(), "accounts")?.size?.px === px) return;
+    run("layout.resize", { id: "accounts", px });
+    run("layout.resize", { id: "sidebar-bottom", px: FOOTER + px });
+  }
+
+  inUse() {
+    const list = this.accounts ?? [];
+    return PROVIDERS.map(p => list.find(a => a.provider === p.key && a.active)).filter(Boolean);
   }
 
   colors(t) {
     return { ok: t.ansi2 ?? t.idle, warn: t.ansi3 ?? t.blocked, hot: t.ansi1 ?? t.blocked };
   }
 
-  panel(t) {
+  render() {
+    const t = theme();
+    const p = props() ?? {};
+    if (p.dialog === "spend") return this.spendDialog(t, p);
+    if (p.dialog === "menu") return this.menu(t, p);
+    if (p.compact) return this.footer(t);
+    return this.all(t, p);
+  }
+
+  // The footer: the account each provider is on now.
+  footer(t) {
+    const c = this.colors(t);
+    const collapsed = narrow();
+    const open = () => run("mod.open", { name: "agent-meter" });
+    return v_flex().size_full().bg(t.chrome).px(8).pb(8).text_size(13)
+      .when(collapsed, el => el.px(0).items_center())
+      .children(this.inUse().map(a => {
+        const pct = used(a);
+        const lv = level(pct, this.threshold);
+        const prov = provider(a.provider);
+        const tip = `${prov.name}: ${a.id}, ${pct}% used. All accounts…`;
+        if (collapsed) {
+          return div().id(`am-f-${a.id}`).relative().w(32).h(ROW).flex().items_center().justify_center().rounded(8)
+            .hover(s => s.bg(t.hover)).cursor_pointer().tooltip(tip).on_click(open)
+            .child(image(prov.icon).w(14).h(14))
+            .child(div().absolute().top(5).right(6).size(6).rounded_full().bg(c[lv]));
+        }
+        return h_flex().id(`am-f-${a.id}`).h(ROW).px(8).gap(9).items_center().rounded(8)
+          .text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground)).cursor_pointer()
+          .tooltip(tip).on_click(open)
+          .child(image(prov.icon).w(14).h(14).flex_none())
+          .child(div().flex_1().min_w(0).truncate().child(a.id))
+          .child(div().flex_none().w(40).h(3).rounded(2).bg(t.border)
+            .child(div().h_full().w(`${Math.min(100, Math.max(4, pct))}%`).rounded(2).bg(c[lv])))
+          .child(div().flex_none().w(32).text_right().text_size(12).text_color(c[lv]).child(`${pct}%`));
+      }));
+  }
+
+  // The modal: every account.
+  all(t, p) {
     const list = this.accounts ?? [];
     const live = agents();
     const c = this.colors(t);
     const now = Date.now();
-
-    const agentsOn = (prov, account) =>
-      account.active ? live.filter(a => prov.app.includes(a.app ?? "")) : [];
 
     const row = (prov, a) => {
       const pct = used(a);
       const lv = level(pct, this.threshold);
       const w = top(a);
       const resets = a.usage?.limitResets?.available ?? 0;
-      const on = agentsOn(prov, a);
-      const hovered = this.hovered === a.id;
-      const quiet = !a.active && !hovered;
+      const on = a.active ? live.filter(x => prov.app.includes(x.app ?? "")) : [];
       const detail = [
         w?.resetsAt ? `${w.label} limit resets in ${span(Date.parse(w.resetsAt) - now)}` : null,
         resets ? `${resets} limit reset${resets === 1 ? "" : "s"}` : null,
-        a.disabled ? (a.disabled.until ? `left out for ${span(Date.parse(a.disabled.until) - now)}` : "left out") : null,
+        a.disabled ? (a.disabled.until ? `left out for ${span(Date.parse(a.disabled.until) - now)}` : "left out of switching") : null,
       ].filter(Boolean).join(" · ");
-      return v_flex()
-        .id(`am-${a.id}`)
-        .px(8).py(5).gap(4).flex_none().rounded(8)
-        .when(!a.active && Boolean(detail), el => el.tooltip(detail))
+      return v_flex().id(`am-${a.id}`).px(10).py(7).gap(5).flex_none().rounded(8)
         .when(a.active, el => el.bg(t.selected))
-        .cursor_pointer()
-        .hover(s => s.bg(t.hover))
-        .on_hover((inside, cx) => { this.hovered = inside ? a.id : (this.hovered === a.id ? null : this.hovered); cx.notify(); })
-        .on_click(() => openOverlay({ mod: "agent-meter", kind: "popup", at: "pointer", width: 250, height: 196, props: { dialog: "menu", id: a.id, account: a } }))
+        .cursor_pointer().hover(s => s.bg(t.hover))
+        .on_click(() => this.openMenu(a, "pointer"))
         .child(h_flex().gap(8).items_center()
-          .child(div().min_w(0).truncate().text_color(quiet ? t.muted : t.foreground).child(a.label ?? a.id))
+          .child(div().flex_none().text_color(a.active ? t.foreground : t.muted).child(a.id))
+          .child(div().min_w(0).truncate().text_size(12).text_color(t.dim).child(a.email ?? ""))
           .when(a.active, el => el.child(div().flex_none().px(6).h(17).rounded(5).bg(t.accent + "2e").text_size(10.5).font_semibold().text_color(t.accent).flex().items_center().child("In use")))
           .child(div().flex_1())
           .when(on.length > 0, el => el.child(h_flex().flex_none().gap(3).items_center().text_size(11).text_color(t.dim)
             .tooltip(on.map(x => `${x.space_name}${x.tab_name ? ` · ${x.tab_name}` : ""}`).join("\n"))
-            .child(image(prov.icon).w(12).h(12))
-            .child(String(on.length))))
-          .child(div().flex_none().w(34).text_right().text_size(12).font_medium().text_color(c[lv]).child(`${pct}%`)))
-        .child(div().h(3).w_full().rounded(2).bg(t.border)
+            .child(image(prov.icon).w(12).h(12)).child(`${on.length} agent${on.length === 1 ? "" : "s"}`)))
+          .child(div().flex_none().w(38).text_right().text_size(12.5).font_medium().text_color(c[lv]).child(`${pct}%`)))
+        .child(div().h(4).w_full().rounded(2).bg(t.border)
           .child(div().h_full().w(`${Math.min(100, Math.max(2, pct))}%`).rounded(2).bg(c[lv])))
-        .when(a.active && Boolean(detail), el => el.child(div().truncate().text_size(11).text_color(t.dim).child(detail)));
+        .when(Boolean(detail), el => el.child(div().truncate().text_size(11.5).text_color(t.dim).child(detail)));
     };
 
     const group = (prov) => {
@@ -142,31 +194,35 @@ export default class AgentMeter extends View {
       if (!mine.length) return [];
       const room = mine.filter(a => used(a) < this.threshold && !a.disabled).length;
       return [
-        h_flex().id(`am-h-${prov.key}`).px(8).pt(10).h(32).flex_none().gap(6).items_center().text_size(11).font_medium()
-          .child(image(prov.icon).w(13).h(13))
-          .child(div().text_color(t.dim).child(prov.name))
+        h_flex().id(`am-h-${prov.key}`).px(10).pt(12).pb(4).flex_none().gap(7).items_center().text_size(11.5).font_medium()
+          .child(image(prov.icon).w(14).h(14))
+          .child(div().text_color(t.muted).child(prov.name))
           .child(div().flex_1())
           .child(div().text_color(t.dim).child(`${room} of ${mine.length} below ${this.threshold}%`)),
         ...mine.map(a => row(prov, a)),
       ];
     };
 
-    return v_flex().size_full().min_h(0).bg(t.chrome).border_t(1).border_color(t.border).text_size(13)
-      .child(h_flex().px(16).h(41).pt(14).pb(5).flex_none().items_center()
-        .child(div().flex_1().text_size(11.5).font_medium().text_color(t.dim).child("Accounts"))
-        .child(div().id("am-refresh").text_size(11).text_color(t.dim).cursor_pointer()
+    return v_flex().size_full().min_h(0).bg(t.popover).text_size(13)
+      .child(h_flex().px(18).h(48).flex_none().gap(10).items_center().border_b(1).border_color(t.border)
+        .child(div().flex_1().text_size(14).font_semibold().text_color(t.foreground).child("Accounts"))
+        .child(div().id("am-refresh").text_size(14).text_color(t.dim).cursor_pointer()
           .hover(s => s.text_color(t.foreground)).tooltip("Read again")
-          .on_click((_e, cx) => this.refresh(cx)).child(div().text_size(14).child("↻")))
-        // Opened as a window (a key, a toast's click): it closes itself.
-        .when(Boolean(props()?.overlay), el => el.child(div().id("am-close").ml(10).text_color(t.dim).cursor_pointer()
+          .on_click((_e, cx) => this.refresh(cx)).child("↻"))
+        .when(Boolean(p.overlay), el => el.child(div().id("am-close").text_color(t.dim).cursor_pointer()
           .hover(s => s.text_color(t.foreground)).tooltip("Close")
-          .on_click(() => closeOverlay(props().overlay)).child(svg("mods/pane/close.svg").size(12)))))
-      .when(Boolean(this.error), el => el.child(div().px(16).text_size(12).text_color(t.blocked).child(this.error)))
-      .when(this.accounts === null && !this.error, el => el.child(div().px(16).text_size(12).text_color(t.dim).child("Reading accounts…")))
-      .child(v_flex().id("am-list").flex_1().min_h(0).px(8).pb(8).overflow_y_scrollbar().children(PROVIDERS.flatMap(group)));
+          .on_click(() => closeOverlay(p.overlay)).child(svg("mods/pane/close.svg").size(13)))))
+      .when(Boolean(this.error), el => el.child(div().px(18).pt(10).text_size(12).text_color(t.blocked).child(this.error)))
+      .when(this.accounts === null && !this.error, el => el.child(div().px(18).pt(10).text_size(12).text_color(t.dim).child("Reading accounts…")))
+      .child(v_flex().id("am-list").flex_1().min_h(0).px(8).pb(10).overflow_y_scrollbar().children(PROVIDERS.flatMap(group)));
   }
 
-  // The account menu: what can be done with one account.
+  openMenu(a, at) {
+    if (!a) return;
+    openOverlay({ mod: "agent-meter", kind: "popup", at, width: 270, height: 176, props: { dialog: "menu", id: a.id, account: a } });
+  }
+
+  // What can be done with one account.
   menu(t, p) {
     const a = p.account;
     const item = (id, text, onClick, dim = false) => h_flex().id(id).h(30).px(10).rounded(6).items_center().cursor_pointer()
@@ -205,7 +261,7 @@ export default class AgentMeter extends View {
       .on_click(onClick).child(text);
     return v_flex().size_full().p(20).gap(12).bg(t.popover).text_size(13)
       .child(h_flex().gap(10).items_center()
-        .child(image(PROVIDERS.find(x => x.key === a?.provider)?.icon ?? "icons/agent.svg").w(18).h(18))
+        .child(image(provider(a?.provider)?.icon ?? "icons/agent.svg").w(18).h(18))
         .child(div().text_size(15).font_semibold().text_color(t.foreground).child(`Spend a limit reset on ${p.id}?`)))
       .child(div().text_color(t.dim).child(a?.email ?? ""))
       .child(v_flex().gap(2).children(grants.map((x, i) => h_flex().id(`g-${i}`).h(28).px(8).gap(8).rounded(6).items_center().cursor_pointer()
@@ -215,7 +271,7 @@ export default class AgentMeter extends View {
         .child(div().min_w(0).truncate().text_color(x === g ? t.foreground : t.muted).child(x.title)))))
       .when(Boolean(g), el => el.child(v_flex().gap(3).px(8).text_size(12.5).text_color(t.muted)
         .child(`Refills ${refills.join(" and ") || "every limit"}`)
-        .when(Boolean(g.expiresAt), el => el.child(`Expires in ${span(Date.parse(g.expiresAt) - now)} (${MONTHS[new Date(g.expiresAt).getMonth()]} ${new Date(g.expiresAt).getDate()})`))
+        .when(Boolean(g.expiresAt), el => el.child(`Expires in ${span(Date.parse(g.expiresAt) - now)} (${day(g.expiresAt)})`))
         .when(g.usableNow === false, el => el.child(div().text_color(t.blocked).child(g.onlyAtLimit ? "Anthropic says it is usable only once a limit is reached" : "Anthropic says it is not usable right now")))))
       .child(div().flex_1())
       .child(h_flex().gap(8).items_center()
@@ -227,7 +283,7 @@ export default class AgentMeter extends View {
             title: r.code === 0 ? `Spent a limit reset on ${p.id}` : `No reset was spent on ${p.id}`,
             body: (r.stdout || r.stderr).trim().split("\n").at(-1),
             level: r.code === 0 ? "success" : "warning",
-            icon: "icons/claude.svg",
+            icon: provider(a?.provider)?.icon,
           }));
         })));
   }

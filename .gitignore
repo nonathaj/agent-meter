@@ -2,3 +2,7 @@
 
 # Crash dumps from shells run in the working directory.
 *.stackdump
+
+# Written by `herdr-app check` next to a mod.
+integrations/herdr-app/*/gpui-kit.d.ts
+integrations/herdr-app/*/jsconfig.json

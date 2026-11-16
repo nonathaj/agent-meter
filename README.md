@@ -187,12 +187,14 @@ next machine that still has it. Remove it on each.
 | `agent-meter remote add\|list\|remove` | The other machines to sync with. |
 | `agent-meter use <account>` | Signs the agent CLI in to a stored account. |
 | `agent-meter remove <account>` | Forgets an account. The account itself is untouched. |
-| `agent-meter spend-reset <account>` | Spends one of an account's [limit resets](#limit-resets), after saying what it refills and asking. `--grant <id>` picks which; `--yes` skips the question. |
+| `agent-meter spend-reset <account>` | Spends one of an account's [limit resets](#limit-resets), after saying what it refills and asking. `--grant <id>` picks which; `--yes` skips the question; `--dry-run` says what each would do and spends none; `--json` with either. |
 | `agent-meter disable <account>` | Leaves an account out of automatic switching until `enable`, or `--for 5h` (`90m`, `2d`, `1w`). See [Accounts to leave alone](#accounts-to-leave-alone). |
 | `agent-meter enable <account>` | Takes a disabled account into automatic switching again. |
 | `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
 | `agent-meter tui` | The same operations in a full-screen interface. |
-| `agent-meter config` | Reads and changes settings. |
+| `agent-meter config` | Reads and changes settings: `show [--json]`, `set`, `unset`, `path`. |
+| `agent-meter history` | The latest switches between accounts, who made them and why. `-n`, `--json`. |
+| `agent-meter herdr install` | Puts agent-meter in the [Herdr desktop app](#in-the-herdr-app). `herdr uninstall` takes it out. |
 | `agent-meter where` | Prints the data directory. |
 
 ### The terminal UI
@@ -308,8 +310,23 @@ same login stored a second time, and is `null` otherwise; `list` and the
 terminal UI point such a copy out, and `agent-meter remove` forgets it.
 `disabled` is `null` for an account automatic switching may take, and
 otherwise says `until` when it is left out, `null` for until it is enabled
-again. A disabled account's `role` is `unusable`, except for the one in use. New
-fields are only ever added at the end of an object.
+again. A disabled account's `role` is `unusable`, except for the one in use.
+`threshold` is the mark the account is left at: its provider's own, else the
+one every agent shares. New fields are only ever added at the end of an object.
+
+`agent-meter history --json` lists the latest switches, oldest first, however
+they were made: each has `at`, `provider`, `from` (absent where no stored
+account was in use), `to`, `by` (`watch` or `hand`), and for the watcher's,
+`why` (`threshold`, `least_used`, `exhausted`, `signed_out`,
+`week_ends_sooner`) and, where it applies, how much of `from` was `used`. The
+history lives in the data directory, so watching that folder sees every switch.
+
+`agent-meter config show --json` lists the settings as the terminal UI's
+panel does, each with its `key`, `label`, `explanation`, `value` in words and as
+`config set` takes it (`set`), and what each change would set it to: `down`
+and `up` for a number (`null` at its bound), `toggle` for an on/off `switch`,
+and `choices` for a `choice`. A provider's own threshold says whether it has
+one in `own`.
 
 A successful command can contain failed account polls: inspect `error`,
 `needsLogin` and `usage.observedAt`. Missing or old usage is unknown, not zero
@@ -492,6 +509,7 @@ rather than from the copies in the local credential file, which drift.
 agent-meter config show
 agent-meter config set watch.threshold 85
 agent-meter config set provider.codex.enabled false
+agent-meter config unset provider.codex.threshold   # back to the shared one
 ```
 
 | Setting | Default | Meaning |
@@ -538,6 +556,38 @@ A reading's age is only ever shown when it is a surprise — older than the
 interval that should already have replaced it, which usually means no watcher is
 running. Saying "just now" on every row would spend a column on the ordinary
 case.
+
+## In the Herdr app
+
+```sh
+agent-meter herdr install
+```
+
+puts agent-meter in the [Herdr](https://herdr.dev) desktop app:
+
+- **Under the sidebar's footer,** below Settings and Add machine: the account
+  each agent is on now, with how full its fullest limit is. Green, yellow under
+  the threshold, red past it. On the narrowed sidebar, the agent's icon with a
+  coloured dot.
+- **Click it** for every account, in switching order, with a bar for each of
+  its limits and when it resets. Click an account to use it, spend a limit
+  reset, or leave it out of switching for 5 hours or until taken back. The
+  gear opens the same settings as the terminal UI's panel.
+- **A switch is announced** with a notice saying where it went and why,
+  whoever made it.
+
+The mod comes from this binary and runs it, so the two always match: run the
+install again after `agent-meter update`. Everything it shows comes from
+`list --json`, `history --json` and `config show --json`, and every change goes
+through the commands above. It never polls a provider itself; leave
+`agent-meter watch` running for fresh readings and automatic switching.
+
+Herdr's own layouts can't be changed, so where the layout shown is one of
+Herdr's, the footer rows need a personal copy of it, which no longer receives
+Herdr's updates. The install asks before making one; `--no-footer` installs the
+mod alone. `agent-meter herdr uninstall` takes the rows out of every layout and
+removes the mod. The mod's source is in
+[`integrations/herdr-app/agent-meter`](integrations/herdr-app/agent-meter).
 
 ## Where things are kept
 

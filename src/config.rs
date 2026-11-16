@@ -467,6 +467,45 @@ impl Config {
         }
         self.validate()
     }
+
+    /// Takes a setting back to having no value of its own, as `agent-meter
+    /// config unset` does: a watch setting to its default, a provider's to
+    /// the one every agent shares.
+    pub fn unset(&mut self, key: &str) -> Result<()> {
+        let defaults = WatchConfig::default();
+        match key.split('.').collect::<Vec<_>>().as_slice() {
+            ["watch", "threshold"] => self.watch.threshold = defaults.threshold,
+            ["watch", "poll-secs"] => self.watch.poll_secs = defaults.poll_secs,
+            ["watch", "margin"] => self.watch.margin = defaults.margin,
+            ["watch", "cooldown-secs"] => self.watch.cooldown_secs = defaults.cooldown_secs,
+            ["watch", "wait-for-reset"] => self.watch.wait_for_reset = defaults.wait_for_reset,
+            ["provider", name, field] => {
+                let provider =
+                    ProviderKind::parse(name).with_context(|| format!("unknown provider {name:?}"))?;
+                let entry = self.provider.entry(provider);
+                match *field {
+                    "threshold" => entry.threshold = None,
+                    "enabled" => entry.enabled = None,
+                    "ignored-models" => entry.ignored_models.clear(),
+                    _ => bail!("unknown setting {key:?}"),
+                }
+                if *entry == ProviderConfig::default() {
+                    match provider {
+                        ProviderKind::Claude => self.provider.claude = None,
+                        ProviderKind::Codex => self.provider.codex = None,
+                    }
+                }
+            }
+            ["account", id, "disabled" | "disabled-until"] => self.enable(id),
+            _ => bail!(
+                "{key:?} has nothing to unset. Keys that do: watch.threshold, watch.poll-secs, \
+                 watch.margin, watch.cooldown-secs, watch.wait-for-reset, \
+                 provider.<claude|codex>.threshold, provider.<claude|codex>.enabled, \
+                 provider.<claude|codex>.ignored-models, account.<id>.<disabled|disabled-until>"
+            ),
+        }
+        self.validate()
+    }
 }
 
 fn check_threshold(value: f64) -> Result<()> {
@@ -537,6 +576,33 @@ mod tests {
                 config.clone().set(key, value).is_err(),
                 "{key}={value} should be rejected"
             );
+        }
+    }
+
+    /// Unsetting a provider's own value puts it back on the shared one, and
+    /// a provider left with nothing of its own is not written out at all.
+    #[test]
+    fn unset_takes_a_setting_back_to_the_shared_one() {
+        let mut config = Config::default();
+        config.set("watch.threshold", "80").unwrap();
+        config.set("provider.codex.threshold", "95").unwrap();
+        config.set("provider.claude.threshold", "70").unwrap();
+        config.set("provider.claude.enabled", "true").unwrap();
+
+        config.unset("provider.codex.threshold").unwrap();
+        assert_eq!(config.own_threshold(ProviderKind::Codex), None);
+        assert_eq!(config.threshold_for(ProviderKind::Codex), 80.0);
+        assert!(config.provider.codex.is_none(), "nothing of its own is left");
+
+        config.unset("provider.claude.threshold").unwrap();
+        assert_eq!(config.threshold_for(ProviderKind::Claude), 80.0);
+        assert!(config.is_switching_on(ProviderKind::Claude), "the rest stays");
+
+        config.unset("watch.threshold").unwrap();
+        assert_eq!(config.watch.threshold, DEFAULT_THRESHOLD);
+
+        for key in ["watch.nonsense", "provider.gemini.threshold", "remote.box.ssh"] {
+            assert!(config.clone().unset(key).is_err(), "{key} has nothing to unset");
         }
     }
 

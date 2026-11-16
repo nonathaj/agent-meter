@@ -15,7 +15,7 @@ use crate::http;
 use crate::policy::{self, Candidate, Decision, Disruption, Reason, Role, Rules};
 use crate::provider::{self, Provider, Spent};
 use crate::remote::Report;
-use crate::store::{Store, SwitchRecord, UsageCache};
+use crate::store::{Store, Switch, SwitchRecord, SwitchWhy, SwitchedBy, UsageCache};
 use crate::usage::{ResetGrant, Resets, Usage};
 use sha2::{Digest, Sha256};
 
@@ -838,10 +838,27 @@ impl Engine {
         self.store.put_state(&state)
     }
 
-    /// Signs the agent CLI in to `id`.
+    /// Signs the agent CLI in to `id`, as a person asked.
     pub fn switch_to(&self, id: &str) -> Result<SwitchOutcome> {
         let _lock = self.store.lock()?;
-        self.switch_locked(id)
+        let outcome = self.switch_locked(id)?;
+        if outcome.from.as_deref() != Some(id) {
+            let provider = self.store.account(id)?.map(|account| account.provider);
+            if let Some(provider) = provider {
+                let mut state = self.store.state()?;
+                state.push_switch(Switch {
+                    at: Timestamp::now(),
+                    provider,
+                    from: outcome.from.clone(),
+                    to: outcome.to.clone(),
+                    by: SwitchedBy::Hand,
+                    why: None,
+                    used: None,
+                });
+                self.store.put_state(&state)?;
+            }
+        }
+        Ok(outcome)
     }
 
     fn switch_locked(&self, id: &str) -> Result<SwitchOutcome> {
@@ -1327,7 +1344,7 @@ impl Engine {
                     // switched back to, so there is nothing to flap between,
                     // and every minute waited is a minute the agent is down.
                     _ if matches!(reason, Reason::ActiveSignedOut { .. }) => {
-                        (Some(self.switch_and_record(kind, to, now)?), None)
+                        (Some(self.switch_and_record(kind, to, reason, now)?), None)
                     }
                     Some(remaining) => (
                         None,
@@ -1336,7 +1353,7 @@ impl Engine {
                             crate::timefmt::duration(remaining.as_secs())
                         )),
                     ),
-                    None => (Some(self.switch_and_record(kind, to, now)?), None),
+                    None => (Some(self.switch_and_record(kind, to, reason, now)?), None),
                 },
                 _ => (None, None),
             };
@@ -1350,9 +1367,17 @@ impl Engine {
         Ok(outcomes)
     }
 
-    /// Makes an automatic switch and notes it, so the cooldown counts from here.
-    fn switch_and_record(&self, kind: ProviderKind, to: &str, now: Timestamp) -> Result<SwitchOutcome> {
-        let outcome = self.switch_to(to)?;
+    /// Makes an automatic switch and notes it, so the cooldown counts from
+    /// here and the history says why it was made.
+    fn switch_and_record(
+        &self,
+        kind: ProviderKind,
+        to: &str,
+        reason: &Reason,
+        now: Timestamp,
+    ) -> Result<SwitchOutcome> {
+        let _lock = self.store.lock()?;
+        let outcome = self.switch_locked(to)?;
         let mut state = self.store.state()?;
         state.record_switch(
             kind,
@@ -1362,6 +1387,24 @@ impl Engine {
                 from: outcome.from.clone(),
             },
         );
+        if outcome.from.as_deref() != Some(to) {
+            let (why, used) = match *reason {
+                Reason::ThresholdCrossed { used, .. } => (SwitchWhy::Threshold, Some(used)),
+                Reason::BestOfExhausted { used, .. } => (SwitchWhy::LeastUsed, Some(used)),
+                Reason::ActiveExhausted { .. } => (SwitchWhy::Exhausted, None),
+                Reason::ActiveSignedOut { .. } => (SwitchWhy::SignedOut, None),
+                Reason::WeekExpiresSooner { .. } => (SwitchWhy::WeekEndsSooner, None),
+            };
+            state.push_switch(Switch {
+                at: now,
+                provider: kind,
+                from: outcome.from.clone(),
+                to: outcome.to.clone(),
+                by: SwitchedBy::Watch,
+                why: Some(why),
+                used,
+            });
+        }
         self.store.put_state(&state)?;
         Ok(outcome)
     }

@@ -17,6 +17,7 @@ pub mod engine;
 pub mod fleet;
 pub mod foreign;
 pub mod fsutil;
+pub mod herdr;
 pub mod http;
 pub mod json_io;
 pub mod jwt;

@@ -783,6 +783,22 @@ fn switching_replaces_the_live_credential_and_keeps_unrelated_settings() {
     let accounts = fixture.accounts();
     assert_eq!(accounts[0]["active"], true);
     assert_eq!(accounts[1]["active"], false);
+
+    // The switch is in the history, made by hand; asking for the account
+    // already in use adds nothing.
+    fixture.run(&["use", "first@example.com"]);
+    let history: Value = serde_json::from_str(&fixture.run(&["history", "--json"])).unwrap();
+    let history = history.as_array().unwrap();
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0]["provider"], "claude");
+    assert_eq!(history[0]["from"], "claude-2");
+    assert_eq!(history[0]["to"], "claude-1");
+    assert_eq!(history[0]["by"], "hand");
+    let said = fixture.run(&["history"]);
+    assert!(
+        said.contains("Claude Code: claude-2 -> claude-1 (by hand)"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -961,6 +977,30 @@ fn settings_round_trip_through_the_config_commands() {
 
     let path = fixture.run(&["config", "path"]);
     assert!(path.trim().ends_with("config.toml"), "{path}");
+
+    // A provider's own mark goes back to the shared one.
+    fixture.run(&["config", "set", "provider.codex.threshold", "95"]);
+    fixture.run(&["config", "unset", "provider.codex.threshold"]);
+    let shown = fixture.run(&["config", "show"]);
+    assert!(!shown.contains("threshold = 95"), "{shown}");
+    fixture
+        .cmd(&["config", "unset", "watch.nonsense"])
+        .assert()
+        .failure()
+        .stderr(contains("nothing to unset"));
+
+    // As JSON, each setting says what every change would set it to.
+    let json: Value = serde_json::from_str(&fixture.run(&["config", "show", "--json"])).unwrap();
+    let threshold = &json["settings"][0];
+    assert_eq!(threshold["key"], "watch.threshold");
+    assert_eq!(threshold["label"], "Switch at");
+    assert_eq!(threshold["value"], "80% used");
+    assert_eq!(threshold["kind"], "number");
+    assert_eq!(threshold["down"], "79");
+    assert_eq!(threshold["up"], "81");
+    let wait = &json["settings"][4];
+    assert_eq!(wait["kind"], "choice");
+    assert_eq!(wait["choices"][1]["set"], "false");
 }
 
 #[test]
@@ -1035,6 +1075,12 @@ fn watch_moves_claude_code_off_an_account_the_provider_signed_out() {
         fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
         "sk-ant-ort01-spare"
     );
+
+    // The history says the watcher made it, and why.
+    let history: Value = serde_json::from_str(&fixture.run(&["history", "--json"])).unwrap();
+    assert_eq!(history[0]["by"], "watch");
+    assert_eq!(history[0]["why"], "signed_out");
+    assert_eq!(history[0]["from"], "claude-2");
 }
 
 /// agent-meter leaves renewing the account in use to its CLI, so the CLI's
@@ -1862,7 +1908,7 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 5] = ["queue", "pace", "counted", "copyOf", "disabled"];
+    const ADDED: [&str; 6] = ["queue", "pace", "counted", "copyOf", "disabled", "threshold"];
     let added = |line: &str| {
         let text = line.trim_start();
         ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": ")))

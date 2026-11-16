@@ -197,8 +197,7 @@ impl Setting {
                  left: wait for the first to come back, or stop."
                 .into(),
             Setting::Switching(kind) => format!(
-                "Whether {} is moved to another account on its own as a limit nears. The same \
-                 as pressing w.",
+                "Whether {} is moved to another account on its own as a limit nears.",
                 kind.display_name()
             ),
             Setting::OwnThreshold(kind) => format!(
@@ -211,6 +210,99 @@ impl Setting {
                  out, for when {model} is a model you never work in."
             ),
         }
+    }
+
+    /// What a key does here that nowhere else has, to follow the explanation
+    /// in the terminal UI.
+    pub fn key_hint(&self) -> Option<&'static str> {
+        matches!(self, Setting::Switching(_)).then_some("The same as pressing w.")
+    }
+
+    /// The key `agent-meter config set` changes this setting by.
+    pub fn key(&self) -> String {
+        match self {
+            Setting::Threshold => "watch.threshold".into(),
+            Setting::Margin => "watch.margin".into(),
+            Setting::Cooldown => "watch.cooldown-secs".into(),
+            Setting::Poll => "watch.poll-secs".into(),
+            Setting::WaitForReset => "watch.wait-for-reset".into(),
+            Setting::Switching(kind) => format!("provider.{kind}.enabled"),
+            Setting::OwnThreshold(kind) => format!("provider.{kind}.threshold"),
+            Setting::Model(kind, _) => format!("provider.{kind}.ignored-models"),
+        }
+    }
+
+    /// The value of [`Self::key`] in `config`, as `config set` would take it.
+    fn raw(&self, config: &Config) -> String {
+        match self {
+            Setting::Threshold => config.watch.threshold.to_string(),
+            Setting::Margin => config.watch.margin.to_string(),
+            Setting::Cooldown => config.watch.cooldown_secs.to_string(),
+            Setting::Poll => config.watch.poll_secs.to_string(),
+            Setting::WaitForReset => config.watch.wait_for_reset.to_string(),
+            Setting::Switching(kind) => config.is_switching_on(*kind).to_string(),
+            Setting::OwnThreshold(kind) => config.threshold_for(*kind).to_string(),
+            Setting::Model(kind, _) => config.ignored_models_for(*kind).join(","),
+        }
+    }
+
+    /// This setting as `config show --json` describes it: what it is called
+    /// and does, its value in words and as `config set` takes it, and what
+    /// each way of changing it would set it to.
+    ///
+    /// A program offering it never works a step out for itself, so it steps
+    /// exactly as the terminal UI does.
+    pub fn describe(&self, config: &Config) -> serde_json::Value {
+        let after = |step: Step| {
+            let mut changed = config.clone();
+            self.change(&mut changed, step).then(|| self.raw(&changed))
+        };
+        let mut json = serde_json::json!({
+            "key": self.key(),
+            "provider": self.provider(),
+            "label": self.label(),
+            "explanation": self.explanation(),
+            "value": self.value(config),
+            "set": self.raw(config),
+        });
+        match self {
+            Setting::WaitForReset => {
+                let mut other = config.clone();
+                other.watch.wait_for_reset = !config.watch.wait_for_reset;
+                json["kind"] = "choice".into();
+                json["choices"] = [true, false]
+                    .into_iter()
+                    .map(|waits| {
+                        let shown = if waits == config.watch.wait_for_reset {
+                            config
+                        } else {
+                            &other
+                        };
+                        serde_json::json!({
+                            "value": self.value(shown),
+                            "set": waits.to_string(),
+                            "chosen": waits == config.watch.wait_for_reset,
+                        })
+                    })
+                    .collect();
+            }
+            Setting::Switching(_) | Setting::Model(..) => {
+                json["kind"] = "switch".into();
+                json["on"] = matches!(self.value(config).as_str(), "on" | "yes").into();
+                json["toggle"] = after(Step::Toggle).into();
+            }
+            _ => {
+                json["kind"] = "number".into();
+                json["down"] = after(Step::Down).into();
+                json["up"] = after(Step::Up).into();
+                json["own"] = match self {
+                    Setting::OwnThreshold(kind) => config.own_threshold(*kind).is_some(),
+                    _ => true,
+                }
+                .into();
+            }
+        }
+        json
     }
 
     /// Applies `step` to this setting in `config`, and says whether that

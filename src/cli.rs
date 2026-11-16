@@ -120,6 +120,12 @@ enum Command {
     /// Read or change settings
     Config(ConfigArgs),
 
+    /// Show the latest switches between accounts, and who made them
+    History(HistoryArgs),
+
+    /// Show agent-meter in the Herdr desktop app
+    Herdr(crate::herdr::HerdrArgs),
+
     /// Show where agent-meter keeps its files
     Where,
 }
@@ -483,6 +489,12 @@ struct SpendResetArgs {
     /// Do not ask for confirmation
     #[arg(short, long)]
     yes: bool,
+    /// Say what each reset would do, and spend none
+    #[arg(long)]
+    dry_run: bool,
+    /// Print as JSON; with nothing to confirm, so `--yes` or `--dry-run` too
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -557,11 +569,29 @@ struct ConfigArgs {
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
     /// Print the current settings
-    Show,
+    Show {
+        /// Each setting as the terminal UI lists it, as JSON: what it is
+        /// called and does, its value, and what each change would set it to
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the path of the configuration file
     Path,
     /// Change a setting, e.g. `watch.threshold 85`
     Set { key: String, value: String },
+    /// Take a setting back to having no value of its own, e.g.
+    /// `provider.codex.threshold` to the one every agent shares
+    Unset { key: String },
+}
+
+#[derive(Args, Debug)]
+struct HistoryArgs {
+    /// How many of the latest switches to show
+    #[arg(short = 'n', long, default_value_t = 10)]
+    count: usize,
+    /// Print as JSON, oldest first
+    #[arg(long)]
+    json: bool,
 }
 
 /// Entry point. Errors are printed with their causes and turned into exit codes.
@@ -620,6 +650,8 @@ fn run() -> Result<ExitCode> {
         Command::Watch(args) => watch(&engine, &args),
         Command::Tui => crate::tui::run(&engine).map(|()| ExitCode::SUCCESS),
         Command::Config(args) => config(&engine, &args),
+        Command::History(args) => history(&engine, &args),
+        Command::Herdr(args) => crate::herdr::run(&args),
         Command::Where => {
             println!("{}", engine.store().dir().display());
             Ok(ExitCode::SUCCESS)
@@ -665,7 +697,11 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
             .iter()
             .map(|s| {
                 let interval = engine.poll_interval(s.account.provider).as_secs();
-                status_json(s, now, interval, places.get(&s.account.id).copied())
+                let mut row = status_json(s, now, interval, places.get(&s.account.id).copied());
+                // The mark this account is left at: its provider's own, else
+                // the one every agent shares.
+                row["threshold"] = json!(engine.config().threshold_for(s.account.provider));
+                row
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -1423,6 +1459,12 @@ fn remove(engine: &Engine, args: &RemoveArgs) -> Result<ExitCode> {
 fn spend_reset(engine: &Engine, args: &SpendResetArgs) -> Result<ExitCode> {
     let account = engine.resolve(&args.account)?;
     let now = Timestamp::now();
+    if args.json && !args.yes && !args.dry_run {
+        bail!("--json asks nothing, so it needs --yes to spend or --dry-run to only look");
+    }
+    if args.dry_run {
+        return spend_reset_offers(engine, &account, args, now);
+    }
     if !args.yes {
         // What is about to be spent, as the last reading has it. The reading
         // taken just before spending decides which reset that is, and it is
@@ -1460,12 +1502,138 @@ fn spend_reset(engine: &Engine, args: &SpendResetArgs) -> Result<ExitCode> {
     }
 
     let report = engine.spend_reset(&account.id, args.grant.as_deref())?;
-    println!("{}", crate::spending::outcome(&report));
-    println!("{}", crate::spending::after(&report, Timestamp::now()));
-    Ok(match report.answer {
-        crate::provider::Spent::Reset { .. } => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
+    let spent = matches!(report.answer, crate::provider::Spent::Reset { .. });
+    let outcome = crate::spending::outcome(&report);
+    let after = crate::spending::after(&report, Timestamp::now());
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "account": account.id,
+                "grant": report.grant.id,
+                "spent": spent,
+                "outcome": outcome,
+                "after": after,
+            }))?
+        );
+    } else {
+        println!("{outcome}");
+        println!("{after}");
+    }
+    Ok(if spent {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     })
+}
+
+/// What spending each of an account's resets would do, as the last reading
+/// has it, without spending any: the one `--grant` names, else every one, the
+/// one spent without `--grant` first.
+fn spend_reset_offers(
+    engine: &Engine,
+    account: &crate::account::Account,
+    args: &SpendResetArgs,
+    now: Timestamp,
+) -> Result<ExitCode> {
+    let status = engine
+        .status()?
+        .into_iter()
+        .find(|status| status.account.id == account.id);
+    let usage = status.as_ref().and_then(|status| status.usage.as_ref());
+    let grants: Vec<_> = usage
+        .and_then(|usage| usage.resets.as_ref())
+        .map(|resets| resets.live_grants_at(now))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| args.grant.is_none() || g.id.as_deref() == args.grant.as_deref())
+        .collect();
+    if let (Some(wanted), true) = (&args.grant, grants.is_empty()) {
+        bail!("the last reading of {} describes no reset {wanted:?}", account.id);
+    }
+    let offers: Vec<_> = grants
+        .iter()
+        .map(|grant| {
+            let mut lines = crate::spending::offer(account.provider, grant, usage, now);
+            let title = lines.remove(0);
+            (grant, title, lines)
+        })
+        .collect();
+    if args.json {
+        let offers: Vec<_> = offers
+            .iter()
+            .map(|(grant, title, lines)| {
+                json!({
+                    "grant": grant.id,
+                    "title": title,
+                    "lines": lines,
+                    "expiresAt": grant.expires_at,
+                    "usable": grant.hindrance().is_none(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"account": account.id, "offers": offers}))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if offers.is_empty() {
+        println!("{} holds no limit reset, as the last reading has it.", account.id);
+    }
+    for (grant, title, lines) in &offers {
+        match &grant.id {
+            Some(id) => println!("{title} (--grant {id})"),
+            None => println!("{title}"),
+        }
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn history(engine: &Engine, args: &HistoryArgs) -> Result<ExitCode> {
+    let switches = engine.store().state()?.switches;
+    let latest = &switches[switches.len().saturating_sub(args.count)..];
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(latest)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if latest.is_empty() {
+        println!("No switches yet.");
+    }
+    for switch in latest {
+        println!(
+            "{}  {}: {}",
+            crate::spending::local_moment(switch.at),
+            switch.provider.display_name(),
+            describe_switch(switch)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One switch in words: between which accounts, and who made it and why.
+fn describe_switch(switch: &crate::store::Switch) -> String {
+    use crate::store::{SwitchWhy, SwitchedBy};
+    let moved = match &switch.from {
+        Some(from) => format!("{from} -> {}", switch.to),
+        None => format!("signed in to {}", switch.to),
+    };
+    let from = switch.from.as_deref().unwrap_or("the account in use");
+    let why = match (switch.by, switch.why, switch.used) {
+        (SwitchedBy::Hand, ..) => "by hand".to_string(),
+        (_, Some(SwitchWhy::Threshold), Some(used)) => format!("{from} reached {used:.0}%"),
+        (_, Some(SwitchWhy::LeastUsed), Some(used)) => {
+            format!("every account was past the mark; {from} was at {used:.0}%")
+        }
+        (_, Some(SwitchWhy::Exhausted), _) => format!("{from} was out of quota"),
+        (_, Some(SwitchWhy::SignedOut), _) => format!("the provider signed {from} out"),
+        (_, Some(SwitchWhy::WeekEndsSooner), _) => format!("{}'s week ends sooner", switch.to),
+        _ => "by the watcher".to_string(),
+    };
+    format!("{moved} ({why})")
 }
 
 fn disable(engine: &Engine, args: &DisableArgs) -> Result<ExitCode> {
@@ -1773,12 +1941,29 @@ fn exit_code_for(outcomes: &[TickOutcome]) -> ExitCode {
 fn config(engine: &Engine, args: &ConfigArgs) -> Result<ExitCode> {
     match &args.command {
         ConfigCommand::Path => println!("{}", crate::config::Config::path(engine.store().dir()).display()),
-        ConfigCommand::Show => print!("{}", toml::to_string_pretty(engine.config())?),
+        ConfigCommand::Show { json: false } => print!("{}", toml::to_string_pretty(engine.config())?),
+        ConfigCommand::Show { json: true } => {
+            let statuses = engine.status()?;
+            let settings: Vec<_> = crate::tui::settings::list(engine.config(), &statuses)
+                .iter()
+                .map(|setting| setting.describe(engine.config()))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "settings": settings }))?
+            );
+        }
         ConfigCommand::Set { key, value } => {
             let mut config = engine.config().clone();
             config.set(key, value)?;
             config.save(engine.store().dir())?;
             println!("{key} = {value}");
+        }
+        ConfigCommand::Unset { key } => {
+            let mut config = engine.config().clone();
+            config.unset(key)?;
+            config.save(engine.store().dir())?;
+            println!("{key} is unset");
         }
     }
     Ok(ExitCode::SUCCESS)

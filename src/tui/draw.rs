@@ -968,12 +968,12 @@ fn draw_settings(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     // through settings that take more and fewer words.
     let explained = settings
         .iter()
-        .map(|setting| wrap(&setting.explanation(), inner).len())
+        .map(|setting| wrap(&explain(setting), inner).len())
         .max()
         .unwrap_or(0);
     let mut explanation: Vec<Line<'static>> = settings
         .get(index)
-        .map(|setting| wrap(&setting.explanation(), inner))
+        .map(|setting| wrap(&explain(setting), inner))
         .unwrap_or_default()
         .into_iter()
         .map(|line| Line::from(Span::styled(line, Style::new().fg(DIM))))
@@ -1373,6 +1373,14 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(area);
     area
+}
+
+/// What a setting does, and the key that does it where one does.
+fn explain(setting: &crate::tui::settings::Setting) -> String {
+    match setting.key_hint() {
+        Some(hint) => format!("{} {hint}", setting.explanation()),
+        None => setting.explanation(),
+    }
 }
 
 #[cfg(test)]

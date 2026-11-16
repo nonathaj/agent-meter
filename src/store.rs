@@ -317,6 +317,62 @@ pub struct State {
     /// answer settles it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub open_claims: BTreeMap<String, Vec<Claim>>,
+    /// The latest switches between accounts, oldest first, however they were
+    /// made: by the watcher, `use` or the terminal UI.
+    ///
+    /// Whatever shows which account is in use reads this rather than the
+    /// agent CLIs' own files, so a switch is seen where agent-meter keeps its
+    /// files, with who made it and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub switches: Vec<Switch>,
+}
+
+/// How many switches [`State::switches`] keeps.
+pub const SWITCHES_KEPT: usize = 50;
+
+/// One switch between two accounts of a provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Switch {
+    pub at: Timestamp,
+    pub provider: ProviderKind,
+    /// The account in use before, where one stored account was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub to: String,
+    pub by: SwitchedBy,
+    /// Why the watcher left `from`; nothing for a switch made by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<SwitchWhy>,
+    /// How much of `from` was used, as the watcher judged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+}
+
+/// Who made a switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchedBy {
+    /// `agent-meter watch`.
+    Watch,
+    /// A person: `agent-meter use`, the terminal UI, or anything driving them.
+    Hand,
+}
+
+/// Why the watcher switched, in the words `list --json` and `history --json` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchWhy {
+    /// The account in use reached the threshold.
+    Threshold,
+    /// Every account was past the threshold and this one had the most room.
+    LeastUsed,
+    /// The account in use was refused requests outright.
+    Exhausted,
+    /// The provider signed the account in use out.
+    SignedOut,
+    /// Another account's week ends sooner and would be wasted.
+    WeekEndsSooner,
 }
 
 /// A request to spend a limit reset, as it was sent.
@@ -345,6 +401,13 @@ impl State {
 
     pub fn record_switch(&mut self, provider: ProviderKind, record: SwitchRecord) {
         self.last_switch.insert(provider.as_str().to_string(), record);
+    }
+
+    /// Adds `switch` to the history, keeping only the latest [`SWITCHES_KEPT`].
+    pub fn push_switch(&mut self, switch: Switch) {
+        self.switches.push(switch);
+        let extra = self.switches.len().saturating_sub(SWITCHES_KEPT);
+        self.switches.drain(..extra);
     }
 
     fn issued(&self, provider: ProviderKind) -> u32 {

@@ -581,6 +581,7 @@ fn parse_profile(response: &Value) -> Identity {
             .map(ToString::to_string)
     };
     let email = string(account, "email").or_else(|| string(account, "email_address"));
+    let capacity = multiplier(organization.and_then(|o| o.get("rate_limit_tier")));
     Identity {
         user_id: string(account, "uuid"),
         workspace_id: string(organization, "uuid"),
@@ -588,44 +589,91 @@ fn parse_profile(response: &Value) -> Identity {
             .and_then(|o| o.get("name"))
             .and_then(Value::as_str)
             .and_then(sanitize_text),
-        plan: parse_plan(account, organization),
-        capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
+        plan: parse_plan(account, organization, capacity),
+        capacity,
         email,
     }
 }
 
+/// The plans Claude sells, in our own words.
+const PLANS: [&str; 6] = ["free", "pro", "max", "ultra", "team", "enterprise"];
+
 /// Which plan an account is on.
 ///
-/// `organization_type` decides it, because the booleans cannot: a Team seat
-/// sets `has_claude_max` exactly as a personal Max one does, so reading the
-/// booleans alone reports a Team account as "max" — a plan the person is not
-/// on. Measured on one machine, 2026-09-15, where the two seats differed in
-/// nothing else the response carries.
+/// The provider's own name for it, `plan_display_name`, decides it when it is
+/// one we know: it is the name Claude shows the person, and it followed the
+/// rename of 2026-10-30 that `organization_type` did not. Measured on one
+/// machine, 2026-11-17: an Ultra account reported `"Ultra"` there, and
+/// `claude_max` on `default_claude_max_20x` beside it.
 ///
-/// Known types are matched to our own words rather than echoed, and one we have
-/// not seen falls through to the booleans instead of being printed. That keeps
-/// the property the booleans had: nothing a provider writes reaches the screen
-/// through this field.
-fn parse_plan(account: Option<&Value>, organization: Option<&Value>) -> Option<String> {
+/// Without that, `organization_type` decides it, because the booleans cannot:
+/// a Team seat sets `has_claude_max` exactly as a personal Max one does, so
+/// reading the booleans alone reports a Team account as "max" — a plan the
+/// person is not on. Measured on one machine, 2026-09-15, where the two seats
+/// differed in nothing else the response carries.
+///
+/// Known names and types are matched to our own words rather than echoed, and
+/// one we have not seen falls through to the next instead of being printed.
+/// That keeps the property the booleans had: nothing a provider writes reaches
+/// the screen through this field.
+fn parse_plan(
+    account: Option<&Value>,
+    organization: Option<&Value>,
+    capacity: Option<u32>,
+) -> Option<String> {
     let flag = |key: &str| {
         account
             .and_then(|a| a.get(key))
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    match organization
+    let named = organization
+        .and_then(|o| o.get("plan_display_name"))
+        .and_then(Value::as_str)
+        .and_then(|name| {
+            PLANS
+                .into_iter()
+                .find(|plan| name.trim().eq_ignore_ascii_case(plan))
+        });
+    if let Some(plan) = named {
+        return Some(plan.into());
+    }
+    let plan = match organization
         .and_then(|o| o.get("organization_type"))
         .and_then(Value::as_str)
     {
-        Some("claude_team") => Some("team".into()),
-        Some("claude_enterprise") => Some("enterprise".into()),
-        Some("claude_max") => Some("max".into()),
-        Some("claude_pro") => Some("pro".into()),
+        Some("claude_team") => "team",
+        Some("claude_enterprise") => "enterprise",
+        Some("claude_max") => personal_plan(capacity),
+        Some("claude_pro") => "pro",
         // The wider plan wins: naming the narrower one would understate what
         // the account can do.
-        _ if flag("has_claude_max") => Some("max".into()),
-        _ if flag("has_claude_pro") => Some("pro".into()),
-        _ => None,
+        _ if flag("has_claude_max") => personal_plan(capacity),
+        _ if flag("has_claude_pro") => "pro",
+        _ => return None,
+    };
+    Some(plan.into())
+}
+
+/// What a personal plan above Pro is called, from the size of its quota.
+///
+/// On 2026-10-30 Claude renamed Max 5x to Max and Max 20x to Ultra, and kept
+/// both on the organization type and rate-limit tiers they had before. So the
+/// tier is what tells them apart where the provider's name for the plan is
+/// missing.
+fn personal_plan(capacity: Option<u32>) -> &'static str {
+    if capacity == Some(20) { "ultra" } else { "max" }
+}
+
+/// Gives a stored account the name its plan has now.
+///
+/// Records written before the rename say `max` for an Ultra account, and only
+/// the account in use asks the provider again, so an idle one would show the
+/// retired name for good. The rename was one-to-one, so no request is needed:
+/// a `max` on the 20x tier is Ultra by definition.
+pub fn rename_retired_plan(identity: &mut Identity) {
+    if identity.plan.as_deref() == Some("max") {
+        identity.plan = Some(personal_plan(identity.capacity).into());
     }
 }
 
@@ -1247,10 +1295,66 @@ mod tests {
         assert_eq!(team.capacity, Some(5));
         assert_eq!(team.plan_label().unwrap(), "team 5x");
 
-        let personal = parse_profile(&seat("claude_max", "default_claude_max_20x"));
+        let personal = parse_profile(&seat("claude_max", "default_claude_max_5x"));
         assert_eq!(personal.plan.as_deref(), Some("max"));
-        assert_eq!(personal.capacity, Some(20));
-        assert_eq!(personal.plan_label().unwrap(), "max 20x");
+        assert_eq!(personal.capacity, Some(5));
+        assert_eq!(personal.plan_label().unwrap(), "max");
+    }
+
+    /// Max 20x became Ultra on 2026-10-30, and Max 5x became Max, without the
+    /// organization type or the tier changing. The provider's own name for the
+    /// plan says which; this is the shape measured on one machine, 2026-11-17.
+    #[test]
+    fn the_twenty_times_plan_is_ultra() {
+        let ultra = json!({
+            "account": {"uuid": "u", "has_claude_max": true, "has_claude_pro": false},
+            "organization": {"uuid": "o", "organization_type": "claude_max",
+                             "rate_limit_tier": "default_claude_max_20x",
+                             "plan_display_name": "Ultra", "plan_display_label": "Ultra plan"}
+        });
+        let identity = parse_profile(&ultra);
+        assert_eq!(identity.plan.as_deref(), Some("ultra"));
+        assert_eq!(identity.capacity, Some(20));
+        // The plan is one size, and its name says which.
+        assert_eq!(identity.plan_label().unwrap(), "ultra");
+
+        // Without the name, the tier tells the two apart.
+        let mut unnamed = ultra.clone();
+        unnamed["organization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("plan_display_name");
+        assert_eq!(parse_profile(&unnamed).plan.as_deref(), Some("ultra"));
+        unnamed["organization"]["organization_type"] = json!(null);
+        assert_eq!(parse_profile(&unnamed).plan.as_deref(), Some("ultra"));
+
+        // A name we do not know is never printed; the type decides instead.
+        let mut odd = ultra.clone();
+        odd["organization"]["plan_display_name"] = json!("\u{1b}[31mUltra");
+        assert_eq!(parse_profile(&odd).plan.as_deref(), Some("ultra"));
+        odd["organization"]["organization_type"] = json!("claude_team");
+        odd["organization"]["plan_display_name"] = json!("Team Premium");
+        assert_eq!(parse_profile(&odd).plan.as_deref(), Some("team"));
+    }
+
+    /// A record kept from before the rename names its plan as it is called now,
+    /// without asking the provider again.
+    #[test]
+    fn a_stored_max_twenty_times_seat_is_called_ultra() {
+        let stored = |plan: &str, capacity: Option<u32>| {
+            let mut identity = Identity {
+                plan: Some(plan.into()),
+                capacity,
+                ..Identity::default()
+            };
+            rename_retired_plan(&mut identity);
+            identity.plan.unwrap()
+        };
+        assert_eq!(stored("max", Some(20)), "ultra");
+        assert_eq!(stored("max", Some(5)), "max");
+        assert_eq!(stored("max", None), "max");
+        assert_eq!(stored("team", Some(20)), "team");
+        assert_eq!(stored("ultra", Some(20)), "ultra");
     }
 
     /// An organization type we have not seen falls back to the booleans rather

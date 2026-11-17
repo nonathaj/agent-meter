@@ -85,6 +85,12 @@ enum HerdrCommand {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Bring an installed mod up to date with this agent-meter
+    ///
+    /// The mod runs this itself, so after `agent-meter update` Herdr is on the
+    /// matching mod within minutes. Layouts are left as they are, and a mod
+    /// that is not installed stays that way.
+    Refresh,
     /// Take agent-meter out of the Herdr app and its rows out of every layout
     Uninstall,
 }
@@ -93,6 +99,7 @@ pub fn run(args: &HerdrArgs) -> Result<ExitCode> {
     let home = app_home()?;
     match &args.command {
         HerdrCommand::Install { no_footer, yes } => install(&home, *no_footer, *yes),
+        HerdrCommand::Refresh => refresh(&home),
         HerdrCommand::Uninstall => uninstall(&home),
     }
 }
@@ -171,6 +178,25 @@ fn install(home: &Path, no_footer: bool, yes: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Rewrites the installed mod where it differs from the one in this binary.
+///
+/// The mod is a copy, and `agent-meter update` replaces only the binary: left
+/// alone, the old mod would go on reading the new agent-meter's JSON. Only the
+/// mod's files are compared, so this costs nothing when they match, and Herdr
+/// reloads the mod only when one changed.
+fn refresh(home: &Path) -> Result<ExitCode> {
+    let folder = home.join("mods").join(MOD);
+    if !folder.is_dir() {
+        println!("The agent-meter mod is not installed; `agent-meter herdr install` puts it in.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let program = std::env::current_exe().context("finding this agent-meter")?;
+    if write_mod(home, &program)? {
+        println!("Brought the agent-meter mod in {} up to date.", folder.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn uninstall(home: &Path) -> Result<ExitCode> {
     let layouts = home.join("layouts");
     for entry in std::fs::read_dir(&layouts).with_context(|| format!("reading {}", layouts.display()))? {
@@ -204,10 +230,12 @@ fn uninstall(home: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Writes the mod's files, pointing it at `program`.
-fn write_mod(home: &Path, program: &Path) -> Result<()> {
+/// Writes the mod's files, pointing it at `program`, and says whether any
+/// file changed.
+fn write_mod(home: &Path, program: &Path) -> Result<bool> {
     let folder = home.join("mods").join(MOD);
     std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
+    let mut changed = false;
     for (name, text) in FILES {
         let text = if *name == "main.js" {
             point_at(text, program)?
@@ -221,8 +249,9 @@ fn write_mod(home: &Path, program: &Path) -> Result<()> {
         }
         fsutil::write_atomic(&path, text.as_bytes(), Mode::InheritExisting)
             .with_context(|| format!("writing {}", path.display()))?;
+        changed = true;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// `main.js` running `program` rather than whichever agent-meter is first on
@@ -476,5 +505,47 @@ mod tests {
         assert_eq!(uninstall(home.path()).unwrap(), ExitCode::SUCCESS);
         assert!(!folder.exists());
         assert_eq!(read_layout(&layouts.join("mine.json")).unwrap(), layout());
+    }
+
+    /// After an update the installed mod is an older release's; refreshing
+    /// brings it level with this binary and touches nothing else.
+    #[test]
+    fn refresh_brings_an_installed_mod_up_to_date_and_installs_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let layouts = home.path().join("layouts");
+        std::fs::create_dir_all(&layouts).unwrap();
+        std::fs::write(
+            layouts.join("mine.json"),
+            serde_json::to_string(&layout()).unwrap(),
+        )
+        .unwrap();
+        let folder = home.path().join("mods").join(MOD);
+
+        // Not installed: it stays that way.
+        assert_eq!(refresh(home.path()).unwrap(), ExitCode::SUCCESS);
+        assert!(!folder.exists());
+
+        let program = std::env::current_exe().unwrap();
+        assert!(
+            write_mod(home.path(), &program).unwrap(),
+            "a first write changes files"
+        );
+        assert!(
+            !write_mod(home.path(), &program).unwrap(),
+            "the same mod again changes nothing, so Herdr does not reload it"
+        );
+
+        // An older release's mod, and one of its files gone.
+        std::fs::write(folder.join("main.js"), "// an older mod").unwrap();
+        std::fs::remove_file(folder.join("plus.svg")).unwrap();
+        assert_eq!(refresh(home.path()).unwrap(), ExitCode::SUCCESS);
+        let main = std::fs::read_to_string(folder.join("main.js")).unwrap();
+        assert_eq!(main, point_at(FILES[0].1, &program).unwrap());
+        assert!(folder.join("plus.svg").is_file());
+        assert_eq!(
+            read_layout(&layouts.join("mine.json")).unwrap(),
+            layout(),
+            "layouts are install's business"
+        );
     }
 }

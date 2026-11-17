@@ -188,8 +188,11 @@ impl Store {
         let bytes = fsutil::read_optional(path)
             .with_context(|| format!("reading {}", path.display()))?
             .with_context(|| format!("{} disappeared while being read", path.display()))?;
-        let account: Account =
+        let mut account: Account =
             serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        if account.provider == ProviderKind::Claude {
+            crate::provider::claude::rename_retired_plan(&mut account.identity);
+        }
 
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         if account.id != stem {

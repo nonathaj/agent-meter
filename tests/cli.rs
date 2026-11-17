@@ -1920,7 +1920,7 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 7] = [
+    const ADDED: [&str; 8] = [
         "queue",
         "pace",
         "counted",
@@ -1928,6 +1928,7 @@ fn as_originally_listed(printed: &str) -> String {
         "disabled",
         "threshold",
         "switching",
+        "planLabel",
     ];
     let added = |line: &str| {
         let text = line.trim_start();

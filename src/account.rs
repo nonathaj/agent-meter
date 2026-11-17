@@ -70,7 +70,7 @@ pub struct Identity {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
-    /// Subscription plan, e.g. `max`, `team`, `pro`, `plus`.
+    /// Subscription plan, e.g. `ultra`, `max`, `team`, `pro`, `plus`.
     ///
     /// Always one of our own words. Nothing a provider writes is printed
     /// through this field.
@@ -140,12 +140,19 @@ impl Identity {
         })
     }
 
-    /// The plan as shown to the user, with the size of the quota when it is
-    /// known: `team 5x`.
+    /// The plan as shown to the user, with the size of the quota where the
+    /// plan comes in more than one: `team 5x`, but `ultra`.
+    ///
+    /// Claude's personal plans are each one size, named for it — Max and
+    /// Ultra, which were Max 5x and Max 20x — so a multiplier there would
+    /// only repeat the name.
     pub fn plan_label(&self) -> Option<String> {
+        const ONE_SIZE: [&str; 2] = ["max", "ultra"];
         match (&self.plan, self.capacity) {
-            (Some(plan), Some(times)) => Some(format!("{plan} {times}x")),
-            (Some(plan), None) => Some(plan.clone()),
+            (Some(plan), Some(times)) if !ONE_SIZE.contains(&plan.as_str()) => {
+                Some(format!("{plan} {times}x"))
+            }
+            (Some(plan), _) => Some(plan.clone()),
             // A multiplier with no plan says little on its own, and inventing a
             // plan name to hang it on would be worse than leaving it out.
             (None, _) => None,

@@ -816,6 +816,8 @@ fn status_json(
                 Disabled::Until(at) => Some(at),
             },
         })),
+        // The plan as the PLAN column shows it.
+        "planLabel": status.account.identity.plan_label(),
     })
 }
 

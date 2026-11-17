@@ -12,7 +12,8 @@
 // does, and switches the agents whose switching is turned on.
 //
 // Installed by `agent-meter herdr install`, which points AGENT_METER at
-// itself. Edits here are overwritten by the next install.
+// itself, and kept level with it by `agent-meter herdr refresh`, which the
+// footer runs. Edits here are overwritten by either.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
@@ -55,12 +56,10 @@ const provider = (key) => PROVIDERS.find(p => p.key === key);
 // Who an account is, as the person knows it: their own label, else the email
 // they signed in with. agent-meter's ids (`claude-7`) are for the CLI.
 const who = (a) => a?.label || a?.email || a?.id || "";
-// Its plan as the provider sells it: "Max 20x", "Team", "Free".
+// Its plan as the provider sells it: "Ultra", "Team 5x", "Free".
 const plan = (a) => {
-  const p = (a?.plan ?? "").trim();
-  if (!p || p === "-") return "";
-  const m = a.capacityMultiplier > 1 ? ` ${a.capacityMultiplier}x` : "";
-  return p[0].toUpperCase() + p.slice(1) + m;
+  const p = (a?.planLabel ?? "").trim();
+  return p ? p[0].toUpperCase() + p.slice(1) : "";
 };
 const named = (a) => (plan(a) ? `${who(a)} (${plan(a)})` : who(a));
 
@@ -114,11 +113,16 @@ export default class AgentMeter extends View {
   // Herdr goes, the last one ends by itself within those 9. One watcher
   // checks at a time on a machine, so with several windows, or a watcher
   // started elsewhere, the rest stand by and the providers are asked once.
+  //
+  // Before each run this mod is brought level with the agent-meter it runs:
+  // `agent-meter update` replaces only the program, and Herdr reloads a mod
+  // whose files change, so the new one takes over from here.
   keepWatching(cx) {
     cx.spawn(async (cx) => {
       for (;;) {
         const started = Date.now();
         try {
+          await exec(AGENT_METER, ["herdr", "refresh"]);
           await exec(AGENT_METER, ["watch", "--only-switched-on", "--for", "540"], { timeout: 600000 });
         } catch {
           // It could not start, or overran: try again, but not in a spin.

@@ -12,7 +12,7 @@ $ agent-meter list
      ID         PROVIDER      ACCOUNT              ORGANIZATION  PLAN     USED  WINDOWS                        RESETS IN  LIMIT RESETS
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  *   claude-1   Claude Code   dev@example.com      Example Inc   team 5x  94%   5h 94%  weekly 61%  weekly Opus 4%  2h13m      -
-     claude-2   Claude Code   dev@example.com      -             max 20x  12%   5h 12%  weekly 30%                  3h02m      1, expires in 22d
+     claude-2   Claude Code   dev@example.com      -             ultra    12%   5h 12%  weekly 30%                  3h02m      1, expires in 22d
  *   codex-1    Codex         dev@example.com      -             pro      8%    5h 0%  weekly 8%                    6d2h       1, expires in 23d
 
 $ agent-meter watch
@@ -194,7 +194,7 @@ next machine that still has it. Remove it on each.
 | `agent-meter tui` | The same operations in a full-screen interface. |
 | `agent-meter config` | Reads and changes settings: `show [--json]`, `set`, `unset`, `path`. |
 | `agent-meter history` | The latest switches between accounts, who made them and why. `-n`, `--json`. |
-| `agent-meter herdr install` | Puts agent-meter in the [Herdr desktop app](#in-the-herdr-app). `herdr uninstall` takes it out. |
+| `agent-meter herdr install` | Puts agent-meter in the [Herdr desktop app](#in-the-herdr-app). `herdr refresh` brings an installed mod level with this binary, as the mod does itself; `herdr uninstall` takes it out. |
 | `agent-meter where` | Prints the data directory. |
 
 ### The terminal UI
@@ -209,7 +209,7 @@ accounts can be compared without selecting either.
  ◆ agent-meter    All 10   Claude Code 8   Codex 2
 ──────────────────────────────────────────────────────────────────────────────────────
  Claude Code  8  ·  using dev@example.com   in the order they will be taken   ● auto at 90%
-┃ 1  dev@example.com  personal · max 20x                                         IN USE
+┃ 1  dev@example.com  personal · ultra                                           IN USE
 ┃    5h            ━━━━━━━━━━━━━━━━━━━━━━━━╸━━━   85%   resets in 3h43m
 ┃    weekly        ━━━━━━━━━━━━━━━━━━━━━━╸━━━━━   80%   resets in 4d19h   ▲ 49% ahead of pace
 ┃    weekly Fable  ━━━━━╸━━━━━━━━━━━━━━━━━━━━━━   19%   resets in 4d19h
@@ -231,7 +231,7 @@ when the first lapses (in yellow once it is two days away), what spending one
 refills, and the provider's name for the grant.
 
 ```text
-  2  oncall@example.com  personal · max 20x
+  2  oncall@example.com  personal · ultra
      weekly        ━━━━━━━━━━━━━━━━━━━━━━━━━━╸━   92%   resets in 21h2m
      limit resets  1 available   expires in 22d21h (Oct 22)   refills 5h + weekly   Claude Opus 5.5 launch: …
 ```
@@ -318,8 +318,11 @@ one every agent shares. `switching` says whether its provider is switched
 automatically (`on`, which is the setting turned on; never set reads as off, as
 every screen shows it, though `watch` takes it as on), and whether anything on
 this machine is running to do it (`watched`: an `agent-meter watch` or a
-terminal UI is open). Switching is only automatic while something is. New fields
-are only ever added at the end of an object.
+terminal UI is open). Switching is only automatic while something is.
+`planLabel` is the plan as the `PLAN` column shows it (`ultra`, `team 5x`), and
+`null` where the plan is unknown; `plan` is the plan alone and
+`capacityMultiplier` the size of its quota. New fields are only ever added at
+the end of an object.
 
 `agent-meter history --json` lists the latest switches, oldest first, however
 they were made: each has `at`, `provider`, `from` (absent where no stored
@@ -496,9 +499,11 @@ naming them in the rules:
 
 A percentage says how full an account is, never how big it is — and two
 accounts on the same plan can differ several-fold. Claude reports the size as a
-multiplier, shown in the plan column: a `max 20x` seat holds four times what a
-`team 5x` one does, so **40% left on the 20x seat is twice the work that 90%
-left on the 5x seat is**.
+multiplier: an `ultra` account is on the 20x tier and holds four times what a
+`team 5x` seat does, so **40% left on the Ultra account is twice the work that
+90% left on the 5x seat is**. The plan column shows the multiplier only where
+the plan comes in more than one size, as Team seats do; Max (once Max 5x) and
+Ultra (once Max 20x) are one size each.
 
 Where the provider states the size of every account in play, `agent-meter`
 compares how much work each can still do rather than the fraction it has left.
@@ -506,9 +511,12 @@ If the size of any one of them is unknown, it compares percentages instead — a
 account is never ranked last over a fact the provider simply did not state.
 
 The same is true of the plan name itself: a Team seat reports `has_claude_max`
-exactly as a personal Max seat does, so the plan is read from the account's
-organization type, and both the plan and the multiplier come from the provider
-rather than from the copies in the local credential file, which drift.
+exactly as a personal Max seat does, and an Ultra account still reports the
+`claude_max` organization type it had as Max 20x. So the plan is the provider's
+own name for it, else read from the organization type and tier, and both the
+plan and the multiplier come from the provider rather than from the copies in
+the local credential file, which drift. Accounts stored before the rename are
+called by their new names without asking the provider again.
 
 ## Settings
 
@@ -607,8 +615,12 @@ happens with nothing else to start. It switches only the agents whose switching
 is turned on, as the terminal UI does, and runs `agent-meter watch` nine minutes
 at a time, so nothing is left running for long once Herdr is gone.
 
-The mod comes from this binary and runs it, so the two always match: run the
-install again after `agent-meter update`. Everything it shows comes from
+The mod comes from this binary and runs it, so the two always match. After
+`agent-meter update` the footer brings the mod level with the new binary itself,
+before its next nine-minute watch, by running `agent-meter herdr refresh`, which
+rewrites only mod files that differ and leaves the layouts alone. (A mod from
+0.1.14 or earlier doesn't do this yet: run `agent-meter herdr install` once
+after updating.) Everything it shows comes from
 `list --json`, `history --json` and `config show --json`, and every change goes
 through the commands above.
 

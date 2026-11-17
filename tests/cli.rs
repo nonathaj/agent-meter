@@ -844,12 +844,24 @@ fn a_second_process_can_read_while_another_is_working() {
     fixture.sign_in_claude("dev@example.com", "uuid-1", "one");
     fixture.run(&["import", "claude"]);
 
-    let mut children: Vec<_> = (0..4)
-        .map(|_| fixture.cmd(&["list", "--refresh"]).spawn().unwrap())
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            fixture
+                .cmd(&["list", "--refresh"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
         .collect();
-    for child in &mut children {
-        let status = child.wait().unwrap();
-        assert!(status.success(), "concurrent read failed: {status}");
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent read failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -1908,7 +1920,15 @@ fn standing_reset(now: jiff::Timestamp, secs: i64) -> String {
 /// out of the printed text, with the comma that came before them, leaves the
 /// bytes an older version printed.
 fn as_originally_listed(printed: &str) -> String {
-    const ADDED: [&str; 6] = ["queue", "pace", "counted", "copyOf", "disabled", "threshold"];
+    const ADDED: [&str; 7] = [
+        "queue",
+        "pace",
+        "counted",
+        "copyOf",
+        "disabled",
+        "threshold",
+        "switching",
+    ];
     let added = |line: &str| {
         let text = line.trim_start();
         ADDED.iter().any(|key| text.starts_with(&format!("\"{key}\": ")))
@@ -2190,6 +2210,136 @@ fn each_row_says_where_its_account_stands_in_the_queue() {
     let only_codex: Vec<Value> =
         serde_json::from_str(&fixture.run(&["list", "--provider", "codex", "--json"])).unwrap();
     assert_eq!(only_codex[0]["queue"], json!({"position": 1, "role": "in_use"}));
+}
+
+/// Each account says whether its provider is switched automatically, and
+/// whether anything on this machine is running to do it: a watcher while it
+/// runs, and not once it is gone, however it went.
+#[test]
+fn accounts_say_whether_switching_is_automatic_and_running() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// Kills the watcher however the test ends.
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let (fixture, _now) = standing_fixture();
+    fixture.sign_in_codex("dev@openai.example", "user-1", "one");
+    fixture.run(&["import", "codex"]);
+    let switching = |id: &str| {
+        fixture
+            .accounts()
+            .into_iter()
+            .find(|row| row["id"] == id)
+            .unwrap()["switching"]
+            .clone()
+    };
+    // Never set reads as off, as every screen shows it.
+    assert_eq!(switching("claude-1"), json!({"on": false, "watched": false}));
+    fixture.run(&["config", "set", "provider.claude.enabled", "true"]);
+    fixture.run(&["config", "set", "provider.codex.enabled", "false"]);
+    assert_eq!(switching("claude-1"), json!({"on": true, "watched": false}));
+    assert_eq!(
+        switching("codex-1"),
+        json!({"on": false, "watched": false}),
+        "each provider its own"
+    );
+
+    // A dry run changes nothing, and is not a watcher.
+    fixture.run(&["watch", "--once", "--dry-run"]);
+    assert_eq!(switching("claude-1")["watched"], json!(false));
+
+    let watcher = |args: &[&str]| {
+        Running(
+            fixture
+                .cmd(&[&["watch"], args].concat())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let until = |watched: bool, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while switching("claude-1")["watched"] != json!(watched) {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let mut first = watcher(&[]);
+    until(true, "the watcher was never seen");
+    assert_eq!(switching("codex-1"), json!({"on": false, "watched": true}));
+
+    // A second one leaves the checks to the first.
+    fixture
+        .cmd(&["watch", "--once"])
+        .assert()
+        .success()
+        .stdout(contains("Another agent-meter is watching on this machine"));
+    let mut second = watcher(&[]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Killed, not stopped: nothing it could do on the way out is counted on.
+    // The one standing by takes over.
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    until(true, "the second never took over");
+    second.0.kill().unwrap();
+    second.0.wait().unwrap();
+    until(false, "a killed watcher was still seen");
+
+    // One run for a while ends by itself.
+    let mut timed = watcher(&["--for", "1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while timed.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "`watch --for 1` kept running");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(timed.0.wait().unwrap().success());
+}
+
+/// An account another agent-meter is reading is left to it rather than asked
+/// of the provider a second time, and read as usual once it is free.
+#[test]
+fn an_account_being_read_elsewhere_is_not_read_twice() {
+    let fixture = Fixture::new();
+    for (email, uuid, refresh) in [
+        ("one@example.com", "uuid-1", "one"),
+        ("two@example.com", "uuid-2", "two"),
+    ] {
+        fixture.sign_in_claude(email, uuid, refresh);
+        fixture.run(&["import", "claude"]);
+    }
+    // Offline, every reading fails, and the failure recorded, with when, is
+    // the mark of a reading asked for.
+    let failed_at = || {
+        let rows: Vec<Value> = serde_json::from_str(&fixture.run(&["list", "--refresh", "--json"])).unwrap();
+        let at = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap()["errorAt"].clone();
+        (at("claude-1"), at("claude-2"))
+    };
+    let before = failed_at();
+    assert_ne!(before.0, Value::Null, "{before:?}");
+
+    // Held as a reading process holds it.
+    let claim = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fixture.data.join("accounts").join("claude-1.reading.lock"))
+        .unwrap();
+    claim.try_lock().unwrap();
+    let held = failed_at();
+    assert_eq!(held.0, before.0, "left to the one reading it");
+    assert_ne!(held.1, before.1, "the other is read");
+
+    drop(claim);
+    assert_ne!(failed_at().0, before.0, "read once it is free");
 }
 
 /// A weekly window says how far ahead of an even pace through the week it has

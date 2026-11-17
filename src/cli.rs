@@ -558,6 +558,14 @@ struct WatchArgs {
     /// Report what would happen without changing anything
     #[arg(long)]
     dry_run: bool,
+    /// Stop after this many seconds, for something that runs the watcher
+    /// over and over and must not leave one behind
+    #[arg(long = "for", value_name = "SECS")]
+    for_secs: Option<u64>,
+    /// Switch only the agents whose switching is turned on, as the terminal
+    /// UI does, rather than every agent not turned off
+    #[arg(long)]
+    only_switched_on: bool,
 }
 
 #[derive(Args, Debug)]
@@ -693,6 +701,7 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
                     .map(|(index, (id, role))| (id, (index + 1, role)))
             })
             .collect();
+        let watched = engine.store().is_watched()?;
         let rows: Vec<_> = statuses
             .iter()
             .map(|s| {
@@ -701,6 +710,12 @@ fn list(engine: &Engine, args: &ListArgs) -> Result<ExitCode> {
                 // The mark this account is left at: its provider's own, else
                 // the one every agent shares.
                 row["threshold"] = json!(engine.config().threshold_for(s.account.provider));
+                // Whether its provider is switched automatically, and whether
+                // anything on this machine is running to do it.
+                row["switching"] = json!({
+                    "on": engine.config().is_switching_on(s.account.provider),
+                    "watched": watched,
+                });
                 row
             })
             .collect();
@@ -1694,11 +1709,24 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
     let store = engine.store().clone();
     let mut settings_read = settings_file(&store);
     let mut engine = watch_engine(&store, args)?;
+    // One watcher checks at a time on a machine, so the providers are asked
+    // once however many are running; the rest stand by. A dry run changes
+    // nothing and takes no part.
+    let mut watching = store.watching();
+    let mut watches = || args.dry_run || watching.keep();
 
     if args.once {
-        let outcomes = tick_and_share(&engine, args.dry_run)?;
+        if !watches() {
+            println!("{STANDING_BY}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        let outcomes = tick_and_share(&engine, args)?;
         return Ok(exit_code_for(&outcomes));
     }
+    let deadline = args
+        .for_secs
+        .map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
+    let over = || deadline.is_some_and(|at| std::time::Instant::now() >= at);
 
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
@@ -1711,15 +1739,33 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         engine.config().watch.threshold
     );
     let mut unreadable: Option<String> = None;
-    while running.load(Ordering::SeqCst) {
+    let mut standing_by = false;
+    while running.load(Ordering::SeqCst) && !over() {
         let interval = Duration::from_secs(engine.config().watch.poll_secs);
-        let sleep_for = match tick_and_share(&engine, args.dry_run) {
-            Ok(outcomes) => wait_after(&outcomes, &engine, interval),
-            Err(error) => {
-                // A failed check should not end the watch: the provider may be
-                // briefly unreachable, and the next tick will try again.
-                eprintln!("{} check failed: {error}", Timestamp::now());
-                interval
+        let sleep_for = if !watches() {
+            // Asking costs nothing, so it is asked often, and a watcher that
+            // stops is taken over within seconds rather than an interval.
+            if !standing_by {
+                println!("{} {STANDING_BY}", Timestamp::now());
+                standing_by = true;
+            }
+            interval.min(STANDBY_RETRY)
+        } else {
+            if standing_by {
+                println!(
+                    "{} The other watcher stopped; watching from here.",
+                    Timestamp::now()
+                );
+                standing_by = false;
+            }
+            match tick_and_share(&engine, args) {
+                Ok(outcomes) => wait_after(&outcomes, &engine, interval),
+                Err(error) => {
+                    // A failed check should not end the watch: the provider may be
+                    // briefly unreachable, and the next tick will try again.
+                    eprintln!("{} check failed: {error}", Timestamp::now());
+                    interval
+                }
             }
         };
         // Wake often enough to notice Ctrl-C promptly, and a change to the
@@ -1731,7 +1777,7 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         // that instant it would read as no settings at all: the defaults.
         let mut waited = Duration::ZERO;
         let mut last_seen = settings_read.clone();
-        while running.load(Ordering::SeqCst) && waited < sleep_for {
+        while running.load(Ordering::SeqCst) && waited < sleep_for && !over() {
             let seen = settings_file(&store);
             if seen != settings_read && seen == last_seen {
                 break;
@@ -1740,7 +1786,7 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
             std::thread::sleep(Duration::from_millis(200));
             waited += Duration::from_millis(200);
         }
-        if !running.load(Ordering::SeqCst) {
+        if !running.load(Ordering::SeqCst) || over() {
             break;
         }
 
@@ -1797,17 +1843,17 @@ fn settings_file(store: &crate::store::Store) -> Option<Vec<u8>> {
 /// they do not have, and the account they hand out next would be the spent
 /// one. Only a check that actually changed a credential is worth an ssh
 /// connection, so the credentials are fingerprinted either side of it.
-fn tick_and_share(engine: &Engine, dry_run: bool) -> Result<Vec<TickOutcome>> {
+fn tick_and_share(engine: &Engine, args: &WatchArgs) -> Result<Vec<TickOutcome>> {
     let automatic = engine
         .config()
         .remote
         .values()
         .any(crate::config::RemoteConfig::is_automatic);
-    let before = (automatic && !dry_run)
+    let before = (automatic && !args.dry_run)
         .then(|| engine.credential_mark())
         .transpose()?;
 
-    let outcomes = run_tick(engine, dry_run)?;
+    let outcomes = run_tick(engine, args)?;
 
     if let Some(before) = before
         && engine.credential_mark()? != before
@@ -1851,9 +1897,18 @@ fn wait_after(outcomes: &[TickOutcome], engine: &Engine, interval: Duration) -> 
     }
 }
 
-fn run_tick(engine: &Engine, dry_run: bool) -> Result<Vec<TickOutcome>> {
+/// How often a watcher standing by asks whether the one watching has stopped.
+const STANDBY_RETRY: Duration = Duration::from_secs(5);
+
+/// What a watcher standing by says, once.
+const STANDING_BY: &str = "Another agent-meter is watching on this machine, so the checks are left to it.";
+
+fn run_tick(engine: &Engine, args: &WatchArgs) -> Result<Vec<TickOutcome>> {
+    let dry_run = args.dry_run;
     let outcomes = if dry_run {
         engine.dry_tick()?
+    } else if args.only_switched_on {
+        engine.tick_switching_on()?
     } else {
         engine.tick()?
     };

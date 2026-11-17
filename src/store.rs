@@ -7,6 +7,10 @@
 //! usage.json             cached usage readings
 //! state.json             last-switch bookkeeping
 //! store.lock             advisory lock held across mutations
+//! accounts/<id>.lock     held while an account's credential is changed
+//! accounts/<id>.reading.lock  held while an account's usage is read
+//! watch.lock             held by the one watcher on this machine
+//! watch-look.lock        taken to look at watch.lock, one look at a time
 //! ```
 //! Account files are written with owner-only permissions, but they are not
 //! encrypted: the agent CLIs keep the same tokens in plain files next door, so
@@ -29,6 +33,32 @@ use crate::usage::Usage;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Guards against a runaway file; real records are a few kilobytes.
 const MAX_ACCOUNT_BYTES: u64 = 256 * 1024;
+
+/// How long a watcher waits for `watch.lock` before standing by. A look at
+/// whether anything is watching holds it for an instant, and a watcher should
+/// wait that out rather than stand by for a whole interval.
+const WATCH_WAIT: Duration = Duration::from_millis(300);
+
+/// The right to watch on this machine. See [`Store::watching`].
+#[derive(Debug)]
+pub struct Watching {
+    path: PathBuf,
+    held: Option<FileLock>,
+}
+
+impl Watching {
+    /// Whether this process is the one watching: takes the watch if no other
+    /// watcher here has it, and keeps it once it has.
+    ///
+    /// Asked before every check, so a watcher standing by takes over at its
+    /// next check once the one watching stops, however that one stopped.
+    pub fn keep(&mut self) -> bool {
+        if self.held.is_none() {
+            self.held = FileLock::acquire(&self.path, WATCH_WAIT).ok();
+        }
+        self.held.is_some()
+    }
+}
 
 /// Handle on agent-meter's data directory.
 #[derive(Debug, Clone)]
@@ -69,11 +99,46 @@ impl Store {
         FileLock::acquire(&self.dir.join("store.lock"), LOCK_TIMEOUT)
     }
 
+    /// The right to watch, for a process that switches accounts on its own:
+    /// `watch`, the terminal UI, or the Herdr app's watcher. One of them
+    /// checks at a time; the others stand by, so the providers are asked once
+    /// however many are open. Taken by [`Watching::keep`].
+    pub fn watching(&self) -> Watching {
+        Watching {
+            path: self.dir.join("watch.lock"),
+            held: None,
+        }
+    }
+
+    /// Whether anything on this machine is switching accounts on its own,
+    /// so that switching set to automatic actually happens.
+    ///
+    /// The one watching holds `watch.lock` for as long as it runs, and the
+    /// operating system lets go of it when the process ends, however it ends,
+    /// so a watcher that crashed is not reported as running. Looks are taken
+    /// one at a time: two at once would each find the lock held, by the other.
+    pub fn is_watched(&self) -> Result<bool> {
+        let _turn = FileLock::acquire(&self.dir.join("watch-look.lock"), LOCK_TIMEOUT)?;
+        Ok(FileLock::try_acquire(&self.dir.join("watch.lock"))?.is_none())
+    }
+
     /// Takes a lock covering one account, for work that must not be done twice
     /// at once but should not stop unrelated accounts from being read.
     pub fn lock_account(&self, id: &str) -> Result<FileLock> {
         validate_id(id)?;
         FileLock::acquire(&self.accounts_dir().join(format!("{id}.lock")), LOCK_TIMEOUT)
+    }
+
+    /// Claims the reading of one account's usage, or `None` while another
+    /// agent-meter is reading it: what that one finds is recorded for both,
+    /// and asking the provider twice spends its budget for nothing. Held from
+    /// before the reading is asked for until it is recorded.
+    ///
+    /// Apart from [`Self::lock_account`], which a reading takes itself when it
+    /// renews the account's credential.
+    pub fn claim_reading(&self, id: &str) -> Result<Option<FileLock>> {
+        validate_id(id)?;
+        FileLock::try_acquire(&self.accounts_dir().join(format!("{id}.reading.lock")))
     }
 
     /// Loads every account, sorted by provider then id.
@@ -164,7 +229,9 @@ impl Store {
         fsutil::remove_file_if_exists(&path).with_context(|| format!("removing {}", path.display()))?;
         // The per-account lock file outlives the account otherwise. A lock held
         // right now keeps the file open, so treat failure as nothing to do.
-        let _ = fsutil::remove_file_if_exists(&self.accounts_dir().join(format!("{id}.lock")));
+        for lock in [format!("{id}.lock"), format!("{id}.reading.lock")] {
+            let _ = fsutil::remove_file_if_exists(&self.accounts_dir().join(lock));
+        }
         if existed {
             let mut usage = self.usage_cache()?;
             if usage.entries.remove(id).is_some() {
@@ -498,6 +565,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn one_watcher_watches_at_a_time_and_another_takes_over() {
+        let (_dir, store) = store();
+        assert!(!store.is_watched().unwrap());
+        let (mut first, mut second) = (store.watching(), store.watching());
+        assert!(first.keep(), "the first to ask watches");
+        assert!(!second.keep(), "the second stands by");
+        assert!(store.is_watched().unwrap());
+        assert!(first.keep(), "looking does not take the watch away");
+        drop(first);
+        assert!(
+            !store.is_watched().unwrap(),
+            "nothing is watching until the next asks"
+        );
+        assert!(second.keep(), "and then it takes over");
+        assert!(store.is_watched().unwrap());
+        drop(second);
+        assert!(!store.is_watched().unwrap());
+    }
+
+    #[test]
+    fn an_account_is_read_by_one_process_at_a_time() {
+        let (_dir, store) = store();
+        let claim = store.claim_reading("claude-1").unwrap();
+        assert!(claim.is_some());
+        assert!(store.claim_reading("claude-1").unwrap().is_none());
+        assert!(
+            store.claim_reading("claude-2").unwrap().is_some(),
+            "others are not held up"
+        );
+        drop(claim);
+        assert!(store.claim_reading("claude-1").unwrap().is_some());
     }
 
     #[test]

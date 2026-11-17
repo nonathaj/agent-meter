@@ -76,12 +76,20 @@ impl Worker {
         let handle = thread::Builder::new()
             .name("agent-meter-worker".into())
             .spawn(move || {
+                // The interface switches accounts on its own while it is
+                // open, as `watch` does, and like any watcher it leaves the
+                // checks to one already watching on this machine.
+                let mut watching = store.watching();
                 // Each job re-opens the engine so a configuration change made
                 // elsewhere takes effect without restarting the interface.
                 while let Ok(job) = job_rx.recv() {
-                    let outcome = Engine::with_store(store.clone())
-                        .and_then(|engine| run_job(&engine, &job))
-                        .map_err(|e| format!("{e:#}"));
+                    let outcome = if job == Job::Tick && !watching.keep() {
+                        Ok(String::new())
+                    } else {
+                        Engine::with_store(store.clone())
+                            .and_then(|engine| run_job(&engine, &job))
+                            .map_err(|e| format!("{e:#}"))
+                    };
                     if outcome_tx.send(outcome).is_err() {
                         break;
                     }
@@ -202,7 +210,7 @@ fn run_job(engine: &Engine, job: &Job) -> Result<String> {
             Ok(format!("{id} is taken into switching again"))
         }
         Job::Tick => {
-            let outcomes = engine.tick()?;
+            let outcomes = engine.tick_switching_on()?;
             let notes: Vec<_> = outcomes
                 .iter()
                 .filter_map(|o| {

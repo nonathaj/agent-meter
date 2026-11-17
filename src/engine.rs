@@ -1008,8 +1008,29 @@ impl Engine {
             (due, active_ids)
         };
 
+        // Each reading is claimed before it is asked for, and the claim kept
+        // until what it found is recorded: another agent-meter reading the
+        // same account skips it, and one that looks after it finds the reading
+        // already there. Without it, a watcher and the terminal UI that both
+        // found an account due would each ask the provider.
+        let mut claims = Vec::new();
         let polled: Vec<_> = due
             .iter()
+            .filter(|(account, _)| {
+                let Ok(Some(claim)) = self.store.claim_reading(&account.id) else {
+                    return false;
+                };
+                // Whoever held the claim before may have just recorded one.
+                let still_due = force
+                    || self
+                        .store
+                        .usage_cache()
+                        .is_ok_and(|cache| self.is_poll_due(&cache, account, Timestamp::now()));
+                if still_due {
+                    claims.push(claim);
+                }
+                still_due
+            })
             .map(|(account, previous)| {
                 let active = active_ids.contains(&account.id);
                 let outcome = self.poll_one(account, active).map(|(credential, usage)| {
@@ -1303,22 +1324,29 @@ impl Engine {
 
     /// Runs one watcher tick: poll what is due, then act on the policy.
     pub fn tick(&self) -> Result<Vec<TickOutcome>> {
-        self.run_tick(true)
+        self.run_tick(true, Config::is_enabled)
+    }
+
+    /// A tick as an interface runs it: switching only the providers somebody
+    /// turned switching on for, which are the ones it shows as automatic.
+    /// A provider never set is shown as switched by hand, and is left so.
+    pub fn tick_switching_on(&self) -> Result<Vec<TickOutcome>> {
+        self.run_tick(true, Config::is_switching_on)
     }
 
     /// Evaluates a tick without switching anything.
     pub fn dry_tick(&self) -> Result<Vec<TickOutcome>> {
-        self.run_tick(false)
+        self.run_tick(false, Config::is_enabled)
     }
 
-    fn run_tick(&self, act: bool) -> Result<Vec<TickOutcome>> {
+    fn run_tick(&self, act: bool, managed: fn(&Config, ProviderKind) -> bool) -> Result<Vec<TickOutcome>> {
         self.poll(&[], false)?;
         let statuses = self.status()?;
         let now = Timestamp::now();
         let mut outcomes = Vec::new();
 
         for kind in ProviderKind::ALL {
-            if !self.config.is_enabled(kind) {
+            if !managed(&self.config, kind) {
                 continue;
             }
             if crate::fleet::Fleet::load(&self.store)?

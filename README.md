@@ -190,7 +190,7 @@ next machine that still has it. Remove it on each.
 | `agent-meter spend-reset <account>` | Spends one of an account's [limit resets](#limit-resets), after saying what it refills and asking. `--grant <id>` picks which; `--yes` skips the question; `--dry-run` says what each would do and spends none; `--json` with either. |
 | `agent-meter disable <account>` | Leaves an account out of automatic switching until `enable`, or `--for 5h` (`90m`, `2d`, `1w`). See [Accounts to leave alone](#accounts-to-leave-alone). |
 | `agent-meter enable <account>` | Takes a disabled account into automatic switching again. |
-| `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`. |
+| `agent-meter watch` | Polls usage and switches accounts as limits approach. `--once`, `--dry-run`, `--for <secs>`, `--only-switched-on`. One watcher checks at a time on a machine; [see below](#one-watcher-at-a-time). |
 | `agent-meter tui` | The same operations in a full-screen interface. |
 | `agent-meter config` | Reads and changes settings: `show [--json]`, `set`, `unset`, `path`. |
 | `agent-meter history` | The latest switches between accounts, who made them and why. `-n`, `--json`. |
@@ -301,7 +301,9 @@ Each account also carries `queue`: its `position` in its provider's switching
 order, counted from 1, and its `role` there — `in_use`, `next_up` (where a
 switch would go), `queued`, or `unusable` (spent, without a recent reading,
 needing a login, or disabled). It is the ranking `watch` switches on, in the order the
-terminal UI lists accounts. Weekly windows carry `pace.aheadPercent`: how many
+terminal UI lists accounts. The unusable ones come in the order they would come
+back: those held back only by an old reading, or spent, ranked on what they last
+said, then those with no reading, then those needing a login or disabled. Weekly windows carry `pace.aheadPercent`: how many
 points more of the week is spent than an even pace through it would have spent,
 `usedPercent − 100 × elapsed / windowSeconds`, or `null` when the window is not
 ahead or nothing dates it. Five-hour windows are a rate rather than a budget and
@@ -312,7 +314,12 @@ terminal UI point such a copy out, and `agent-meter remove` forgets it.
 otherwise says `until` when it is left out, `null` for until it is enabled
 again. A disabled account's `role` is `unusable`, except for the one in use.
 `threshold` is the mark the account is left at: its provider's own, else the
-one every agent shares. New fields are only ever added at the end of an object.
+one every agent shares. `switching` says whether its provider is switched
+automatically (`on`, which is the setting turned on; never set reads as off, as
+every screen shows it, though `watch` takes it as on), and whether anything on
+this machine is running to do it (`watched`: an `agent-meter watch` or a
+terminal UI is open). Switching is only automatic while something is. New fields
+are only ever added at the end of an object.
 
 `agent-meter history --json` lists the latest switches, oldest first, however
 they were made: each has `at`, `provider`, `from` (absent where no stored
@@ -520,7 +527,7 @@ agent-meter config unset provider.codex.threshold   # back to the shared one
 | `watch.cooldown-secs` | `300` | Minimum gap between automatic switches. |
 | `watch.wait-for-reset` | `true` | With every account spent, wait for the first to come back rather than exit. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
-| `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. |
+| `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. The terminal UI, the Herdr app and `watch --only-switched-on` manage it only once it is set to `true`. |
 | `provider.<name>.ignored-models` | — | Models whose own limits are left out of judging an account, such as `GPT-5.3-Codex-Spark`. See [Models you never use](#models-you-never-use). |
 | `account.<id>.disabled` | `false` | Never switch to this account automatically. See [Accounts to leave alone](#accounts-to-leave-alone). |
 | `account.<id>.disabled-until` | — | The same, until this moment, such as `2026-11-15T09:00:00Z`. |
@@ -557,6 +564,22 @@ interval that should already have replaced it, which usually means no watcher is
 running. Saying "just now" on every row would spend a column on the ordinary
 case.
 
+### One watcher at a time
+
+However many watchers are running on a machine — `agent-meter watch` in two
+terminals, the terminal UI, the [Herdr app](#in-the-herdr-app) — one of them
+does the checking, and the providers are asked once. The others stand by, and
+one takes over within seconds of the watcher stopping, however it stopped. A
+`watch --once` with a watcher already running leaves the check to it, and a
+`--dry-run` changes nothing, so it takes no part.
+
+Each account is also read by one process at a time: a `list --refresh`, or the
+terminal UI reading on its own, leaves an account another agent-meter is reading
+to that one, and uses what it finds.
+
+Each machine runs its own watcher, since each switches the CLIs signed in
+there.
+
 ## In the Herdr app
 
 ```sh
@@ -573,14 +596,21 @@ puts agent-meter in the [Herdr](https://herdr.dev) desktop app:
   its limits and when it resets. Click an account to use it, spend a limit
   reset, or leave it out of switching for 5 hours or until taken back. The
   gear opens the same settings as the terminal UI's panel.
+- **Each agent says how it switches:** *Auto-switch*, *Manual*, or
+  *Auto-switch · not running* where switching is on but nothing is watching to
+  do it. Click it to turn automatic switching on or off.
 - **A switch is announced** with a notice saying where it went and why,
   whoever made it.
+
+**While Herdr is open it is the watcher,** so readings stay fresh and switching
+happens with nothing else to start. It switches only the agents whose switching
+is turned on, as the terminal UI does, and runs `agent-meter watch` nine minutes
+at a time, so nothing is left running for long once Herdr is gone.
 
 The mod comes from this binary and runs it, so the two always match: run the
 install again after `agent-meter update`. Everything it shows comes from
 `list --json`, `history --json` and `config show --json`, and every change goes
-through the commands above. It never polls a provider itself; leave
-`agent-meter watch` running for fresh readings and automatic switching.
+through the commands above.
 
 Herdr's own layouts can't be changed, so where the layout shown is one of
 Herdr's, the footer rows need a personal copy of it, which no longer receives
@@ -667,7 +697,7 @@ stored account would be one failed refresh away from needing a manual login.
   to meter.
 - Only subscription (OAuth) accounts are managed.
 - `watch` runs in the foreground. Use your platform's service manager if you want
-  it running all the time.
+  it running all the time, or leave the [Herdr app](#in-the-herdr-app) open.
 - `sync` never removes anything, so an account removed on one machine returns
   from the next one that still holds it.
 

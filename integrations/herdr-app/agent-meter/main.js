@@ -8,7 +8,8 @@
 // Everything comes from agent-meter's own commands (`list --json`,
 // `history --json`, `config show --json`, `spend-reset --dry-run --json`), and
 // every change goes through the commands a person would type. Nothing here
-// asks a provider anything: polling stays with `agent-meter watch`.
+// asks a provider anything itself: the footer runs `agent-meter watch`, which
+// does, and switches the agents whose switching is turned on.
 //
 // Installed by `agent-meter herdr install`, which points AGENT_METER at
 // itself. Edits here are overwritten by the next install.
@@ -92,6 +93,7 @@ export default class AgentMeter extends View {
     if (p.dialog === "spend") { this.readOffers(cx, p.id); return; }
     this.refresh(cx);
     if (!p.compact) this.readSettings(cx);
+    if (p.compact) this.keepWatching(cx);
     cx.timer.every(30000, (cx) => this.refresh(cx));
     // Every switch and reading lands in agent-meter's own folder: follow it.
     cx.spawn(async (cx) => {
@@ -102,6 +104,26 @@ export default class AgentMeter extends View {
         await watchFolder(where);
         this.refresh(cx);
         if (!props()?.compact) this.readSettings(cx);
+      }
+    });
+  }
+
+  // agent-meter's watcher, for as long as Herdr is open: it reads usage and
+  // switches the agents whose switching is turned on. A program can run for
+  // at most 10 minutes here, so it runs for 9 and is started again; and if
+  // Herdr goes, the last one ends by itself within those 9. One watcher
+  // checks at a time on a machine, so with several windows, or a watcher
+  // started elsewhere, the rest stand by and the providers are asked once.
+  keepWatching(cx) {
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const started = Date.now();
+        try {
+          await exec(AGENT_METER, ["watch", "--only-switched-on", "--for", "540"], { timeout: 600000 });
+        } catch {
+          // It could not start, or overran: try again, but not in a spin.
+        }
+        if (Date.now() - started < 60000) await cx.sleep(60000);
       }
     });
   }
@@ -257,7 +279,11 @@ export default class AgentMeter extends View {
       const resets = a.usage?.limitResets;
       const on = a.active ? live.filter(x => prov.app.includes(x.app ?? "")) : [];
       const windows = a.usage?.windows ?? [];
+      // Older than agent-meter trusts for a switch (half an hour): it goes by
+      // these figures only once it has read them again.
+      const age = a.usage?.observedAt ? now - Date.parse(a.usage.observedAt) : 0;
       const notes = [
+        age > 30 * 60000 ? `read ${span(age)} ago` : null,
         resets?.available ? `${resets.available} limit reset${resets.available === 1 ? "" : "s"}${resets.nextExpiresAt ? `, the first expires ${day(resets.nextExpiresAt)}` : ""}` : null,
         a.disabled ? (a.disabled.until ? `left out of switching for ${span(Date.parse(a.disabled.until) - now)}` : "left out of switching") : null,
         a.needsLogin ? "needs signing in again" : null,
@@ -265,12 +291,16 @@ export default class AgentMeter extends View {
       return v_flex().id(`am-${a.id}`).px(10).py(7).gap(4).flex_none().rounded(8)
         .when(a.active, el => el.bg(t.selected))
         .cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click(() => this.openMenu(a, "pointer"))
+        // Opened where it was pressed. Herdr's own idea of the pointer is not
+        // kept up over a dialog, and puts the menu where the dialog was opened from.
+        .on_mouse_down("left", (e) => { this.pressedAt = e.position; })
+        .on_click(() => this.openMenu(a, this.pressedAt ?? "pointer"))
         .child(h_flex().h(20).gap(8).items_center()
           .child(div().flex_none().max_w(230).truncate().text_color(a.active ? t.foreground : t.muted).font_medium().child(who(a)))
           .when(Boolean(plan(a)), el => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(plan(a))))
           .when(a.active, el => el.child(div().flex_none().px(6).h(17).rounded(5).bg(t.accent + "2e").text_size(10.5).font_semibold().text_color(t.accent).flex().items_center().child("In use")))
-          .when(a.queue?.role === "next_up", el => el.child(div().flex_none().px(6).h(17).rounded(5).border(1).border_color(t.border).text_size(10.5).font_medium().text_color(t.muted).flex().items_center()
+          // Only where something is choosing: switched by hand, it is just an order.
+          .when(a.queue?.role === "next_up" && a.switching?.on, el => el.child(div().flex_none().px(6).h(17).rounded(5).border(1).border_color(t.border).text_size(10.5).font_medium().text_color(t.muted).flex().items_center()
             .tooltip("Where agent-meter switches when this provider's account fills up").child("Next up")))
           .child(div().flex_1())
           .when(on.length > 0, el => el.child(h_flex().flex_none().gap(3).items_center().text_size(11).text_color(t.dim)
@@ -294,6 +324,7 @@ export default class AgentMeter extends View {
         h_flex().id(`am-h-${prov.key}`).px(10).pt(12).pb(4).flex_none().gap(7).items_center().text_size(11.5).font_medium()
           .child(image(prov.icon).w(14).h(14))
           .child(div().text_color(t.muted).child(prov.name))
+          .child(this.switchingPill(t, prov, mine[0].switching, mark))
           .child(div().flex_1())
           .child(div().text_color(t.dim).child(`${room} of ${mine.length} below ${mark}%`)),
         ...mine.map(a => row(prov, a)),
@@ -320,6 +351,28 @@ export default class AgentMeter extends View {
         .child("No accounts yet. Run `agent-meter import` to store the one you are signed in to.")))
       .when(settings, el => el.child(this.settingsView(t)))
       .when(!settings, el => el.child(v_flex().id("am-list").flex_1().min_h(0).px(8).pb(10).overflow_y_scrollbar().children(PROVIDERS.flatMap(group))));
+  }
+
+  // Whether a provider is switched for you or by hand, and, when it is meant to
+  // be automatic, whether anything is running to do it: only `agent-meter
+  // watch` or its terminal UI switch, so with neither open nothing does.
+  // Clicking it turns automatic switching on or off for that provider.
+  switchingPill(t, prov, switching, mark) {
+    if (!switching) return div();
+    const c = this.colors(t);
+    const auto = switching.on;
+    const running = auto && switching.watched;
+    const [text, dot, tip] = !auto
+      ? ["Manual", null, `agent-meter leaves ${prov.name} on the account you chose.\nClick to switch automatically at ${mark}%.`]
+      : running
+        ? ["Auto-switch", c.ok, `agent-meter moves ${prov.name} to the next account here when the one in use reaches ${mark}%.\nClick to switch only by hand.`]
+        : ["Auto-switch · not running", c.warn, `Switching is automatic, but nothing on this computer is watching, so no switch will happen.\nRun agent-meter watch, or open agent-meter in a terminal, to start.\nClick to switch only by hand.`];
+    return h_flex().id(`am-sw-${prov.key}`).flex_none().h(20).px(7).gap(5).items_center().rounded(10).border(1)
+      .border_color(running ? c.ok : t.border).text_size(11).font_medium().text_color(running ? t.foreground : t.muted)
+      .cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
+      .on_click((_e, cx) => this.change(cx, ["set", `provider.${prov.key}.enabled`, String(!auto)]))
+      .child(div().size(6).rounded_full().when(Boolean(dot), el => el.bg(dot)).when(!dot, el => el.border(1).border_color(t.muted)))
+      .child(text);
   }
 
   // agent-meter's settings, as `config show --json` lists them: those every

@@ -446,10 +446,31 @@ pub fn queue_roles<'a>(
             (c.id, role)
         }))
         .collect();
-    // Whatever the ranking had no place for still belongs on screen, after it.
-    let rest = candidates
-        .iter()
-        .filter(|c| !ranked.iter().any(|(id, _)| *id == c.id))
+    // Whatever the ranking had no place for still belongs on screen, after it,
+    // and in the order it would come back. An account held back only by an
+    // old reading, or by being spent, is ranked the same way on what it last
+    // said: with nothing watching, every reading goes old, and the order they
+    // were last in is the best guess at the order a fresh look would find.
+    // Then those that say nothing, which a reading may yet make usable; then
+    // those nothing but a login or the person can.
+    let unranked = || {
+        candidates
+            .iter()
+            .filter(|c| !ranked.iter().any(|(id, _)| *id == c.id))
+    };
+    let said = |c: &Candidate<'a>| c.usage.filter(|usage| !usage.states_nothing_at(now));
+    let mut known: Vec<(&Candidate<'_>, &Usage)> = unranked()
+        .filter(|c| c.usable)
+        .filter_map(|c| Some((c, said(c)?)))
+        .collect();
+    rank(&mut known, rules, now, &remaining);
+    let silent = unranked().filter(|c| c.usable && said(c).is_none());
+    let barred = unranked().filter(|c| !c.usable);
+    let rest = known
+        .into_iter()
+        .map(|(c, _)| c)
+        .chain(silent)
+        .chain(barred)
         .map(|c| (c.id, Role::Unusable));
     ranked.iter().copied().chain(rest).collect()
 }
@@ -1426,10 +1447,13 @@ mod tests {
                 ("claude-3", Role::InUse),
                 ("claude-4", Role::NextUp),
                 ("claude-2", Role::Queued),
-                ("claude-1", Role::Unusable),
+                // Ranked on what they last said: the old reading with room
+                // before the spent one.
                 ("claude-5", Role::Unusable),
-                ("claude-6", Role::Unusable),
+                ("claude-1", Role::Unusable),
+                // Then one a reading may make usable, then one only a login can.
                 ("claude-7", Role::Unusable),
+                ("claude-6", Role::Unusable),
             ]
         );
         let decision = decide(&candidates, &Rules::default(), now());
@@ -1451,6 +1475,37 @@ mod tests {
         assert_eq!(
             queue_roles(&idle, &Rules::default(), now()),
             [("claude-2", Role::NextUp), ("claude-1", Role::Queued)]
+        );
+    }
+
+    /// With nothing watching, every reading goes old and none is switched to.
+    /// The list still has to read in the order a fresh look would take them,
+    /// not in the order they were added: the empty account before the nearly
+    /// full one.
+    #[test]
+    fn old_readings_keep_their_order() {
+        let age = 4 * 3600;
+        let (in_use, half, full, empty) = (
+            usage_aged(12.0, age),
+            usage_aged(50.0, age),
+            usage_aged(98.0, age),
+            usage_aged(0.0, age),
+        );
+        let candidates = [
+            candidate("claude-1", Some(&full), false),
+            candidate("claude-2", Some(&half), false),
+            candidate("claude-3", None, false),
+            candidate("claude-4", Some(&empty), false),
+            candidate("claude-7", Some(&in_use), true),
+        ];
+        let roles = queue_roles(&candidates, &Rules::default(), now());
+        assert_eq!(
+            roles.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ["claude-7", "claude-4", "claude-2", "claude-1", "claude-3"]
+        );
+        assert!(
+            roles[1..].iter().all(|(_, role)| *role == Role::Unusable),
+            "none is switched to on figures this old: {roles:?}"
         );
     }
 

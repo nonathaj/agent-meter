@@ -383,7 +383,14 @@ fn limits(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
                 .collect();
             lines.extend(resets_line(usage, now, width));
             if let Some(error) = error {
-                lines.push(note("! not refreshed", error, Color::Yellow, width));
+                // Why it is not next up however good its figures look: they
+                // are from before the reads stopped.
+                let said = if status.active {
+                    error.clone()
+                } else {
+                    format!("{error} · not switched to until it reads again")
+                };
+                lines.push(note("! not refreshed", &said, Color::Yellow, width));
             }
             lines
         }
@@ -1773,6 +1780,30 @@ mod tests {
         assert!(first.contains("next up"), "{screen}");
         assert_eq!(screen.matches("next up").count(), 1, "{screen}");
         assert!(screen.contains("signed out"), "{screen}");
+    }
+
+    /// An account whose reads are being refused says why it is not next up
+    /// however good its last figures look; the one in use only says it was
+    /// not refreshed, since it is not waiting to be switched to.
+    #[test]
+    fn an_account_that_cannot_be_read_says_it_will_not_be_switched_to() {
+        let mut statuses = crate::tui::app::sample_statuses(2);
+        for status in &mut statuses {
+            status.usage = Some(usage(vec![window(FIVE_HOURS, None, 40.0, 3600)]));
+            status.error = Some("rate limited by the provider".into());
+        }
+        let mut app = App::for_tests(statuses);
+        let screen = render(&mut app, 160, 30);
+        assert_eq!(
+            screen.matches("not switched to until it reads again").count(),
+            1,
+            "{screen}"
+        );
+        assert_eq!(
+            screen.matches("rate limited by the provider").count(),
+            2,
+            "{screen}"
+        );
     }
 
     /// After a switch the watcher holds off for a while. The wait is on

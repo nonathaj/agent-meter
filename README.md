@@ -423,6 +423,13 @@ left alone instead: the provider rotates refresh tokens, so writing over a login
 only the CLI holds would lose it. `agent-meter import <provider>` (`i` in the
 terminal UI) takes it in, and from then on it is switched like any other.
 
+An account whose last read failed — most often because the provider is
+refusing reads for a while — is never switched to, however good its last
+figures look: they are from before the reads stopped, and the account most
+likely to be refused is the one that was just in use. It is taken again as soon
+as it reads. The account in use is still judged on its last reading, which is
+the best there is to go on.
+
 An account is compared on its *tightest* window, so one at 20% of its five-hour
 limit but 98% of its weekly one counts as 98% full. That includes the limits a
 provider sets on one model, such as Claude's `weekly Fable` or Codex's
@@ -576,6 +583,13 @@ lowering it cannot speed any provider past its own rate.
 | **Codex** | every minute | Its own CLI reads that endpoint about once a minute per running session, so this is traffic your machine already makes. |
 | **Claude** | every 5 minutes | Anthropic tolerates roughly 30 requests an hour per account, and going past it does not cost one skipped reading — the endpoint stays saturated for about an hour, which is an hour with nothing to switch on. |
 | a new provider | the slow rate | Guessing slow costs a stale figure; guessing fast can cost that hour. |
+
+That budget is the account's, not `agent-meter`'s. Anything else that reads the
+same endpoint with the account's token — a status line script, another usage
+monitor, or `agent-meter` on another machine — spends it too, and the account in
+use is the one they all read. One that reads it every minute is enough to have
+it refused for most of the hour: a status line can read `agent-meter list --json`
+instead, which costs the provider nothing.
 
 Plan and quota size are on a slower clock again: they change when you change plan
 or move organisation, not as you work, so they are re-read every six hours and

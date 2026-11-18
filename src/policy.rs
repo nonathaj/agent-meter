@@ -21,6 +21,12 @@ pub struct Candidate<'a> {
     /// How large this account's quota is relative to the base tier, when the
     /// provider says. See [`weights`] for what it changes.
     pub capacity: Option<u32>,
+    /// The last attempt to read it failed — the provider refused, say — so
+    /// its reading is what it was, not what it is. Such an account is never
+    /// switched to: one that was in use until the reads stopped may well be
+    /// at its limit while its last reading says otherwise. The account in use
+    /// is still judged on it, which is the best there is to go on.
+    pub read_failed: bool,
 }
 
 /// What moving to another account costs the person using it.
@@ -580,6 +586,9 @@ fn weight(candidate: &Candidate<'_>, weighted: bool) -> f64 {
 
 /// The candidate's reading, if it is recent enough to act on.
 fn fresh<'a>(candidate: &Candidate<'a>, rules: &Rules, now: Timestamp) -> Option<&'a Usage> {
+    if candidate.read_failed {
+        return None;
+    }
     candidate
         .usage
         .filter(|usage| usage.age_secs(now) <= rules.max_reading_age_secs)
@@ -625,6 +634,7 @@ mod tests {
             active,
             usable: true,
             capacity: None,
+            read_failed: false,
         }
     }
 
@@ -1040,6 +1050,49 @@ mod tests {
             queue_roles(&candidates, &seamless(), now())[0],
             ("claude-2", Role::NextUp)
         );
+    }
+
+    /// An account the provider stopped answering for is not switched to on
+    /// what it said before. It was the one in use until the reads were
+    /// refused at 89% of its five hours, and was moved back to while it was
+    /// at its limit, because 89% is under the mark and its week ended sooner.
+    #[test]
+    fn an_account_that_could_not_be_read_is_not_switched_to() {
+        let (here, stale, other) = (
+            pressed(20.0, 4 * 86_400),
+            metered(89.0, 3 * 3600, 25.0, 2),
+            pressed(30.0, 5 * 86_400),
+        );
+        let unread = Candidate {
+            read_failed: true,
+            ..candidate("claude-9", Some(&stale), false)
+        };
+        let candidates = [
+            candidate("claude-3", Some(&here), true),
+            unread.clone(),
+            candidate("claude-5", Some(&other), false),
+        ];
+        // Its week ends soonest, and that was the whole case for moving.
+        assert_eq!(
+            decide(&candidates, &seamless(), now()),
+            Decision::Stay(Stay::BelowThreshold { used: 20.0 })
+        );
+        let roles = queue_roles(&candidates, &seamless(), now());
+        assert!(roles.contains(&("claude-9", Role::Unusable)), "{roles:?}");
+        assert!(roles.contains(&("claude-5", Role::NextUp)), "{roles:?}");
+
+        // Read again, it is.
+        let read = [
+            candidates[0].clone(),
+            Candidate {
+                read_failed: false,
+                ..unread
+            },
+        ];
+        assert!(matches!(
+            decide(&read, &seamless(), now()),
+            Decision::Switch { ref to, .. } if to == "claude-9"
+        ));
     }
 
     #[test]

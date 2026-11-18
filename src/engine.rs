@@ -1596,6 +1596,9 @@ fn candidate(status: &Status) -> Candidate<'_> {
             && status.fleet_home.is_none()
             && (status.active || status.disabled.is_none()),
         capacity: status.account.identity.capacity,
+        // A failure is only recorded after the reading it follows, and
+        // cleared by the next one that succeeds.
+        read_failed: status.error.is_some(),
     }
 }
 

@@ -1174,6 +1174,66 @@ fn watch_signs_a_signed_out_claude_code_in_to_the_next_account() {
     assert!(said.contains("Claude Code was signed out"), "{said}");
 }
 
+/// The account in use was rate-limited by the usage endpoint at 89% of its
+/// five hours and went on being used up to its limit. Left by hand, it was
+/// switched straight back to on that last reading: under the mark, and its
+/// week ending sooner than the one moved to.
+#[test]
+fn watch_never_moves_to_an_account_it_could_not_read() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("team@example.com", "uuid-team", "team");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("personal@example.com", "uuid-personal", "personal");
+    fixture.run(&["import", "claude"]);
+
+    let now = jiff::Timestamp::now();
+    let reading = |five_hour: f64, week_in_days: i64, age_mins: i64| {
+        json!({
+            "observed_at": now - jiff::SignedDuration::from_mins(age_mins),
+            "windows": [
+                {"window_secs": 18000, "used_percent": five_hour,
+                 "resets_at": now + jiff::SignedDuration::from_hours(3)},
+                {"window_secs": 604800, "used_percent": 25.0,
+                 "resets_at": now + jiff::SignedDuration::from_hours(24 * week_in_days)},
+            ],
+            "limit_reached": false,
+        })
+    };
+    let refused = json!({
+        "usage": reading(89.0, 2, 15),
+        "error": "rate limited by the provider",
+        "failed_at": now,
+        "retry_after": now + jiff::SignedDuration::from_mins(6),
+        "failures": 3,
+    });
+    let entries = |team: Value| {
+        json!({"entries": {
+            "claude-1": team,
+            "claude-2": {"usage": reading(20.0, 4, 0), "failures": 0},
+        }})
+    };
+    write_json(&fixture.data.join("usage.json"), &entries(refused));
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-personal",
+        "{output}"
+    );
+
+    // Once it reads again and the figure holds, its sooner week wins.
+    write_json(
+        &fixture.data.join("usage.json"),
+        &entries(json!({"usage": reading(89.0, 2, 0), "failures": 0})),
+    );
+    let output = fixture.run(&["watch", "--once"]);
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-team",
+        "{output}"
+    );
+}
+
 /// A switch somebody makes holds the watcher off for the cooldown, as one it
 /// makes itself does. It used to be undone at the next check, seconds later.
 #[test]

@@ -85,7 +85,10 @@ pub enum Stay {
     /// Every account is past the threshold, and on this provider moving would
     /// interrupt running sessions — too high a price for picking the least bad.
     NotWorthARestart { used: f64 },
-    /// Nothing is signed in, so there is nothing to switch away from.
+    /// The CLI is signed in to a login no stored account is. agent-meter does
+    /// not hold it, and the provider rotates refresh tokens, so writing over
+    /// it would lose it for good; it has to be imported first. (A CLI signed
+    /// in to nothing at all is [`decide_signed_out`]'s to judge.)
     NoActiveAccount,
     /// The active account has no usable reading, so its load is unknown.
     UsageUnknown,
@@ -106,6 +109,10 @@ pub enum Reason {
     /// The provider rejected the active account's credential, so the agent is
     /// signed out and nothing it asks for will be served until it moves.
     ActiveSignedOut { target_used: f64 },
+    /// The CLI holds no login at all — most often because the provider
+    /// rejected the credential and the CLI dropped it — so the agent can do
+    /// nothing until it is signed in to something.
+    NothingSignedIn { target_used: f64 },
     /// Nothing is wrong with the account in use, but another account's weekly
     /// allowance expires sooner and would otherwise be thrown away unspent.
     /// Only taken where a switch interrupts nothing.
@@ -140,7 +147,9 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     // whatever its last reading said, and a reading may not exist precisely
     // because the rejection stopped the polls.
     if !active.usable {
-        return leave_signed_out(candidates, rules, now);
+        return leave_signed_out(candidates, rules, now, |target_used| Reason::ActiveSignedOut {
+            target_used,
+        });
     }
     // Deliberately not gated on age. The account being used up is the one that
     // gets hammered, so it is the first the provider rate-limits — and if a
@@ -208,7 +217,7 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     // How much work each account can still do, rather than what fraction of
     // itself it has left: a percentage is relative to that account's own quota,
     // and quotas differ.
-    let weighted = quotas_all_known(active, &usable);
+    let weighted = sizes_weighable(Some(active), &usable);
     let remaining =
         |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
 
@@ -246,23 +255,40 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     }
 }
 
-/// Decides where to go from an account the provider has signed out.
+/// Decides for a CLI that holds no login at all.
+///
+/// Its own files may still name the account it was on, but nothing it asks
+/// for will be served, so it is in the same place as an agent whose account
+/// the provider signed out, and goes where that one would: to the account
+/// next up. Not to be used for a CLI signed in to a login that is not stored,
+/// which [`decide`] leaves alone.
+pub fn decide_signed_out(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> Decision {
+    leave_signed_out(candidates, rules, now, |target_used| Reason::NothingSignedIn {
+        target_used,
+    })
+}
+
+/// Decides where to go from an agent that is signed out, whether from a
+/// stored account the provider rejected or from nothing at all.
 ///
 /// Not a choice between loads, because staying is not one of the options:
 /// every request the agent makes fails until it is on another account. So the
 /// threshold does not apply, and neither does the reluctance to restart
 /// sessions, which are already stopped. What is left is the ranking itself —
 /// the account the watcher would take next anyway.
-fn leave_signed_out(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> Decision {
+fn leave_signed_out(
+    candidates: &[Candidate<'_>],
+    rules: &Rules,
+    now: Timestamp,
+    reason: impl FnOnce(f64) -> Reason,
+) -> Decision {
     let mut usable: Vec<(&Candidate<'_>, &Usage)> = candidates
         .iter()
         .filter(|c| !c.active && c.usable)
         .filter_map(|c| Some((c, fresh(c, rules, now)?)))
         .filter(|(_, usage)| !usage.is_exhausted_at(now))
         .collect();
-    // The account being left has no quota worth comparing against, so only the
-    // accounts on offer decide whether sizes can be weighed.
-    let weighted = usable.iter().all(|(c, _)| c.capacity.is_some());
+    let weighted = sizes_weighable(None, &usable);
     let remaining =
         |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
     rank(&mut usable, rules, now, &remaining);
@@ -270,9 +296,7 @@ fn leave_signed_out(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp)
     match usable.first() {
         Some((candidate, usage)) => Decision::Switch {
             to: candidate.id.to_string(),
-            reason: Reason::ActiveSignedOut {
-                target_used: usage.used_at(now),
-            },
+            reason: reason(usage.used_at(now)),
         },
         // A signed-out account never frees up by waiting, so it is no part of
         // when relief arrives.
@@ -418,8 +442,8 @@ pub enum Role {
 /// [`queue`], with what each account is in it.
 ///
 /// Next up is the first account a switch could go to, whether or not
-/// anything is in use: with nothing signed in there is no switch to make, but
-/// the order still says which account would be taken first.
+/// anything is in use: a signed-out agent is signed in to it, and one on a
+/// login that is not stored would take it once that login is imported.
 pub fn queue_roles<'a>(
     candidates: &'a [Candidate<'a>],
     rules: &Rules,
@@ -433,7 +457,9 @@ pub fn queue_roles<'a>(
         .filter(|(_, usage)| !usage.is_exhausted_at(now))
         .collect();
 
-    let weighted = active.is_some_and(|active| quotas_all_known(active, &usable));
+    // Weighed as the decision weighs them, so the account shown next up is
+    // the one a switch goes to.
+    let weighted = sizes_weighable(active.filter(|active| active.usable), &usable);
     let remaining =
         |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
     rank(&mut usable, rules, now, &remaining);
@@ -531,9 +557,11 @@ fn soonest_to_recover<'a>(
 ///
 /// Weighting is all-or-nothing on purpose: treating an unknown quota as the
 /// base tier would rank a perfectly good account last for a fact the provider
-/// simply did not state.
-fn quotas_all_known(active: &Candidate<'_>, usable: &[(&Candidate<'_>, &Usage)]) -> bool {
-    active.capacity.is_some() && usable.iter().all(|(c, _)| c.capacity.is_some())
+/// simply did not state. `active` is the account being compared against, where
+/// there is one: an agent that is signed out has no quota worth comparing, so
+/// only the accounts on offer decide it.
+fn sizes_weighable(active: Option<&Candidate<'_>>, usable: &[(&Candidate<'_>, &Usage)]) -> bool {
+    active.is_none_or(|active| active.capacity.is_some()) && usable.iter().all(|(c, _)| c.capacity.is_some())
 }
 
 /// What one point of an account's headroom is worth against the others.
@@ -954,6 +982,63 @@ mod tests {
                 relief_at: Timestamp::from_second(NOW + 1800).ok(),
                 relief_account: Some("claude-2".into()),
             })
+        );
+    }
+
+    /// A CLI signed in to nothing goes to the account next up, at once and
+    /// whatever the threshold: staying is not a way to keep working.
+    #[test]
+    fn a_signed_out_agent_is_signed_in_to_the_account_next_up() {
+        let (busy, roomy, spent) = (usage(95.0), usage(10.0), usage(100.0));
+        let mut gone = candidate("claude-4", Some(&roomy), false);
+        gone.usable = false;
+        let candidates = [
+            candidate("claude-1", Some(&busy), false),
+            candidate("claude-2", Some(&roomy), false),
+            candidate("claude-3", Some(&spent), false),
+            gone,
+        ];
+        let decision = decide_signed_out(&candidates, &Rules::default(), now());
+        assert_eq!(
+            decision,
+            Decision::Switch {
+                to: "claude-2".into(),
+                reason: Reason::NothingSignedIn { target_used: 10.0 },
+            }
+        );
+        // And it is the account the queue calls next up.
+        assert!(queue_roles(&candidates, &Rules::default(), now()).contains(&("claude-2", Role::NextUp)));
+
+        // Past the threshold, it is still better than nothing.
+        assert!(matches!(
+            decide_signed_out(&candidates[..1], &Rules::default(), now()),
+            Decision::Switch { ref to, .. } if to == "claude-1"
+        ));
+        // Nothing to go to.
+        assert_eq!(
+            decide_signed_out(&candidates[3..], &Rules::default(), now()),
+            Decision::Blocked(Blocked::NoAlternative)
+        );
+    }
+
+    /// With nothing in use, the order shown is weighed as the switch weighs
+    /// it, so the account next up is the one a switch goes to.
+    #[test]
+    fn with_nothing_in_use_next_up_is_where_the_switch_goes() {
+        // Both weeks end together, so what each can still do decides it: a
+        // fifth of a 20x seat is more than four-fifths of a 1x one.
+        let (small, large) = (pressed(20.0, 3 * 86_400), pressed(80.0, 3 * 86_400));
+        let candidates = [
+            sized("claude-1", Some(&small), false, 1),
+            sized("claude-2", Some(&large), false, 20),
+        ];
+        let Decision::Switch { to, .. } = decide_signed_out(&candidates, &seamless(), now()) else {
+            panic!("a signed-out agent is signed in somewhere");
+        };
+        assert_eq!(to, "claude-2");
+        assert_eq!(
+            queue_roles(&candidates, &seamless(), now())[0],
+            ("claude-2", Role::NextUp)
         );
     }
 

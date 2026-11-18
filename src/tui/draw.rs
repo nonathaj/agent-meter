@@ -25,6 +25,7 @@ use super::settings::Kind;
 use crate::account::ProviderKind;
 use crate::config::Disabled;
 use crate::engine::Status;
+use crate::policy::Role;
 use crate::timefmt;
 use crate::usage::{Usage, Window, WindowKind};
 
@@ -154,9 +155,13 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
     for (index, row) in app.rows.iter().enumerate() {
         match row {
             Row::Provider(kind) => lines.push(provider_heading(*kind, app, width)),
-            Row::Account { status, position } => {
+            Row::Account {
+                status,
+                position,
+                role,
+            } => {
                 let selected = app.selected_row() == Some(index);
-                lines.extend(account_block(status, *position, selected, app, now, width));
+                lines.extend(account_block(status, *position, *role, selected, app, now, width));
             }
         }
     }
@@ -221,8 +226,13 @@ fn provider_heading(kind: ProviderKind, app: &App, width: usize) -> Line<'static
                 Style::new().fg(Color::Green),
             ));
         }
+        // Two different states: one a switch mends, the other a login only
+        // the CLI holds, which an import has to take in first.
+        None if app.signed_out.contains(&kind) => {
+            left.push(Span::styled("signed out", Style::new().fg(Color::LightRed)))
+        }
         None => left.push(Span::styled(
-            "not signed in to a stored account",
+            "on an account not stored here · i imports it",
             Style::new().fg(Color::Yellow),
         )),
     }
@@ -258,6 +268,7 @@ fn provider_heading(kind: ProviderKind, app: &App, width: usize) -> Line<'static
 fn account_block(
     status: &Status,
     position: usize,
+    role: Role,
     selected: bool,
     app: &App,
     now: Timestamp,
@@ -297,7 +308,7 @@ fn account_block(
         ));
     }
 
-    let mut lines = vec![spread(head, standing(status, position, app, now), width)];
+    let mut lines = vec![spread(head, standing(status, role, app, now), width)];
     for line in body(status, now, width) {
         let mut spans = vec![gutter()];
         spans.extend(line.spans);
@@ -384,7 +395,7 @@ pub(super) fn body_height(status: &Status) -> usize {
 }
 
 /// What this account is, in a badge: in use, next, or spent.
-fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Vec<Span<'static>> {
+fn standing(status: &Status, role: Role, app: &App, now: Timestamp) -> Vec<Span<'static>> {
     let badge = |text: &str, colour: Color| {
         vec![Span::styled(
             format!(" {text} "),
@@ -426,8 +437,9 @@ fn standing(status: &Status, position: usize, app: &App, now: Timestamp) -> Vec<
         return vec![Span::styled(" spent ", Style::new().fg(Color::Red))];
     }
     // Only meaningful when something is actually choosing: with switching off
-    // the order is just an order.
-    if app.switching_on(status.account.provider) && position == 2 {
+    // the order is just an order. Taken from the queue rather than from the
+    // place in it, because with nothing in use the first account is next.
+    if app.switching_on(status.account.provider) && role == Role::NextUp {
         return vec![Span::styled(
             " next up ",
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1708,6 +1720,31 @@ mod tests {
         assert!(screen.contains("next up"), "{screen}");
         assert!(screen.contains("in the order they will be taken"), "{screen}");
         assert!(screen.contains("● auto at 90%"), "{screen}");
+    }
+
+    /// With nothing in use, the account at the top of the list is the one a
+    /// switch goes to. The badge used to go on the second place whatever was
+    /// in the first, which is right only while the first is the one in use.
+    #[test]
+    fn with_nothing_in_use_the_first_account_is_next_up() {
+        let mut statuses = crate::tui::app::sample_statuses(2);
+        statuses[0].usage = Some(usage(vec![window(FIVE_HOURS, None, 95.0, 3600)]));
+        statuses[1].usage = Some(usage(vec![window(FIVE_HOURS, None, 5.0, 3600)]));
+        for status in &mut statuses {
+            status.active = false;
+        }
+        let mut app = App::for_tests(statuses);
+        app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
+        app.signed_out = vec![ProviderKind::Claude];
+
+        let screen = render(&mut app, 110, 30);
+        let first = screen
+            .lines()
+            .find(|line| line.trim_start_matches(['┃', ' ']).starts_with("1 "))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(first.contains("next up"), "{screen}");
+        assert_eq!(screen.matches("next up").count(), 1, "{screen}");
+        assert!(screen.contains("signed out"), "{screen}");
     }
 
     /// Spending a window faster than it refills is the thing a percentage

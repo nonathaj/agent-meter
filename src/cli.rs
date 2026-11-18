@@ -1646,6 +1646,9 @@ fn describe_switch(switch: &crate::store::Switch) -> String {
             format!("every account was past the mark; {from} was at {used:.0}%")
         }
         (_, Some(SwitchWhy::Exhausted), _) => format!("{from} was out of quota"),
+        (_, Some(SwitchWhy::SignedOut), _) if switch.from.is_none() => {
+            format!("{} was signed out", switch.provider.display_name())
+        }
         (_, Some(SwitchWhy::SignedOut), _) => format!("the provider signed {from} out"),
         (_, Some(SwitchWhy::WeekEndsSooner), _) => format!("{}'s week ends sooner", switch.to),
         _ => "by the watcher".to_string(),
@@ -1760,7 +1763,7 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
                 );
                 standing_by = false;
             }
-            match tick_and_share(&engine, args) {
+            let wait = match tick_and_share(&engine, args) {
                 Ok(outcomes) => wait_after(&outcomes, &engine, interval),
                 Err(error) => {
                     // A failed check should not end the watch: the provider may be
@@ -1768,8 +1771,12 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
                     eprintln!("{} check failed: {error}", Timestamp::now());
                     interval
                 }
-            }
+            };
+            wait.min(until_next_change(&engine))
         };
+        // Taken after the check, so what the check itself wrote is not taken
+        // for somebody else's change.
+        let changes = engine.change_mark();
         // Wake often enough to notice Ctrl-C promptly, and a change to the
         // settings at once: whoever made it is waiting to see it take effect,
         // and with every account spent the wait can run to hours.
@@ -1777,14 +1784,27 @@ fn watch(engine: &Engine, args: &WatchArgs) -> Result<ExitCode> {
         // A change counts once the file reads the same twice in a row. A file
         // saved in place is cut to nothing before it is written, and caught in
         // that instant it would read as no settings at all: the defaults.
+        //
+        // Anything else that bears on the decision — an account added, signed
+        // in again, re-enabled or reset, new readings, or the agent CLI
+        // signing in or out — is looked for every second and acted on in the
+        // same way, so auto mode follows what happens rather than its clock.
         let mut waited = Duration::ZERO;
         let mut last_seen = settings_read.clone();
+        let mut last_mark = changes.clone();
         while running.load(Ordering::SeqCst) && waited < sleep_for && !over() {
             let seen = settings_file(&store);
             if seen != settings_read && seen == last_seen {
                 break;
             }
             last_seen = seen;
+            if waited.as_millis().is_multiple_of(CHANGE_LOOK.as_millis()) {
+                let mark = engine.change_mark();
+                if mark != changes && mark == last_mark {
+                    break;
+                }
+                last_mark = mark;
+            }
             std::thread::sleep(Duration::from_millis(200));
             waited += Duration::from_millis(200);
         }
@@ -1899,6 +1919,26 @@ fn wait_after(outcomes: &[TickOutcome], engine: &Engine, interval: Duration) -> 
     }
 }
 
+/// How often a watcher looks for something changed that bears on a decision.
+///
+/// A change counts once two looks in a row agree, so it is acted on within
+/// two of these.
+const CHANGE_LOOK: Duration = Duration::from_millis(600);
+
+/// How long until something a watcher knows the time of could change its
+/// decision; see [`Engine::next_change`]. At least a second, so a moment
+/// that does not pass as expected cannot spin.
+fn until_next_change(engine: &Engine) -> Duration {
+    let now = Timestamp::now();
+    engine
+        .next_change(now)
+        .ok()
+        .flatten()
+        .map_or(Duration::MAX, |at| {
+            Duration::from_secs((at.as_second() - now.as_second()).max(1) as u64)
+        })
+}
+
 /// How often a watcher standing by asks whether the one watching has stopped.
 const STANDBY_RETRY: Duration = Duration::from_secs(5);
 
@@ -1924,17 +1964,21 @@ fn run_tick(engine: &Engine, args: &WatchArgs) -> Result<Vec<TickOutcome>> {
             println!("{provider}: {held}");
             continue;
         }
-        println!("{provider}: {}", describe(&outcome.decision, dry_run));
+        println!(
+            "{provider}: {}",
+            describe(&outcome.decision, outcome.provider, dry_run)
+        );
     }
     Ok(outcomes)
 }
 
-fn describe(decision: &Decision, dry_run: bool) -> String {
+fn describe(decision: &Decision, kind: ProviderKind, dry_run: bool) -> String {
     match decision {
         Decision::Stay(Stay::BelowThreshold { used }) => format!("{used:.0}% used, staying put"),
-        Decision::Stay(Stay::NoActiveAccount) => {
-            "no stored account is signed in; run `agent-meter use <account>`".into()
-        }
+        Decision::Stay(Stay::NoActiveAccount) => format!(
+            "signed in to an account agent-meter does not store, so it is left alone; \
+             `agent-meter import {kind}` takes it into switching"
+        ),
         Decision::Stay(Stay::UsageUnknown) => "usage unknown, staying put".into(),
         Decision::Stay(Stay::NoBetterAccount { used }) => {
             format!("{used:.0}% used, but no other account has meaningfully more left")
@@ -1956,6 +2000,12 @@ fn describe(decision: &Decision, dry_run: bool) -> String {
                 }
                 Reason::ActiveSignedOut { target_used } => {
                     format!("the provider signed this account out; {to} is at {target_used:.0}%")
+                }
+                Reason::NothingSignedIn { target_used } => {
+                    format!(
+                        "{} is signed out; {to} is at {target_used:.0}%",
+                        kind.display_name()
+                    )
                 }
                 Reason::WeekExpiresSooner { target_used } => format!(
                     "{to}'s weekly allowance resets sooner, so spending it first wastes \

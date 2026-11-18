@@ -86,6 +86,25 @@ impl Store {
         self.dir.join("accounts")
     }
 
+    /// The files whose writing, by any process, may change what a check
+    /// decides: every account, the readings, and the settings.
+    ///
+    /// Listed afresh each time, so an account added or removed changes the
+    /// list itself.
+    pub fn watched_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.accounts_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        files.sort();
+        files.push(self.dir.join("usage.json"));
+        files.push(crate::config::Config::path(&self.dir));
+        files
+    }
+
     fn account_path(&self, id: &str) -> PathBuf {
         self.accounts_dir().join(format!("{id}.json"))
     }

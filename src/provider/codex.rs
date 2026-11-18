@@ -99,6 +99,23 @@ impl Provider for Codex {
         })
     }
 
+    fn signed_out(&self, home: &Path) -> Result<bool> {
+        // `codex logout` deletes the file.
+        let Some(blob) = read_auth(home)? else {
+            return Ok(true);
+        };
+        let filled = |value: Option<&Value>| value.and_then(Value::as_str).is_some_and(|v| !v.is_empty());
+        let api_key = filled(blob.get("OPENAI_API_KEY"));
+        let tokens = blob
+            .get("tokens")
+            .is_some_and(|tokens| filled(tokens.get("access_token")) || filled(tokens.get("refresh_token")));
+        Ok(!api_key && !tokens)
+    }
+
+    fn credential_files(&self, home: &Path) -> Vec<PathBuf> {
+        vec![auth_path(home)]
+    }
+
     fn install(&self, home: &Path, account: &Account) -> Result<()> {
         // Keep whatever else the live file holds: Codex writes settings there
         // that have nothing to do with which account is signed in.
@@ -603,6 +620,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = Codex.capture(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("codex login"), "{err}");
+    }
+
+    #[test]
+    fn a_home_without_a_login_is_signed_out() {
+        let (tmp, home) = write_home(&auth_json());
+        let signed_out = || Codex.signed_out(&home).unwrap();
+        assert!(!signed_out());
+
+        let mut blob = auth_json();
+        blob["tokens"] = Value::Null;
+        std::fs::write(home.join(AUTH_FILE), serde_json::to_vec(&blob).unwrap()).unwrap();
+        assert!(signed_out());
+
+        // An API key is no subscription, but it is somebody's login.
+        blob["OPENAI_API_KEY"] = json!("sk-proj-abc");
+        std::fs::write(home.join(AUTH_FILE), serde_json::to_vec(&blob).unwrap()).unwrap();
+        assert!(!signed_out());
+
+        // `codex logout` deletes the file.
+        std::fs::remove_file(home.join(AUTH_FILE)).unwrap();
+        assert!(signed_out());
+        drop(tmp);
     }
 
     #[test]

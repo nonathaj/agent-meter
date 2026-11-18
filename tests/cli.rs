@@ -1095,6 +1095,179 @@ fn watch_moves_claude_code_off_an_account_the_provider_signed_out() {
     assert_eq!(history[0]["from"], "claude-2");
 }
 
+/// Fresh readings for the given accounts: a five-hour window at each figure.
+fn fresh_readings(fixture: &Fixture, used: &[(&str, f64)]) {
+    let now = jiff::Timestamp::now();
+    let entries: serde_json::Map<String, Value> = used
+        .iter()
+        .map(|(id, used)| {
+            let reading = json!({
+                "observed_at": now,
+                "windows": [{
+                    "window_secs": 18000,
+                    "used_percent": used,
+                    "resets_at": now + jiff::SignedDuration::from_hours(3),
+                }],
+                "limit_reached": false,
+            });
+            (id.to_string(), json!({"usage": reading, "failures": 0}))
+        })
+        .collect();
+    write_json(&fixture.data.join("usage.json"), &json!({ "entries": entries }));
+}
+
+/// When the provider rejects the refresh token of the account in use, Claude
+/// Code drops its tokens and keeps the rest of its files, so it names an
+/// account while holding no login for it. Matching no stored account, the
+/// watcher took that for "nothing to switch away from" and left the agent
+/// signed out, while the interface said switching was automatic and showed
+/// which account was next.
+#[test]
+fn watch_signs_a_signed_out_claude_code_in_to_the_next_account() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-spare", "spare");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("busy@example.com", "uuid-busy", "busy");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("dead@example.com", "uuid-dead", "dead");
+    fixture.run(&["import", "claude"]);
+
+    let record = fixture.data.join("accounts").join("claude-3.json");
+    let mut stored: Value = read_json(&record);
+    stored["needs_login"] = json!("the provider rejected its credential: invalid_grant");
+    write_json(&record, &stored);
+    // What Claude Code leaves behind: the identity file still names the
+    // account, and the credential file has lost only its login.
+    write_json(
+        &fixture.claude_home.join(".credentials.json"),
+        &json!({"mcpOAuth": {"machine": "scoped"}}),
+    );
+    fresh_readings(&fixture, &[("claude-1", 10.0), ("claude-2", 95.0)]);
+    // Signed in by hand a moment ago: no cooldown holds an agent that is down.
+    write_json(
+        &fixture.data.join("state.json"),
+        &json!({"last_switch": {"claude": {
+            "at": jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60),
+            "to": "claude-3",
+        }}}),
+    );
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert!(output.contains("claude-1"), "{output}");
+    let credentials = fixture.claude_credentials();
+    assert_eq!(
+        credentials["claudeAiOauth"]["refreshToken"], "sk-ant-ort01-spare",
+        "{output}"
+    );
+    assert_eq!(credentials["mcpOAuth"]["machine"], "scoped");
+    assert_eq!(
+        fixture.claude_settings()["oauthAccount"]["emailAddress"],
+        "spare@example.com"
+    );
+
+    let history: Value = serde_json::from_str(&fixture.run(&["history", "--json"])).unwrap();
+    assert_eq!(history[0]["by"], "watch");
+    assert_eq!(history[0]["why"], "signed_out");
+    assert_eq!(history[0]["to"], "claude-1");
+    assert!(history[0].get("from").is_none(), "{history}");
+    let said = fixture.run(&["history"]);
+    assert!(said.contains("Claude Code was signed out"), "{said}");
+}
+
+/// Accounts synced from another machine are no reason to set up a CLI this
+/// machine has never run: with no home of its own, it is not signed out, it
+/// is not here.
+#[test]
+fn watch_never_sets_up_a_cli_that_is_not_here() {
+    let fixture = Fixture::new();
+    fixture.sign_in_codex("dev@example.com", "user-1", "one");
+    fixture.run(&["import", "codex"]);
+    fresh_readings(&fixture, &[("codex-1", 10.0)]);
+    std::fs::remove_dir_all(&fixture.codex_home).unwrap();
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert!(!fixture.codex_home.exists(), "{output}");
+
+    // Set up, and signed out, it is signed in.
+    std::fs::create_dir_all(&fixture.codex_home).unwrap();
+    let output = fixture.run(&["watch", "--once"]);
+    assert_eq!(
+        fixture.codex_auth()["tokens"]["refresh_token"],
+        "refresh-one",
+        "{output}"
+    );
+}
+
+/// Auto mode follows what happens, not its clock: a running watcher sees
+/// Claude Code drop its login within seconds, however long its interval.
+#[test]
+fn a_running_watcher_acts_on_a_change_at_once() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-spare", "spare");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("dev@example.com", "uuid-dev", "dev");
+    fixture.run(&["import", "claude"]);
+    fresh_readings(&fixture, &[("claude-1", 10.0), ("claude-2", 40.0)]);
+
+    let mut watcher = fixture
+        .cmd(&["watch", "--interval", "3600", "--for", "60"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let waited = |what: &dyn Fn() -> bool| {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(15) {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+    // Its first check stays put, and records nothing.
+    assert!(waited(&|| fixture.data.join("watch.lock").exists()));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-dev"
+    );
+
+    write_json(
+        &fixture.claude_home.join(".credentials.json"),
+        &json!({"mcpOAuth": {"machine": "scoped"}}),
+    );
+    let switched =
+        waited(&|| fixture.claude_credentials()["claudeAiOauth"]["refreshToken"] == "sk-ant-ort01-spare");
+    watcher.kill().unwrap();
+    let output = watcher.wait_with_output().unwrap();
+    assert!(
+        switched,
+        "still signed out: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// A login agent-meter does not hold is one only the CLI has: the provider
+/// rotates refresh tokens, so writing over it would lose it for good.
+#[test]
+fn watch_leaves_claude_code_on_an_account_it_does_not_store() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-spare", "spare");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("someone@example.com", "uuid-someone", "someone");
+    fresh_readings(&fixture, &[("claude-1", 10.0)]);
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert!(
+        output.contains("left alone; `agent-meter import claude` takes it"),
+        "{output}"
+    );
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-someone"
+    );
+}
+
 /// agent-meter leaves renewing the account in use to its CLI, so the CLI's
 /// renewal is what ends a run of failed polls. The backoff those failures set
 /// must not hold the new credential out until it lapses.

@@ -414,6 +414,15 @@ On each check, for each provider:
 4. If every account is completely spent, it says so and names the one that frees
    up first, rather than churning.
 
+An agent that is signed out moves at once, whatever the threshold and the
+cooldown, to the account next up: staying is not a way to keep working. That
+covers an account the provider rejected, and a CLI that holds no login at all —
+which is what Claude Code leaves when a refresh is rejected, still naming the
+account it was on. A CLI signed in to a login `agent-meter` does not store is
+left alone instead: the provider rotates refresh tokens, so writing over a login
+only the CLI holds would lose it. `agent-meter import <provider>` (`i` in the
+terminal UI) takes it in, and from then on it is switched like any other.
+
 An account is compared on its *tightest* window, so one at 20% of its five-hour
 limit but 98% of its weekly one counts as 98% full. That includes the limits a
 provider sets on one model, such as Claude's `weekly Fable` or Codex's
@@ -545,7 +554,12 @@ with what it is set to and what it does, and changes the same file.
 
 A running `watch` reads these again before every check, and a change to the file
 brings that check forward, so a setting changed with `config set` takes effect
-within a second, with no restart. A `--threshold` or `--interval` given to
+within a second, with no restart. So does anything else that could change what a
+check decides — an account added, signed in again, enabled or given a spent
+limit reset, new readings, or an agent CLI signing in or out, whether from the
+terminal UI, Herdr, the command line or the CLI itself — and the watcher checks
+again by itself the moment a window is due to turn over, a disabled-for-a-while
+account comes back, or the cooldown after a switch ends. A `--threshold` or `--interval` given to
 `watch` itself holds for that run whatever the file says. A file edited by hand
 into something that does not read leaves the watcher on the settings it last
 read, and it says so once.

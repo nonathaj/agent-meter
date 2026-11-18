@@ -126,6 +126,38 @@ impl Provider for Claude {
             .with_context(|| format!("reading the Claude Code credential in {}", home.display()))
     }
 
+    fn signed_out(&self, home: &Path) -> Result<bool> {
+        // When the provider rejects its refresh token, Claude Code drops the
+        // OAuth block and keeps everything else, `oauthAccount` included — so
+        // the identity file goes on naming an account it holds no login for.
+        let holds_token = |oauth: &Value| {
+            ["accessToken", "refreshToken"].iter().any(|key| {
+                oauth
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+            })
+        };
+        if read_credentials(home)?
+            .as_ref()
+            .and_then(|blob| blob.get(OAUTH_KEY))
+            .is_some_and(holds_token)
+        {
+            return Ok(false);
+        }
+        // A Console login keeps an API key beside the identity instead.
+        let api_key = read_identity_file(home)?
+            .as_ref()
+            .and_then(|root| root.get("primaryApiKey"))
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.is_empty());
+        Ok(!api_key)
+    }
+
+    fn credential_files(&self, home: &Path) -> Vec<PathBuf> {
+        vec![credentials_path(home)]
+    }
+
     fn install(&self, home: &Path, account: &Account) -> Result<()> {
         let _locks = lock_claude_code(home)?;
 
@@ -1496,6 +1528,53 @@ mod tests {
         let creds: Value =
             serde_json::from_slice(&std::fs::read(home.join(CREDENTIALS_FILE)).unwrap()).unwrap();
         assert_eq!(creds["mcpOAuth"]["server"], "machine-scoped");
+    }
+
+    /// What Claude Code leaves when the provider rejects its refresh token is
+    /// a signed-out home that still names the account, and a switch may write
+    /// into it. Any login it does hold must never be taken for one.
+    #[test]
+    fn a_home_without_a_login_is_signed_out_whatever_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("profile");
+        std::fs::create_dir_all(&home).unwrap();
+        let write = |file: &str, value: Value| {
+            std::fs::write(home.join(file), serde_json::to_vec(&value).unwrap()).unwrap();
+        };
+        let signed_out = || Claude.signed_out(&home).unwrap();
+
+        // Never set up.
+        assert!(signed_out());
+
+        write(CREDENTIALS_FILE, credentials_json());
+        write(
+            IDENTITY_FILE,
+            json!({"oauthAccount": {"accountUuid": "acct-1", "emailAddress": "dev@example.com"}}),
+        );
+        assert!(!signed_out());
+
+        // The login dropped, the rest kept.
+        write(
+            CREDENTIALS_FILE,
+            json!({"mcpOAuth": {"server": "machine-scoped"}}),
+        );
+        assert!(signed_out());
+        write(
+            CREDENTIALS_FILE,
+            json!({"claudeAiOauth": {"accessToken": "", "refreshToken": null}}),
+        );
+        assert!(signed_out());
+        write(
+            CREDENTIALS_FILE,
+            json!({"claudeAiOauth": {"accessToken": "sk-ant-oat01-only"}}),
+        );
+        assert!(!signed_out(), "a token on its own still works until it expires");
+
+        // A Console login keeps an API key instead, which is no subscription
+        // but is somebody's login all the same.
+        write(CREDENTIALS_FILE, json!({}));
+        write(IDENTITY_FILE, json!({"primaryApiKey": "sk-ant-api03-key"}));
+        assert!(!signed_out());
     }
 
     #[test]

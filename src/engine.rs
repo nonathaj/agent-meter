@@ -115,6 +115,14 @@ pub struct SpendReport {
     pub after: Result<Usage, String>,
 }
 
+/// How long after a window's stated reset it is read again: long enough for
+/// the provider to have made it, short enough that nobody waits on it.
+const RESET_SETTLE: SignedDuration = SignedDuration::from_secs(15);
+
+/// See [`Engine::change_mark`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeMark(Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>);
+
 /// What one watcher tick did for one provider.
 #[derive(Debug, Clone)]
 pub struct TickOutcome {
@@ -219,45 +227,17 @@ impl Engine {
 
     /// [`Self::switch_order`], with what each account is in that order.
     pub fn queue(&self, statuses: &[Status], kind: ProviderKind) -> Vec<(String, Role)> {
-        let mine: Vec<&Status> = statuses.iter().filter(|s| s.account.provider == kind).collect();
-        let candidates: Vec<Candidate<'_>> = mine.iter().map(|s| self.candidate(s)).collect();
-        policy::queue_roles(&candidates, &self.rules_for(kind), Timestamp::now())
-            .into_iter()
-            .map(|(id, role)| (id.to_string(), role))
-            .collect()
+        queue(&self.config, statuses, kind)
     }
 
     /// How one account looks to the policy.
     fn candidate<'a>(&self, status: &'a Status) -> Candidate<'a> {
-        Candidate {
-            id: &status.account.id,
-            usage: status.usage.as_ref(),
-            active: status.active,
-            // A disabled account is no place to go, but the one in use is
-            // where the agent already is: disabling it leaves it to be left
-            // as any other is, rather than as one the provider signed out.
-            usable: status.account.needs_login.is_none()
-                && status.fleet_home.is_none()
-                && (status.active || status.disabled.is_none()),
-            capacity: status.account.identity.capacity,
-        }
+        candidate(status)
     }
 
     /// The rules this provider is judged by.
     pub fn rules_for(&self, kind: ProviderKind) -> Rules {
-        Rules {
-            threshold: self.config.threshold_for(kind),
-            margin: self.config.watch.margin,
-            // Taken from the provider's own answer about restarts, so a new
-            // provider inherits the behaviour instead of being named in the
-            // policy.
-            disruption: if provider::get(kind).restarts_sessions() {
-                Disruption::RestartsSessions
-            } else {
-                Disruption::Seamless
-            },
-            ..Rules::default()
-        }
+        rules_for(&self.config, kind)
     }
 
     /// Resolves a user-supplied account reference: an id, an email, or a label.
@@ -1322,6 +1302,22 @@ impl Engine {
         }
     }
 
+    /// Whether the agent CLI holds no login of any kind, so that signing it in
+    /// would overwrite nothing.
+    ///
+    /// Anything that cannot be read is taken as a login: the cost of being
+    /// wrong that way is a switch not made, and the other way a login lost.
+    /// A CLI never set up on this machine is not signed out either — it is
+    /// not here — so accounts synced from another machine do not conjure one.
+    pub fn signed_out(&self, kind: ProviderKind) -> bool {
+        let provider = provider::get(kind);
+        provider
+            .config_home()
+            .ok()
+            .filter(|home| home.is_dir())
+            .is_some_and(|home| provider.signed_out(&home).unwrap_or(false))
+    }
+
     /// Runs one watcher tick: poll what is due, then act on the policy.
     pub fn tick(&self) -> Result<Vec<TickOutcome>> {
         self.run_tick(true, Config::is_enabled)
@@ -1362,7 +1358,15 @@ impl Engine {
 
             let candidates: Vec<Candidate<'_>> =
                 provider_statuses.iter().map(|s| self.candidate(s)).collect();
-            let decision = policy::decide(&candidates, &self.rules_for(kind), now);
+            // Matching no stored account is two different things: signed in to
+            // a login agent-meter does not hold, which is left alone, or
+            // signed in to nothing, which the agent cannot work from. Asked
+            // after the match, so a login made since is found and kept.
+            let decision = if !candidates.iter().any(|c| c.active) && self.signed_out(kind) {
+                policy::decide_signed_out(&candidates, &self.rules_for(kind), now)
+            } else {
+                policy::decide(&candidates, &self.rules_for(kind), now)
+            };
 
             let (switched, held) = match &decision {
                 Decision::Switch { .. } if !act => (None, None),
@@ -1371,7 +1375,11 @@ impl Engine {
                     // traded back and forth. A signed-out one can never be
                     // switched back to, so there is nothing to flap between,
                     // and every minute waited is a minute the agent is down.
-                    _ if matches!(reason, Reason::ActiveSignedOut { .. }) => {
+                    _ if matches!(
+                        reason,
+                        Reason::ActiveSignedOut { .. } | Reason::NothingSignedIn { .. }
+                    ) =>
+                    {
                         (Some(self.switch_and_record(kind, to, reason, now)?), None)
                     }
                     Some(remaining) => (
@@ -1420,7 +1428,11 @@ impl Engine {
                 Reason::ThresholdCrossed { used, .. } => (SwitchWhy::Threshold, Some(used)),
                 Reason::BestOfExhausted { used, .. } => (SwitchWhy::LeastUsed, Some(used)),
                 Reason::ActiveExhausted { .. } => (SwitchWhy::Exhausted, None),
-                Reason::ActiveSignedOut { .. } => (SwitchWhy::SignedOut, None),
+                // The agent was signed out either way; with nothing to leave,
+                // the record names no account it left.
+                Reason::ActiveSignedOut { .. } | Reason::NothingSignedIn { .. } => {
+                    (SwitchWhy::SignedOut, None)
+                }
                 Reason::WeekExpiresSooner { .. } => (SwitchWhy::WeekEndsSooner, None),
             };
             state.push_switch(Switch {
@@ -1437,6 +1449,71 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// A fingerprint of everything any process may write that bears on what a
+    /// check decides: the accounts, their readings, the settings, and each
+    /// agent CLI's own credential.
+    ///
+    /// Compared from one moment to the next, it is how a watcher notices that
+    /// an account was added, signed in again, re-enabled or had a limit reset
+    /// spent — or that the CLI signed in, signed out or dropped its login —
+    /// and checks at once rather than at the end of its interval.
+    pub fn change_mark(&self) -> ChangeMark {
+        let mut files = self.store.watched_files();
+        for provider in provider::all() {
+            if let Ok(home) = provider.config_home() {
+                files.extend(provider.credential_files(&home));
+            }
+        }
+        ChangeMark(
+            files
+                .into_iter()
+                .map(|path| {
+                    let stamp = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+                    (path, stamp)
+                })
+                .collect(),
+        )
+    }
+
+    /// The soonest moment after `now` at which a check could decide
+    /// differently with nothing written in between: a window turning over, a
+    /// failed reading's backoff ending, an account disabled for a while coming
+    /// back, or the cooldown after an automatic switch running out.
+    ///
+    /// A watcher checks then rather than at the end of its interval, so an
+    /// account that frees up is switched to as it does.
+    pub fn next_change(&self, now: Timestamp) -> Result<Option<Timestamp>> {
+        let cache = self.store.usage_cache()?;
+        let accounts = self.store.accounts()?;
+        let entries: Vec<_> = accounts.iter().filter_map(|a| cache.get(&a.id)).collect();
+        // A moment after the reset, so the provider has certainly made it.
+        let resets = entries
+            .iter()
+            .filter_map(|entry| entry.usage.as_ref())
+            .flat_map(|usage| usage.windows.iter().filter_map(|window| window.resets_at))
+            .map(|at| at + RESET_SETTLE);
+        let retries = entries.iter().filter_map(|entry| entry.retry_after);
+        let returns = self
+            .config
+            .account
+            .values()
+            .filter_map(|account| account.disabled_until);
+        let state = self.store.state()?;
+        let cooldown = SignedDuration::from_secs(self.config.watch.cooldown_secs as i64);
+        let cooldowns = ProviderKind::ALL
+            .into_iter()
+            .filter_map(|kind| state.last_switch(kind))
+            .map(|record| record.at + cooldown);
+        Ok(resets
+            .chain(retries)
+            .chain(returns)
+            .chain(cooldowns)
+            .filter(|at| *at > now)
+            .min())
+    }
+
     /// How long remains of the cooldown after the last automatic switch.
     fn cooldown_remaining(&self, kind: ProviderKind, now: Timestamp) -> Result<Option<std::time::Duration>> {
         let cooldown = self.config.watch.cooldown_secs as i64;
@@ -1445,6 +1522,56 @@ impl Engine {
         };
         let elapsed = now.as_second() - record.at.as_second();
         Ok((elapsed < cooldown).then(|| std::time::Duration::from_secs((cooldown - elapsed) as u64)))
+    }
+}
+
+/// The order `kind`'s accounts would be taken in under `config`, best next
+/// first, with what each account is in it.
+///
+/// A function of what is on screen and the settings alone, so an interface
+/// can order what it already holds without going back to the store.
+pub fn queue(config: &Config, statuses: &[Status], kind: ProviderKind) -> Vec<(String, Role)> {
+    let candidates: Vec<Candidate<'_>> = statuses
+        .iter()
+        .filter(|s| s.account.provider == kind)
+        .map(candidate)
+        .collect();
+    policy::queue_roles(&candidates, &rules_for(config, kind), Timestamp::now())
+        .into_iter()
+        .map(|(id, role)| (id.to_string(), role))
+        .collect()
+}
+
+/// How one account looks to the policy.
+fn candidate(status: &Status) -> Candidate<'_> {
+    Candidate {
+        id: &status.account.id,
+        usage: status.usage.as_ref(),
+        active: status.active,
+        // A disabled account is no place to go, but the one in use is
+        // where the agent already is: disabling it leaves it to be left
+        // as any other is, rather than as one the provider signed out.
+        usable: status.account.needs_login.is_none()
+            && status.fleet_home.is_none()
+            && (status.active || status.disabled.is_none()),
+        capacity: status.account.identity.capacity,
+    }
+}
+
+/// The rules `kind` is judged by under `config`.
+fn rules_for(config: &Config, kind: ProviderKind) -> Rules {
+    Rules {
+        threshold: config.threshold_for(kind),
+        margin: config.watch.margin,
+        // Taken from the provider's own answer about restarts, so a new
+        // provider inherits the behaviour instead of being named in the
+        // policy.
+        disruption: if provider::get(kind).restarts_sessions() {
+            Disruption::RestartsSessions
+        } else {
+            Disruption::Seamless
+        },
+        ..Rules::default()
     }
 }
 
@@ -1638,6 +1765,82 @@ mod tests {
         assert_eq!(usage, none);
         let usage = engine.describe_resets(&account, &account.credential, previous.clone(), None);
         assert_eq!(usage.resets, Some(described));
+    }
+
+    /// A watcher wakes for whatever comes first of the moments it knows a
+    /// decision could change at, and for none that has passed.
+    #[test]
+    fn the_next_change_is_the_soonest_moment_a_decision_could_turn() {
+        use crate::usage::{FIVE_HOURS, Window};
+        let (_tmp, mut engine) = engine();
+        let now = Timestamp::now();
+        let at = |secs: i64| now + SignedDuration::from_secs(secs);
+        assert_eq!(engine.next_change(now).unwrap(), None, "nothing stored");
+
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r1"), None)
+            .unwrap();
+        let reading = |resets: &[i64]| crate::usage::Usage {
+            observed_at: now,
+            windows: resets
+                .iter()
+                .map(|secs| Window {
+                    window_secs: FIVE_HOURS,
+                    scope: None,
+                    used_percent: 50.0,
+                    resets_at: Some(at(*secs)),
+                })
+                .collect(),
+            limit_reached: false,
+            resets: None,
+            ignored: Vec::new(),
+        };
+        let mut cache = engine.store().usage_cache().unwrap();
+        cache.record_success("claude-1", reading(&[-60, 3600, 7200]));
+        engine.store().put_usage_cache(&cache).unwrap();
+        // A moment after the reset, so the provider has made it.
+        assert_eq!(engine.next_change(now).unwrap(), Some(at(3600) + RESET_SETTLE));
+
+        // An account back from being disabled for a while is sooner.
+        let mut config = engine.store().config().unwrap();
+        config.disable("claude-1", Some(at(1800)));
+        config.save(engine.store().dir()).unwrap();
+        engine = Engine::with_store(engine.store().clone()).unwrap();
+        assert_eq!(engine.next_change(now).unwrap(), Some(at(1800)));
+
+        // And the end of the cooldown after a switch sooner still.
+        let mut state = engine.store().state().unwrap();
+        state.record_switch(
+            ProviderKind::Claude,
+            SwitchRecord {
+                at: at(-200),
+                to: "claude-1".into(),
+                from: None,
+            },
+        );
+        engine.store().put_state(&state).unwrap();
+        let cooldown = engine.config().watch.cooldown_secs as i64;
+        assert_eq!(engine.next_change(now).unwrap(), Some(at(cooldown - 200)));
+    }
+
+    /// Anything another process writes that bears on a decision moves the
+    /// mark: a new account, new readings, the CLI signing in or out.
+    #[test]
+    fn the_change_mark_moves_with_what_bears_on_a_decision() {
+        let (_tmp, engine) = engine();
+        // Never compared equal here: the mark takes in this machine's own agent
+        // CLIs, which may renew their logins while the test runs.
+        let before = engine.change_mark();
+        engine
+            .store_captured(ProviderKind::Claude, captured("a@x.com", "r1"), None)
+            .unwrap();
+        let added = engine.change_mark();
+        assert_ne!(added, before);
+
+        let mut cache = engine.store().usage_cache().unwrap();
+        cache.record_failure("claude-1", "offline".into(), None);
+        engine.store().put_usage_cache(&cache).unwrap();
+        assert_ne!(engine.change_mark(), added);
     }
 
     fn captured(email: &str, refresh: &str) -> Captured {

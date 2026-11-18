@@ -182,7 +182,7 @@ export default class AgentMeter extends View {
         : s.why === "threshold" && s.used != null ? `${who(was)} hit ${Math.round(s.used)}%`
         : s.why === "least_used" ? "every account is past the mark"
         : s.why === "exhausted" ? `${who(was)} ran out`
-        : s.why === "signed_out" ? `${who(was)} was signed out`
+        : s.why === "signed_out" ? `${was ? who(was) : (p?.name ?? "the agent")} was signed out`
         : s.why === "week_ends_sooner" ? "its week ends sooner"
         : "";
       notify({

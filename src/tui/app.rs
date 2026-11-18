@@ -16,7 +16,8 @@ use super::settings::{self, Setting, Step};
 use super::worker::{Job, Worker};
 use crate::account::ProviderKind;
 use crate::config::Config;
-use crate::engine::{Engine, Status};
+use crate::engine::{ChangeMark, Engine, Status};
+use crate::policy::Role;
 
 /// How often to redraw while idle. Short enough that countdowns tick visibly.
 const FRAME: Duration = Duration::from_millis(250);
@@ -89,6 +90,8 @@ pub enum Row {
         status: Box<Status>,
         /// Its place in the order, counted from one within its harness.
         position: usize,
+        /// What it is in that order.
+        role: Role,
     },
 }
 
@@ -113,6 +116,9 @@ pub struct App {
     queued: std::collections::VecDeque<Job>,
     /// Which harnesses switch automatically, as the configuration says.
     pub switching: Vec<(ProviderKind, bool)>,
+    /// The harnesses whose CLI holds no login at all, rather than one that is
+    /// not stored: the heading says which.
+    pub signed_out: Vec<ProviderKind>,
     /// The settings as they stood when the store was last read.
     pub config: Config,
     /// The login under way, while the login panel is up.
@@ -122,7 +128,18 @@ pub struct App {
     pub should_quit: bool,
     next_tick: Instant,
     tick_interval: Duration,
+    /// The job the worker is running, so its outcome can be told apart from
+    /// the change a check made itself.
+    running: Option<Job>,
+    /// What the files that bear on a decision looked like when last read, and
+    /// a differing look waiting for a second to agree with it.
+    changes: Option<ChangeMark>,
+    changing: Option<ChangeMark>,
+    next_look: Instant,
 }
+
+/// How often the interface looks for something changed by another process.
+const CHANGE_LOOK: Duration = Duration::from_millis(600);
 
 /// A line shown in the footer.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,12 +163,17 @@ impl App {
             busy: None,
             queued: std::collections::VecDeque::new(),
             switching: Vec::new(),
+            signed_out: Vec::new(),
             config: engine.config().clone(),
             login: None,
             epoch: Instant::now(),
             should_quit: false,
             next_tick: Instant::now() + interval,
             tick_interval: interval,
+            running: None,
+            changes: None,
+            changing: None,
+            next_look: Instant::now(),
         };
         app.reload(engine)?;
         Ok(app)
@@ -164,7 +186,7 @@ impl App {
         if switching {
             app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
         }
-        app.rebuild(Some(engine));
+        app.rebuild();
         Ok(app)
     }
 
@@ -183,14 +205,19 @@ impl App {
             busy: None,
             queued: std::collections::VecDeque::new(),
             switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
+            signed_out: Vec::new(),
             config: Config::default(),
             login: None,
             epoch: Instant::now(),
             should_quit: false,
             next_tick: Instant::now(),
             tick_interval: Duration::from_secs(60),
+            running: None,
+            changes: None,
+            changing: None,
+            next_look: Instant::now(),
         };
-        app.rebuild(None);
+        app.rebuild();
         app
     }
 
@@ -209,7 +236,12 @@ impl App {
             .map(|kind| (kind, self.config.is_switching_on(kind)))
             .to_vec();
         self.tick_interval = Duration::from_secs(self.config.watch.poll_secs);
-        self.rebuild(Some(engine));
+        self.signed_out = ProviderKind::ALL
+            .into_iter()
+            .filter(|kind| self.statuses.iter().any(|s| s.account.provider == *kind))
+            .filter(|kind| self.active_of(*kind).is_none() && engine.signed_out(*kind))
+            .collect();
+        self.rebuild();
         Ok(())
     }
 
@@ -258,6 +290,17 @@ impl App {
             .find(|status| status.account.provider == kind && status.active)
     }
 
+    /// Brings the next check forward to the next moment a decision could
+    /// change by itself — a window turning over, say — rather than leaving
+    /// it to the interval.
+    fn check_by_next_change(&mut self, engine: &Engine) {
+        let now = jiff::Timestamp::now();
+        if let Ok(Some(at)) = engine.next_change(now) {
+            let wait = Duration::from_secs((at.as_second() - now.as_second()).max(1) as u64);
+            self.next_tick = self.next_tick.min(Instant::now() + wait);
+        }
+    }
+
     /// Rebuilds the list: grouped by harness, and within each one in the order
     /// the accounts would actually be taken.
     ///
@@ -265,7 +308,7 @@ impl App {
     /// order moves underneath it — a poll can lift an account up the queue
     /// while somebody is still deciding what to do with the one they are
     /// looking at, and the selection should follow the account, not the place.
-    fn rebuild(&mut self, engine: Option<&Engine>) {
+    fn rebuild(&mut self) {
         let keep = self.selected().map(|status| status.account.id.clone());
         self.rows.clear();
 
@@ -273,29 +316,21 @@ impl App {
             if self.filter.is_some_and(|only| only != kind) {
                 continue;
             }
-            let mut mine: Vec<Status> = self
-                .statuses
-                .iter()
-                .filter(|status| status.account.provider == kind)
-                .cloned()
-                .collect();
-            if mine.is_empty() {
+            // The queue holds every account of the harness, so walking it
+            // is walking them all, in the order they would be taken.
+            let order = crate::engine::queue(&self.config, &self.statuses, kind);
+            if order.is_empty() {
                 continue;
             }
-            if let Some(engine) = engine {
-                let order = engine.switch_order(&self.statuses, kind);
-                mine.sort_by_key(|status| {
-                    order
-                        .iter()
-                        .position(|id| *id == status.account.id)
-                        .unwrap_or(usize::MAX)
-                });
-            }
             self.rows.push(Row::Provider(kind));
-            for (index, status) in mine.into_iter().enumerate() {
+            for (index, (id, role)) in order.into_iter().enumerate() {
+                let Some(status) = self.status_of(&id).cloned() else {
+                    continue;
+                };
                 self.rows.push(Row::Account {
                     status: Box::new(status),
                     position: index + 1,
+                    role,
                 });
             }
         }
@@ -388,7 +423,7 @@ impl App {
     }
 
     /// Cycles through showing every harness and each one alone.
-    fn cycle_filter(&mut self, engine: Option<&Engine>) {
+    fn cycle_filter(&mut self) {
         let order: Vec<Option<ProviderKind>> =
             std::iter::once(None).chain(ProviderKind::ALL.map(Some)).collect();
         let at = order
@@ -396,7 +431,7 @@ impl App {
             .position(|filter| *filter == self.filter)
             .unwrap_or(0);
         self.filter = order[(at + 1) % order.len()];
-        self.rebuild(engine);
+        self.rebuild();
         let shown = self.filter_label();
         self.note(format!("Showing {shown}"));
     }
@@ -494,18 +529,28 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
 
         if let Some(outcome) = worker.poll() {
             app.busy = None;
+            let finished = app.running.take();
             match outcome {
                 Ok(note) => app.note(note),
                 Err(error) => app.fail(error),
             }
             reopen(engine);
             app.reload(engine)?;
+            // What the job wrote is this interface's own doing, not a change
+            // from elsewhere to act on.
+            app.changes = Some(engine.change_mark());
+            app.changing = None;
+            if finished.is_some_and(|job| job.may_change_the_decision()) {
+                app.next_tick = Instant::now();
+            }
+            app.check_by_next_change(engine);
             if let Some(job) = app.queued.pop_front() {
                 submit(&mut app, &worker, job);
             }
         }
 
         follow_login(&mut app, engine, &worker)?;
+        follow_changes(&mut app, engine)?;
 
         if app.any_switching() && app.busy.is_none() && Instant::now() >= app.next_tick {
             app.next_tick = Instant::now() + app.tick_interval;
@@ -527,6 +572,40 @@ fn event_loop(engine: &Engine, terminal: &mut ratatui::DefaultTerminal) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+/// Takes in what another process changed — an account signed in or out from
+/// the command line or Herdr, new readings, the agent CLI's own login — and
+/// has auto mode look at it at once.
+///
+/// Not while a job runs: what it writes is the interface's own, and is taken
+/// in when it finishes.
+fn follow_changes(app: &mut App, engine: &mut Engine) -> Result<()> {
+    if app.busy.is_some() || Instant::now() < app.next_look {
+        return Ok(());
+    }
+    app.next_look = Instant::now() + CHANGE_LOOK;
+    let mark = engine.change_mark();
+    let Some(known) = &app.changes else {
+        app.changes = Some(mark);
+        return Ok(());
+    };
+    if *known == mark {
+        app.changing = None;
+        return Ok(());
+    }
+    // A file caught half-written reads differently a moment later; a change
+    // counts once two looks agree on it.
+    if app.changing.as_ref() != Some(&mark) {
+        app.changing = Some(mark);
+        return Ok(());
+    }
+    reopen(engine);
+    app.reload(engine)?;
+    app.changes = Some(engine.change_mark());
+    app.changing = None;
+    app.next_tick = Instant::now();
     Ok(())
 }
 
@@ -567,6 +646,7 @@ fn submit(app: &mut App, worker: &Worker, job: Job) {
     }
     if worker.submit(job.clone()) {
         app.busy = Some(job.describe());
+        app.running = Some(job);
     } else {
         app.fail("the background worker is not running");
     }
@@ -823,7 +903,7 @@ fn browse_key(app: &mut App, engine: &Engine, worker: &Worker, key: KeyEvent) {
         KeyCode::Home | KeyCode::Char('g') => app.move_selection(-(app.rows.len() as isize)),
         KeyCode::End | KeyCode::Char('G') => app.move_selection(app.rows.len() as isize),
         KeyCode::Char('r') => submit(app, worker, Job::Poll { force: true }),
-        KeyCode::Char('p') | KeyCode::Tab => app.cycle_filter(Some(engine)),
+        KeyCode::Char('p') | KeyCode::Tab => app.cycle_filter(),
         KeyCode::Char('?') | KeyCode::F(1) => app.mode = Mode::Help,
         KeyCode::Char('s') => {
             app.mode = Mode::Settings {
@@ -1117,7 +1197,7 @@ mod tests {
 
         // The list is rebuilt with that account somewhere else entirely.
         app.statuses.reverse();
-        app.rebuild(None);
+        app.rebuild();
         assert_eq!(app.selected().unwrap().account.id, "claude-3");
     }
 
@@ -1137,17 +1217,17 @@ mod tests {
         assert_eq!(accounts(&app), 2);
         assert_eq!(app.filter_label(), "2 accounts");
 
-        app.cycle_filter(None);
+        app.cycle_filter();
         assert_eq!(app.filter, Some(ProviderKind::Claude));
         assert_eq!(accounts(&app), 1);
         assert_eq!(app.filter_label(), "Claude Code only");
 
-        app.cycle_filter(None);
+        app.cycle_filter();
         assert_eq!(app.filter, Some(ProviderKind::Codex));
         assert_eq!(accounts(&app), 1);
 
         // And back to everything.
-        app.cycle_filter(None);
+        app.cycle_filter();
         assert_eq!(app.filter, None);
         assert_eq!(accounts(&app), 2);
     }

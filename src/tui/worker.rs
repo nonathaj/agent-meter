@@ -37,6 +37,26 @@ pub enum Job {
 }
 
 impl Job {
+    /// Whether what this job changes is worth a check as soon as it is done:
+    /// an account to switch to that was not there, or one that is no longer.
+    ///
+    /// Not a check, whose own writes are what it decided. Not a switch made
+    /// by hand either: that is somebody's choice, and is judged at the next
+    /// regular check as before rather than undone on the spot.
+    pub fn may_change_the_decision(&self) -> bool {
+        match self {
+            Job::Poll { .. }
+            | Job::Read(_)
+            | Job::Remove(_)
+            | Job::Import(_)
+            | Job::SpendReset { .. }
+            | Job::Disable { .. }
+            | Job::Enable(_) => true,
+            Job::SetSwitching { on, .. } => *on,
+            Job::Tick | Job::Switch(_) => false,
+        }
+    }
+
     /// What to show while the job runs.
     pub fn describe(&self) -> String {
         match self {

@@ -36,6 +36,24 @@ pub trait Provider: Send + Sync {
     /// Reads the account currently signed in to `home`.
     fn capture(&self, home: &Path) -> Result<Captured>;
 
+    /// Whether `home` holds no login of any kind, so that installing an
+    /// account there would overwrite nothing.
+    ///
+    /// This is what tells a CLI that is signed out from one signed in to a
+    /// login agent-meter does not store, which [`Self::capture`] alone cannot:
+    /// both match no stored account. The difference decides whether a switch
+    /// may be made, because the provider rotates refresh tokens, so a login
+    /// only the CLI holds is gone for good once written over. Anything that
+    /// might be a login, including an API key agent-meter cannot meter, counts
+    /// as one.
+    fn signed_out(&self, home: &Path) -> Result<bool>;
+
+    /// The files in `home` the CLI rewrites when it signs in, signs out or
+    /// renews its login, for noticing that it has. A credential the CLI keeps
+    /// somewhere else (the macOS Keychain) is noticed at the next regular
+    /// check instead.
+    fn credential_files(&self, home: &Path) -> Vec<PathBuf>;
+
     /// Writes `account` into `home`, making it the CLI's signed-in account.
     ///
     /// Implementations merge into the existing files so unrelated settings and

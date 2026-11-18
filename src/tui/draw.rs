@@ -247,16 +247,33 @@ fn provider_heading(kind: ProviderKind, app: &App, width: usize) -> Line<'static
     } else {
         Span::styled(" ○ manual ", Style::new().fg(DIM))
     };
+    // After any switch, by hand or not, the watcher holds off for a while:
+    // shown counting down, so a switch that has not happened yet is seen to
+    // be waiting rather than forgotten.
+    let now = Timestamp::now();
+    let cooldown = app
+        .cooldown_of(kind, now)
+        .filter(|_| app.switching_on(kind))
+        .map(|until| {
+            Span::styled(
+                format!("cooldown {} ", timefmt::until(now, until)),
+                Style::new().fg(Color::Yellow),
+            )
+        });
     // The order is explained only where there is room: the status is the part
     // that must not be pushed off the edge.
     let mut right = Vec::new();
     let hint = "in the order they will be taken  ";
-    if app.switching_on(kind) && spans_width(&left) + hint.len() + status.width() + 3 <= width {
+    let cooldown_width = cooldown.as_ref().map_or(0, Span::width);
+    if app.switching_on(kind)
+        && spans_width(&left) + hint.len() + cooldown_width + status.width() + 3 <= width
+    {
         right.push(Span::styled(
             hint,
             Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
         ));
     }
+    right.extend(cooldown);
     right.push(status);
     spread(left, right, width)
 }
@@ -439,7 +456,18 @@ fn standing(status: &Status, role: Role, app: &App, now: Timestamp) -> Vec<Span<
     // Only meaningful when something is actually choosing: with switching off
     // the order is just an order. Taken from the queue rather than from the
     // place in it, because with nothing in use the first account is next.
-    if app.switching_on(status.account.provider) && role == Role::NextUp {
+    let kind = status.account.provider;
+    // A switch to it that the cooldown is holding back says when it comes.
+    if let Some((_, until)) = app
+        .held_switch(kind, now)
+        .filter(|(to, _)| *to == status.account.id && app.switching_on(kind))
+    {
+        return vec![Span::styled(
+            format!(" next up · switching in {} ", timefmt::until(now, until)),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+    }
+    if app.switching_on(kind) && role == Role::NextUp {
         return vec![Span::styled(
             " next up ",
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1745,6 +1773,45 @@ mod tests {
         assert!(first.contains("next up"), "{screen}");
         assert_eq!(screen.matches("next up").count(), 1, "{screen}");
         assert!(screen.contains("signed out"), "{screen}");
+    }
+
+    /// After a switch the watcher holds off for a while. The wait is on
+    /// screen, counting down, and a switch it is holding back says when it
+    /// will be made — rather than looking like auto mode forgot.
+    #[test]
+    fn a_running_cooldown_and_the_switch_it_holds_are_shown() {
+        let mut statuses = crate::tui::app::sample_statuses(2);
+        statuses[0].usage = Some(usage(vec![window(FIVE_HOURS, None, 95.0, 3600)]));
+        statuses[1].usage = Some(usage(vec![window(FIVE_HOURS, None, 5.0, 3600)]));
+        let mut app = App::for_tests(statuses);
+        app.switching = ProviderKind::ALL.map(|kind| (kind, true)).to_vec();
+        let until = Timestamp::now() + jiff::SignedDuration::from_secs(250);
+        app.cooldowns = vec![(ProviderKind::Claude, until)];
+
+        let screen = render(&mut app, 120, 30);
+        let heading = screen.lines().find(|line| line.contains("auto at")).unwrap();
+        assert!(heading.contains("cooldown 4m"), "{screen}");
+        let next = screen.lines().find(|line| line.contains("claude-2")).unwrap();
+        assert!(next.contains("next up · switching in 4m"), "{screen}");
+        // Both stay on screen however narrow the window.
+        for width in [60u16, 80, 110] {
+            let screen = render(&mut app, width, 30);
+            assert!(screen.contains("cooldown 4m"), "at {width}:\n{screen}");
+            assert!(screen.contains("switching in 4m"), "at {width}:\n{screen}");
+        }
+
+        // Over, it is gone.
+        app.cooldowns.clear();
+        let screen = render(&mut app, 120, 30);
+        assert!(!screen.contains("cooldown"), "{screen}");
+        assert!(!screen.contains("switching in"), "{screen}");
+        assert!(screen.contains("next up"), "{screen}");
+
+        // With switching off there is nothing being held off.
+        app.cooldowns = vec![(ProviderKind::Claude, until)];
+        app.switching = ProviderKind::ALL.map(|kind| (kind, false)).to_vec();
+        let screen = render(&mut app, 120, 30);
+        assert!(!screen.contains("cooldown"), "{screen}");
     }
 
     /// Spending a window faster than it refills is the thing a percentage

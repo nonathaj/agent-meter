@@ -1174,6 +1174,36 @@ fn watch_signs_a_signed_out_claude_code_in_to_the_next_account() {
     assert!(said.contains("Claude Code was signed out"), "{said}");
 }
 
+/// A switch somebody makes holds the watcher off for the cooldown, as one it
+/// makes itself does. It used to be undone at the next check, seconds later.
+#[test]
+fn a_switch_made_by_hand_is_not_undone_at_once() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("roomy@example.com", "uuid-roomy", "roomy");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("busy@example.com", "uuid-busy", "busy");
+    fixture.run(&["import", "claude"]);
+    fixture.run(&["use", "claude-1"]);
+    // Past the threshold, so left alone the watcher would move it back.
+    fresh_readings(&fixture, &[("claude-1", 95.0), ("claude-2", 10.0)]);
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert!(output.contains("waiting"), "{output}");
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-roomy"
+    );
+
+    // Once the cooldown is over, it is.
+    fixture.run(&["config", "set", "watch.cooldown-secs", "0"]);
+    let output = fixture.run(&["watch", "--once"]);
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-busy",
+        "{output}"
+    );
+}
+
 /// Accounts synced from another machine are no reason to set up a CLI this
 /// machine has never run: with no home of its own, it is not signed out, it
 /// is not here.

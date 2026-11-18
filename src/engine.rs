@@ -230,11 +230,6 @@ impl Engine {
         queue(&self.config, statuses, kind)
     }
 
-    /// How one account looks to the policy.
-    fn candidate<'a>(&self, status: &'a Status) -> Candidate<'a> {
-        candidate(status)
-    }
-
     /// The rules this provider is judged by.
     pub fn rules_for(&self, kind: ProviderKind) -> Rules {
         rules_for(&self.config, kind)
@@ -826,8 +821,20 @@ impl Engine {
             let provider = self.store.account(id)?.map(|account| account.provider);
             if let Some(provider) = provider {
                 let mut state = self.store.state()?;
+                let now = Timestamp::now();
+                // A switch somebody chose holds the watcher off for the
+                // cooldown, as one it made does: undone seconds later, it was
+                // never really a choice.
+                state.record_switch(
+                    provider,
+                    SwitchRecord {
+                        at: now,
+                        to: outcome.to.clone(),
+                        from: outcome.from.clone(),
+                    },
+                );
                 state.push_switch(Switch {
-                    at: Timestamp::now(),
+                    at: now,
                     provider,
                     from: outcome.from.clone(),
                     to: outcome.to.clone(),
@@ -1356,30 +1363,17 @@ impl Engine {
                 continue;
             }
 
-            let candidates: Vec<Candidate<'_>> =
-                provider_statuses.iter().map(|s| self.candidate(s)).collect();
             // Matching no stored account is two different things: signed in to
             // a login agent-meter does not hold, which is left alone, or
             // signed in to nothing, which the agent cannot work from. Asked
             // after the match, so a login made since is found and kept.
-            let decision = if !candidates.iter().any(|c| c.active) && self.signed_out(kind) {
-                policy::decide_signed_out(&candidates, &self.rules_for(kind), now)
-            } else {
-                policy::decide(&candidates, &self.rules_for(kind), now)
-            };
+            let signed_out = !provider_statuses.iter().any(|s| s.active) && self.signed_out(kind);
+            let decision = decide(&self.config, &statuses, kind, signed_out, now);
 
             let (switched, held) = match &decision {
                 Decision::Switch { .. } if !act => (None, None),
                 Decision::Switch { to, reason } => match self.cooldown_remaining(kind, now)? {
-                    // The cooldown keeps two workable accounts from being
-                    // traded back and forth. A signed-out one can never be
-                    // switched back to, so there is nothing to flap between,
-                    // and every minute waited is a minute the agent is down.
-                    _ if matches!(
-                        reason,
-                        Reason::ActiveSignedOut { .. } | Reason::NothingSignedIn { .. }
-                    ) =>
-                    {
+                    _ if ignores_cooldown(reason) => {
                         (Some(self.switch_and_record(kind, to, reason, now)?), None)
                     }
                     Some(remaining) => (
@@ -1514,14 +1508,24 @@ impl Engine {
             .min())
     }
 
-    /// How long remains of the cooldown after the last automatic switch.
+    /// How long remains of the cooldown after the last switch.
     fn cooldown_remaining(&self, kind: ProviderKind, now: Timestamp) -> Result<Option<std::time::Duration>> {
-        let cooldown = self.config.watch.cooldown_secs as i64;
-        let Some(record) = self.store.state()?.last_switch(kind).cloned() else {
-            return Ok(None);
-        };
-        let elapsed = now.as_second() - record.at.as_second();
-        Ok((elapsed < cooldown).then(|| std::time::Duration::from_secs((cooldown - elapsed) as u64)))
+        Ok(self
+            .cooldown_until(kind, now)?
+            .map(|until| std::time::Duration::from_secs((until.as_second() - now.as_second()).max(0) as u64)))
+    }
+
+    /// When the cooldown after `kind`'s last switch ends, if it is still
+    /// running at `now`: until then the watcher makes no switch but one away
+    /// from an agent that is signed out.
+    pub fn cooldown_until(&self, kind: ProviderKind, now: Timestamp) -> Result<Option<Timestamp>> {
+        let cooldown = SignedDuration::from_secs(self.config.watch.cooldown_secs as i64);
+        Ok(self
+            .store
+            .state()?
+            .last_switch(kind)
+            .map(|record| record.at + cooldown)
+            .filter(|until| *until > now))
     }
 }
 
@@ -1540,6 +1544,43 @@ pub fn queue(config: &Config, statuses: &[Status], kind: ProviderKind) -> Vec<(S
         .into_iter()
         .map(|(id, role)| (id.to_string(), role))
         .collect()
+}
+
+/// What a check would decide for `kind` under `config`, with `signed_out`
+/// saying whether its CLI holds no login at all.
+///
+/// The one place the decision is made, so an interface showing what is about
+/// to happen shows what the watcher will do.
+pub fn decide(
+    config: &Config,
+    statuses: &[Status],
+    kind: ProviderKind,
+    signed_out: bool,
+    now: Timestamp,
+) -> Decision {
+    let candidates: Vec<Candidate<'_>> = statuses
+        .iter()
+        .filter(|s| s.account.provider == kind)
+        .map(candidate)
+        .collect();
+    let rules = rules_for(config, kind);
+    if signed_out && !candidates.iter().any(|c| c.active) {
+        policy::decide_signed_out(&candidates, &rules, now)
+    } else {
+        policy::decide(&candidates, &rules, now)
+    }
+}
+
+/// Whether `reason` is one a switch is made for at once, cooldown or not.
+///
+/// The cooldown keeps two workable accounts from being traded back and forth.
+/// An agent that is signed out has nothing to flap between, and every minute
+/// waited is a minute it is down.
+pub fn ignores_cooldown(reason: &Reason) -> bool {
+    matches!(
+        reason,
+        Reason::ActiveSignedOut { .. } | Reason::NothingSignedIn { .. }
+    )
 }
 
 /// How one account looks to the policy.

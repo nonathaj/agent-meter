@@ -119,6 +119,9 @@ pub struct App {
     /// The harnesses whose CLI holds no login at all, rather than one that is
     /// not stored: the heading says which.
     pub signed_out: Vec<ProviderKind>,
+    /// When the cooldown after each harness's last switch ends, where it is
+    /// still running.
+    pub cooldowns: Vec<(ProviderKind, jiff::Timestamp)>,
     /// The settings as they stood when the store was last read.
     pub config: Config,
     /// The login under way, while the login panel is up.
@@ -164,6 +167,7 @@ impl App {
             queued: std::collections::VecDeque::new(),
             switching: Vec::new(),
             signed_out: Vec::new(),
+            cooldowns: Vec::new(),
             config: engine.config().clone(),
             login: None,
             epoch: Instant::now(),
@@ -206,6 +210,7 @@ impl App {
             queued: std::collections::VecDeque::new(),
             switching: ProviderKind::ALL.map(|kind| (kind, false)).to_vec(),
             signed_out: Vec::new(),
+            cooldowns: Vec::new(),
             config: Config::default(),
             login: None,
             epoch: Instant::now(),
@@ -241,6 +246,11 @@ impl App {
             .filter(|kind| self.statuses.iter().any(|s| s.account.provider == *kind))
             .filter(|kind| self.active_of(*kind).is_none() && engine.signed_out(*kind))
             .collect();
+        let now = jiff::Timestamp::now();
+        self.cooldowns = ProviderKind::ALL
+            .into_iter()
+            .filter_map(|kind| Some((kind, engine.cooldown_until(kind, now).ok().flatten()?)))
+            .collect();
         self.rebuild();
         Ok(())
     }
@@ -256,6 +266,31 @@ impl App {
             .iter()
             .find(|(provider, _)| *provider == kind)
             .is_some_and(|(_, on)| *on)
+    }
+
+    /// When the cooldown after `kind`'s last switch ends, if it is running at
+    /// `now`.
+    pub fn cooldown_of(&self, kind: ProviderKind, now: jiff::Timestamp) -> Option<jiff::Timestamp> {
+        self.cooldowns
+            .iter()
+            .find(|(provider, until)| *provider == kind && *until > now)
+            .map(|(_, until)| *until)
+    }
+
+    /// The switch the cooldown is holding back for `kind`, if one is: the
+    /// account it would go to, and when.
+    ///
+    /// Worked out as the watcher works it out, so what is promised on screen
+    /// is what happens.
+    pub fn held_switch(&self, kind: ProviderKind, now: jiff::Timestamp) -> Option<(String, jiff::Timestamp)> {
+        let until = self.cooldown_of(kind, now)?;
+        let signed_out = self.signed_out.contains(&kind);
+        match crate::engine::decide(&self.config, &self.statuses, kind, signed_out, now) {
+            crate::policy::Decision::Switch { to, reason } if !crate::engine::ignores_cooldown(&reason) => {
+                Some((to, until))
+            }
+            _ => None,
+        }
     }
 
     /// Whether something on screen is moving, and needs drawing more often.

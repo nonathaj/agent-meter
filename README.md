@@ -541,7 +541,7 @@ agent-meter config unset provider.codex.threshold   # back to the shared one
 | `watch.threshold` | `90` | Usage percent at which to look for a better account. |
 | `watch.poll-secs` | `60` | Seconds between checks. Each provider is still polled no faster than it allows. |
 | `watch.margin` | `5` | Extra headroom needed to switch when every account is busy. |
-| `watch.cooldown-secs` | `300` | Minimum gap between automatic switches. |
+| `watch.cooldown-secs` | `300` | How long the watcher holds off after any switch, automatic or made by hand, so a choice is not undone on the spot. A signed-out agent never waits. The terminal UI counts it down in the heading, and on the account it is holding a switch to. |
 | `watch.wait-for-reset` | `true` | With every account spent, wait for the first to come back rather than exit. |
 | `provider.<name>.threshold` | — | Per-provider threshold. |
 | `provider.<name>.enabled` | `true` | Whether `watch` manages this provider. The terminal UI, the Herdr app and `watch --only-switched-on` manage it only once it is set to `true`. |
